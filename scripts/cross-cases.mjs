@@ -93,6 +93,21 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
   check("C1", "unknown tool -> JSON-RPC error", !!bad.error || bad.result?.isError === true);
   const cancelErr = await s.call("claude_review_followup", { sessionId: "x", message: "hi", repoPath: mkRepo("c1") });
   check("C1", "followup handled without crash (async jobId or clear error)", !!cancelErr.result?.structuredContent?.jobId || cancelErr.result?.isError === true || cancelErr.error != null, textOf(cancelErr).slice(0, 120));
+  {
+    // Re-cover the followup job lifecycle: the bogus-session job must SETTLE
+    // (with the stub CLI it succeeds; with real claude it errors — either way
+    // it must not hang in "running" forever).
+    const jid = cancelErr.result?.structuredContent?.jobId;
+    if (jid) {
+      let settled = null;
+      for (let i = 0; i < 12 && !settled; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const p = await s.call("claude_review_status", { jobId: jid });
+        if (p.result?.structuredContent?.status !== "running") settled = p;
+      }
+      check("C1", "followup job settles (not stuck running)", !!settled && (settled.result?.isError === true || /reply|STUB|result/i.test(textOf(settled))), settled ? textOf(settled).slice(0, 120) : "never settled");
+    }
+  }
   s.kill();
 }
 

@@ -339,7 +339,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.9.0";
+const SERVER_VERSION = "1.9.1";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -903,7 +903,7 @@ server.tool(
     if (!ok) {
       return {
         isError: true,
-        content: [{ type: "text", text: failureBanner(j, run) + stderrTail(run.stderr) + logNote }],
+        content: [{ type: "text", text: gitProgramNotes + failureBanner(j, run) + stderrTail(run.stderr) + logNote }],
         structuredContent: {
           status: status2, sessionId: j.session_id, costUsd: meta.costUsd,
           numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, effort, fix, logFile,
@@ -1052,6 +1052,23 @@ server.tool(
       return err(`repoPath does not exist or is not a directory: ${repoPath}`);
     }
 
+    // Same repo-controlled git-config gate as a full review: the followup child
+    // runs the same allowlisted git reads from cwd=repoPath, so a live
+    // core.fsmonitor / driver would execute here too. (Dead cross-machine
+    // config only notes, matching the review path.)
+    const gitPrograms = repoRunsGitPrograms(repoPath);
+    if (gitPrograms.refusals.length) {
+      return err(
+        `Refusing to run the followup in ${repoPath}: its own git configuration executes programs, which would run on the first git command the reviewer makes:\n` +
+        gitPrograms.refusals.slice(0, 5).map((h) => `- ${h}`).join("\n") +
+        `\nRemove the offending entries (.git/config / .gitattributes), or review a copy of the repository. (cc-code-review server v${SERVER_VERSION})`
+      );
+    }
+    const gitProgramNotes = gitPrograms.notes.length
+      ? `note: stale/cross-machine git config in the repo (harmless on this machine):\n` +
+        gitPrograms.notes.slice(0, 5).map((h) => `- ${h}`).join("\n") + "\n\n"
+      : "";
+
     const gw = await probeGateway();
     if (gw && gw.ok === false) {
       return err(`Local gateway not reachable: ${gw.host} (${gw.reason}). Start CC Switch / your local gateway, then retry.`);
@@ -1065,7 +1082,17 @@ server.tool(
     ]);
     const startedAt = Date.now();
     const jobAbort = new AbortController();
-    const executeFollowup = async (signal) => {
+    const executeFollowup = async (signal, progressToken) => {
+    // Best-effort progress notifications while the followup runs (mirrors the
+    // review path so clients that render progress treat both tools alike).
+    const token = progressToken ?? null;
+    const progressTimer = token == null ? null : setInterval(() => {
+      const mins = Math.round((Date.now() - startedAt) / 60000);
+      extra?.sendNotification?.({
+        method: "notifications/progress",
+        params: { progressToken: token, progress: mins, total: timeoutMinutes, message: `claude followup in progress (${mins}min elapsed)` },
+      }).catch(() => {});
+    }, 60_000);
     const run = await runClaude({
       cli,
       repoPath,
@@ -1088,6 +1115,7 @@ server.tool(
       timeoutMs: timeoutMinutes * 60_000,
       signal,
     });
+    if (progressTimer) clearInterval(progressTimer);
 
     const logFile = writeLogFile(run.stdout, run.stderr);
     const logNote = logNoteOf(logFile);
@@ -1109,7 +1137,7 @@ server.tool(
     }
     const chainNote = shellChainingNote(run.bashCommands);
     return {
-      content: [{ type: "text", text: runResultText(j.result, {
+      content: [{ type: "text", text: gitProgramNotes + runResultText(j.result, {
         status: status2,
         sessionId: j.session_id ?? sessionId,
         costUsd: j.total_cost_usd, numTurns: j.num_turns, durationMs: j.duration_ms, logFile,
@@ -1123,7 +1151,7 @@ server.tool(
     };
     }; // end executeFollowup
 
-    if (args.waitForResult) return executeFollowup(extra?.signal);
+    if (args.waitForResult) return executeFollowup(extra?.signal, extra?._meta?.progressToken);
 
     const jobId = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const job = {

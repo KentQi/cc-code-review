@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.1 — 2026-10-18
+
+Fixes verified from a max-effort self-audit (the MCP reviewing its own repo through the code-review skill; 2 H reported, 1 verified false, 1 fixed):
+
+- **[H, verified TRUE] followup skipped the repo git-config gate** — the followup child runs the same allowlisted git reads, so a live core.fsmonitor/driver would execute on it too; it now runs the same refusals/notes gate as claude_code_review (notes included in both result shapes).
+- [H, verified FALSE] the audit claimed followup never marks its guard file in-flight — the 1.8.3 fix marks inside prepareRunHardening, which both tools call; no change needed.
+- **[M, fixed]** waitForResult followups now emit progress notifications (60s cadence, same as review).
+- [L, fixed] cross-cases C1 re-covers the followup job lifecycle (must settle, not hang running).
+- Note for client maintainers: since 1.9.0 claude_review_followup is async by default — the synchronous reply shape only applies with waitForResult=true.
+
 ## 1.9.0 — 2026-10-18
 
 - **claude_review_followup is async too** — the last M from the audits: it was the only remaining synchronous agentic call, cut off by ~30s client tool timeouts. Same job pattern as claude_code_review: jobId at once, poll/fetch/cancel via claude_review_status, waitForResult=true restores the sync contract, client-cancel of the initial call aborts the job.

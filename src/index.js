@@ -42,8 +42,11 @@ const execFileAsync = promisify(execFile);
 const log = (...a) => console.error("[cc-code-review]", ...a);
 
 const ENV = {
-  timeoutMinutes: positive(process.env.CLAUDE_REVIEW_TIMEOUT_MIN, 20),
-  maxBudgetUsd: nonNegative(process.env.CLAUDE_REVIEW_MAX_BUDGET_USD, 5),
+  // clamp to the same ranges the zod schema enforces, otherwise an out-of-range
+  // env default makes every call that omits the param fail with '-32602 ... at
+  // timeoutMinutes' naming no env var
+  timeoutMinutes: Math.min(60, Math.max(1, Math.round(positive(process.env.CLAUDE_REVIEW_TIMEOUT_MIN, 20)))),
+  maxBudgetUsd: Math.min(50, nonNegative(process.env.CLAUDE_REVIEW_MAX_BUDGET_USD, 5)),
   model: process.env.CLAUDE_REVIEW_MODEL || undefined,
   autoInstallSkill: process.env.CLAUDE_REVIEW_AUTO_INSTALL_SKILL !== "0",
 };
@@ -127,6 +130,11 @@ function requireAbsoluteRepoPath(p) {
         `repoPath "${p}" has no Windows drive letter (C:\\... or \\\\server\\share\\...). ` +
         `On Windows it would resolve against this server's own drive, not the path you typed — pass the full drive-letter path.`,
     };
+  }
+  // NTFS allows names ending in space/dot but Win32 path APIs (incl. spawn)
+  // fail ENOENT on them — refuse up front instead of dying at first git call
+  if (process.platform === "win32" && /(^|[\\/])[^\\/]*[ .]([\\/]|$)/.test(expanded)) {
+    return { ok: false, error: `repoPath has a path component ending with a space or dot, which Win32 cannot spawn (${expanded}). Rename that directory, then retry.` };
   }
   if (!path.isAbsolute(expanded)) {
     return {
@@ -331,7 +339,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.8.2";
+const SERVER_VERSION = "1.8.3";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -405,6 +413,7 @@ async function prepareRunHardening(cli) {
     }
   }
   const guardSettings = writeGuardSettings();
+  markGuardSettingsInFlight(guardSettings, true); // held until the claude spawn returns
 
   let semver = null;
   try { semver = await claudeSemver(cli); } catch { /* unreadable version: fall through to help-text probing */ }
@@ -930,7 +939,13 @@ server.tool(
     reviewJobs.set(jobId, job);
     // The client cancelling THIS initial call must not orphan the background
     // run: tie its signal to the job's abort as well.
-    extra?.signal?.addEventListener("abort", () => jobAbort.abort(), { once: true });
+    if (extra?.signal) {
+      // the client may have cancelled while preflight ran: an already-aborted
+      // signal never fires listeners, and the SDK drops our response — the run
+      // would bill with no jobId ever reaching the caller
+      if (extra.signal.aborted) jobAbort.abort();
+      else extra.signal.addEventListener("abort", () => jobAbort.abort(), { once: true });
+    }
     void executeRun(jobAbort.signal, undefined)
       .then((result) => { job.result = result; job.state = "done"; job.finishedAt = Date.now(); })
       .catch((e) => { job.result = err(`review job crashed: ${e?.message || e}`); job.state = "done"; job.finishedAt = Date.now(); })
@@ -973,7 +988,7 @@ server.tool(
     }
     const job = reviewJobs.get(jobId);
     if (!job) {
-      return err(`unknown jobId "${jobId}" — jobs live in the server process that created them (a ZCode restart clears them); list current jobs by calling this tool without jobId.`);
+      return err(`unknown jobId "${jobId}" — jobs live in the server process that created them (older ones are pruned once 10 newer jobs finished; a host restart clears them all). List current jobs by calling this tool without jobId.`);
     }
     if (job.state === "running") {
       if (cancel) {

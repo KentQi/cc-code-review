@@ -174,7 +174,8 @@ function classifySpawnTarget(p, low) {
   if (low.endsWith(".js") || low.endsWith(".cjs") || low.endsWith(".mjs")) return "node-script";
   if (low.endsWith(".cmd") || low.endsWith(".bat") || low.endsWith(".ps1") || low.endsWith(".sh")) return "shim";
   if (IS_WIN) return low.endsWith(".exe") || low.endsWith(".com") ? "exec" : "no";
-  return isExecutableFile(p) || hasShebang(p) ? "exec" : "no";
+  // POSIX: spawning needs the exec bit; a bare shebang would fail as EACCES later
+  return isExecutableFile(p) ? "exec" : "no";
 }
 
 /**
@@ -755,12 +756,16 @@ export async function guardSelfTest({ refresh = false } = {}) {
       resolve({ decision: null, error: String(e?.message || e) });
       return;
     }
+    // A wedged hook (AV, dead mount) would leave this promise unsettled and
+    // hang the caller forever — no other timeout exists on this path.
+    const killer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } }, 15_000);
     let out = "";
     let err = "";
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => { err += d; });
-    child.on("error", (e) => resolve({ decision: null, error: String(e?.message || e) }));
+    child.on("error", (e) => { clearTimeout(killer); resolve({ decision: null, error: String(e?.message || e) }); });
     child.on("close", (code) => {
+      clearTimeout(killer);
       let decision = null;
       try { decision = JSON.parse(out.trim().split(/\r?\n/).filter(Boolean).pop() || "{}"); } catch { /* no output = allow */ }
       resolve({ decision, code, stderr: err.slice(0, 300) });
@@ -877,6 +882,7 @@ export function runClaude({
   return new Promise((resolve) => {
     // A signal already aborted before we even spawn: never start a paid run.
     if (signal?.aborted) {
+      guardSettingsInFlight.delete(guardSettings);
       removeGuardSettings(guardSettings);
       resolve({ ok: false, json: null, stdout: "", stderr: "", timedOut: false, cancelled: true, exitCode: null, durationMs: 0 });
       return;
@@ -917,6 +923,7 @@ export function runClaude({
         detached: !IS_WIN, // own process group on unix so killTree can take the whole tree
       });
     } catch (err) {
+      guardSettingsInFlight.delete(guardSettings);
       removeGuardSettings(guardSettings);
       resolve({ ok: false, json: null, stdout: "", stderr: String(err?.message || err), timedOut: false, cancelled: false, exitCode: null, durationMs: 0, spawnError: String(err?.message || err) });
       return;
@@ -976,7 +983,10 @@ export function runClaude({
         buf = buf.subarray(idx + 1);
         if (line) ingest(line);
       }
-      soPartial = buf;
+      // An unterminated multi-MB line (corrupt stream) would otherwise grow
+      // unboundedly with per-chunk Buffer.concat (O(n^2)). Drop it: no valid
+      // stream-json event is that large.
+      soPartial = buf.length > 4 * 1024 * 1024 ? Buffer.alloc(0) : buf;
     });
     child.stderr.on("data", (d) => {
       if (seBytes >= MAX_STREAM_BYTES) { stderrTruncated = true; return; }
@@ -1109,6 +1119,9 @@ function gitSpawnOpts(cwd, extraEnv = {}) {
     cwd,
     timeout: 15000,
     windowsHide: true,
+    // default 1MB explodes on repos with many untracked files (porcelain > 1MB),
+    // silently disabling fix verification and misdiagnosing gitPreflight
+    maxBuffer: 64 * 1024 * 1024,
     env: {
       ...buildClaudeEnv(),
       ...extraEnv,
@@ -1397,5 +1410,6 @@ export async function gitPreflight(repoPath) {
   if (head.ok) return { hasCommits: true, dirty: null };
   const status = await run(["status", "--porcelain"]);
   const dirty = status.ok && status.out.trim().length > 0;
-  return { hasCommits: false, dirty, gitError: !head.ok && !status.ok ? head.err : null };
+  // status failing (not "empty") must surface its own error, not rev-parse's
+  return { hasCommits: false, dirty, gitError: !status.ok ? (status.err ?? head.err) : null };
 }

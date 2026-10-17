@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.8.3 — 2026-10-18
+
+Fixes from a fourth multi-expert audit (reliability / universality / usability; 5 independent auditors, no H findings):
+
+- cancel-before-listener race: a client cancelling the async call DURING preflight never fired the abort (already-aborted signals do not fire listeners) — the run billed with no jobId reaching the caller; now checked up front.
+- guard files are marked in-flight the moment prepareRunHardening writes them (an awaited version-probe window previously let a concurrent env call delete them; followup never marked at all).
+- git status porcelain over 1MB broke fix verification silently and made gitPreflight misdiagnose no-commit repos — maxBuffer raised to 64MB; a failed status now surfaces its own error.
+- skill install IO failure (locked dir / read-only home) escaped as an opaque SDK error; now degrades to the documented inline fallback.
+- guardSelfTest probes could hang forever on a wedged hook; 15s kill timer added.
+- stream-json partial-line buffer capped (a corrupt multi-MB line caused O(n^2) memory).
+- CLAUDE_REVIEW_TIMEOUT_MIN / MAX_BUDGET_USD env defaults outside the zod ranges made every call fail -32602 naming no env var; now clamped.
+- Windows: repoPath whose directory name ends in space/dot (legal NTFS, unspawnable) is refused with a clear message.
+- POSIX: CLAUDE_CODE_PATH without the exec bit is no longer accepted on shebang evidence alone (was an opaque EACCES at spawn).
+- init: EISDIR / unreadable config.json now exits cleanly (the 1.8.2 claim for this case was premature); stub pidfile moved to the OS temp dir so npm pack no longer ships it; cross-cases C8 no longer passes vacuously (waits for the pidfile, then proves the kill).
+- Docs truth pass: counts 67/158, tool-1 Returns documents the async default, the 4th tool added to the stable-name list, cross-cases documented in both READMEs; jobId expiry text names pruning, not only restarts.
+- Known limitation (two auditors, not fixed): claude_review_followup is still synchronous-only — clients with ~30s tool timeouts will cut it; keep follow-ups short.
+
+
 ## 1.8.2 — 2026-10-17
 
 Loop-tested with a 10-case MECE suite (scripts/cross-cases.mjs, free via a stub claude + one paid e2e) plus two more independent audits; all findings fixed:

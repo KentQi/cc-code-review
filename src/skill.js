@@ -36,15 +36,21 @@ export function installBundledSkill() {
   if (status === "user") {
     return { installed: false, reason: `user-managed code-review skill already exists at ${userSkillDir()}; keeping it untouched` };
   }
-  const dir = userSkillDir();
-  fs.mkdirSync(dir, { recursive: true });
-  fs.copyFileSync(bundledSkillFile(), path.join(dir, "SKILL.md"));
+  try {
+    const dir = userSkillDir();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(bundledSkillFile(), path.join(dir, "SKILL.md"));
   fs.writeFileSync(path.join(dir, MARKER), new Date().toISOString() + "\n");
   // Drop markers from earlier server names so the directory carries exactly one.
   for (const legacy of LEGACY_MARKERS) {
     try { fs.rmSync(path.join(dir, legacy), { force: true }); } catch { /* best effort */ }
   }
-  return { installed: true, dir, from: bundledSkillFile() };
+    return { installed: true, dir, from: bundledSkillFile() };
+  } catch (e) {
+    // locked dir / AV / read-only home: degrade to the inline fallback prompt
+    // instead of an opaque SDK-level throw out of the tool handler
+    return { installed: false, reason: `skill install failed (${e?.message || e})` };
+  }
 }
 
 export function uninstallBundledSkill() {

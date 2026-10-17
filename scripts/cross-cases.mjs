@@ -255,18 +255,29 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
   check("C8", "finished poll returns the full report", /STUB-REPORT-OK/.test(textOf(p2)) && p2.result?.structuredContent?.status === "success" && p2.result.structuredContent.sessionId === "stub-session-0001", textOf(p2).slice(0, 200));
   const unknown = await s.call("claude_review_status", { jobId: "job-nope" });
   check("C8", "unknown jobId -> clear error", unknown.result?.isError === true);
-  // cancel path + process-tree kill
+  // cancel path + process-tree kill. The stub writes its pid to the OS temp dir;
+  // wait for it to APPEAR first — reading a missing file used to pass vacuously.
+  const pidFile = path.join(os.tmpdir(), "stub-claude-test.pid");
+  fs.rmSync(pidFile, { force: true });
   const r3 = await s.call("claude_code_review", { repoPath: repo, scope: "last-commit" });
   const j3 = r3.result?.structuredContent?.jobId;
+  let stubPid = null;
+  for (let i = 0; i < 20 && stubPid === null; i++) {
+    await new Promise((res) => setTimeout(res, 250));
+    try { stubPid = Number(fs.readFileSync(pidFile, "utf8")); } catch { /* not yet */ }
+  }
+  check("C8", "stub claude reached its pidfile (no vacuous pass)", Number.isInteger(stubPid) && stubPid > 0, `pid=${stubPid}`);
   const c1 = await s.call("claude_review_status", { jobId: j3, cancel: true });
   check("C8", "cancel accepted", /cancel/i.test(textOf(c1)));
   await new Promise((res) => setTimeout(res, 3500));
   const c2 = await s.call("claude_review_status", { jobId: j3 });
   check("C8", "cancelled job settles (done, error result)", c2.result?.structuredContent?.status !== "running" && (c2.result?.isError === true || /STUB-REPORT-OK/.test(textOf(c2))), textOf(c2).slice(0, 150));
-  const pidFile = STUB + ".pid";
-  let pidGone = true;
-  try { const pid = Number(fs.readFileSync(pidFile, "utf8")); process.kill(pid, 0); pidGone = false; } catch { pidGone = true; }
-  check("C8", "stub claude process actually killed", pidGone);
+  let pidGone = false;
+  if (Number.isInteger(stubPid)) {
+    try { process.kill(stubPid, 0); pidGone = false; } catch { pidGone = true; }
+  }
+  check("C8", "stub claude process actually killed", pidGone && Number.isInteger(stubPid));
+  fs.rmSync(pidFile, { force: true });
   s.kill();
 }
 

@@ -72,7 +72,7 @@ npm run init
 }
 ```
 
-> 工具名（`claude_code_review` / `claude_review_followup` / `claude_review_env`）与环境变量前缀（`CLAUDE_REVIEW_*`）**保持稳定**，不随 server 名改变——已注册过的调用方与脚本无需跟着改，改的只是 server 键名（工具前缀从 `mcp__claude-review__*` 变成 `mcp__cc-code-review__*`）。
+> 工具名（`claude_code_review` / `claude_review_status` / `claude_review_followup` / `claude_review_env`）与环境变量前缀（`CLAUDE_REVIEW_*`）**保持稳定**，不随 server 名改变——已注册过的调用方与脚本无需跟着改，改的只是 server 键名（工具前缀从 `mcp__claude-review__*` 变成 `mcp__cc-code-review__*`）。
 
 ## 工具
 
@@ -95,7 +95,7 @@ npm run init
 | `maxBudgetUsd` | `5` | 0–50 | API 花费上限（`--max-budget-usd`，0 = 关闭；第三方网关下依赖网关返回 usage，按 Anthropic 官方单价估算，可能不准或提前中止） |
 | `installSkillIfMissing` | `true` | - | skill 缺失时自动安装 |
 
-返回：markdown 报告（Review Summary / Findings / Notes）+ 元数据（`session_id`、花费、轮数、日志路径）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
+返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（Review Summary / Findings / Notes）+ 元数据（`session_id`、花费、轮数、日志路径）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
 
 ### 2. `claude_review_status` — 轮询/获取/取消后台 review 任务（免费）
 
@@ -216,9 +216,10 @@ v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `sh
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（152 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（158 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
+node scripts/cross-cases.mjs                    # 10 个 MECE 用例（44 项检查；含桩 claude 的免费异步生命周期；C9 付费需 CC_LOOP_PAID=1）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）
 node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立刻杀掉（计费，几美分）

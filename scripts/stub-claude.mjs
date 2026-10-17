@@ -4,6 +4,7 @@
 // and a -p headless run that sleeps, emits a valid stream-json result, exits 0.
 // Writes a pidfile next to itself so tests can verify the process tree was killed.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -29,7 +30,9 @@ if (args.includes("--help")) {
 }
 
 // headless review: drain stdin, sleep, emit result
-try { fs.writeFileSync(self + ".pid", String(process.pid)); } catch { /* best effort */ }
+// in the OS temp dir, not the package dir — "npm pack" ships scripts/ wholesale
+const pidFile = path.join(os.tmpdir(), "stub-claude-test.pid");
+try { fs.writeFileSync(pidFile, String(process.pid)); } catch { /* best effort */ }
 process.stdin.resume();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 await sleep(4000);
@@ -43,5 +46,5 @@ if (args.includes("stream-json")) {
   console.log(JSON.stringify({ type: "system", subtype: "init", session_id: result.session_id }));
 }
 console.log(JSON.stringify(result));
-try { fs.rmSync(self + ".pid", { force: true }); } catch { /* best effort */ }
+try { fs.rmSync(pidFile, { force: true }); } catch { /* best effort */ }
 process.exit(0);

@@ -73,7 +73,7 @@ Manual config (equivalent, for those who prefer not to run a script) — note `c
 
 On macOS, replace `command` with your local node absolute path (e.g. `/usr/local/bin/node` or `/opt/homebrew/bin/node`). Restart ZCode (or reconnect the MCP) after editing. Tool names: `mcp__cc-code-review__claude_code_review` and friends.
 
-> Tool names (`claude_code_review` / `claude_review_followup` / `claude_review_env`) and the env-var prefix (`CLAUDE_REVIEW_*`) are **stable** — they do not follow the server name, so existing callers and scripts need no changes; only the server key changed (the tool prefix went from `mcp__claude-review__*` to `mcp__cc-code-review__*`).
+> Tool names (`claude_code_review` / `claude_review_status` / `claude_review_followup` / `claude_review_env`) and the env-var prefix (`CLAUDE_REVIEW_*`) are **stable** — they do not follow the server name, so existing callers and scripts need no changes; only the server key changed (the tool prefix went from `mcp__claude-review__*` to `mcp__cc-code-review__*`).
 
 ## Tools
 
@@ -96,7 +96,7 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `maxBudgetUsd` | `5` | 0–50 | API spend cap (`--max-budget-usd`, 0 = disabled; behind third-party gateways this depends on the gateway reporting usage and is estimated at Anthropic list prices — may be inaccurate or trip early) |
 | `installSkillIfMissing` | `true` | - | auto-install the skill when missing |
 
-Returns: a markdown report (Review Summary / Findings / Notes) + metadata (`session_id`, spend, turns, log path). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
+Returns (async by default: a jobId (<1s) plus the preflight verdict, with the report fetched via claude_review_status(jobId); with waitForResult: true the synchronous form below applies): a markdown report (Review Summary / Findings / Notes) + metadata (`session_id`, spend, turns, log path). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
 
 ### 2. `claude_review_status` — poll / fetch / cancel a background review (free)
 
@@ -217,9 +217,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (152, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (158, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
+node scripts/cross-cases.mjs                    # 10 MECE cases (44 checks; free stub-claude async lifecycle; C9 paid needs CC_LOOP_PAID=1)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)
 node scripts/cancel-test.mjs <repoPath>         # is the process tree killed right after cancel (billed, a few cents)

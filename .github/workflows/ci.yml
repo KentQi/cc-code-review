@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The project's whole promise is cross-platform correctness — test on all three.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install
+      # These two suites are hermetic: no claude CLI, no network, no spend.
+      # smoke-test / validation-test additionally need a Claude Code install,
+      # so they stay as local commands (see CONTRIBUTING.md).
+      - run: node scripts/shell-guard-test.mjs
+      - run: node scripts/audit-fixes-test.mjs

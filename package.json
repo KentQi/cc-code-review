@@ -1,0 +1,55 @@
+{
+  "name": "cc-code-review",
+  "version": "1.6.0",
+  "description": "MCP server (cc-code-review) that wraps Claude Code's headless mode to run the code-review skill (5 parallel reviewer subagents, 0-100 confidence scoring, >=80 filter) and returns the findings to ZCode or any other MCP client.",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "cc-code-review": "src/index.js"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "KentQi",
+    "url": "https://github.com/KentQi"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KentQi/cc-code-review.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KentQi/cc-code-review/issues"
+  },
+  "homepage": "https://github.com/KentQi/cc-code-review#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "claude",
+    "code-review",
+    "zcode",
+    "cc-switch"
+  ],
+  "files": [
+    "src",
+    "scripts",
+    "assets",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "smoke": "node scripts/smoke-test.mjs",
+    "validate": "node scripts/validation-test.mjs",
+    "test": "node scripts/shell-guard-test.mjs && node scripts/audit-fixes-test.mjs && node scripts/smoke-test.mjs"
+  },
+  "engines": {
+    "node": ">=18.19"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.25.0"
+  }
+}

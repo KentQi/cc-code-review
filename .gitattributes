@@ -1,0 +1,6 @@
+# Normalize line endings: this repo is developed on Windows and executed on
+# Windows and macOS; keep the working tree LF everywhere so diffs and the
+# shell-hook scripts stay identical across platforms.
+* text=auto eol=lf
+*.png binary
+*.ico binary

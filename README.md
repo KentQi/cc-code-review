@@ -4,6 +4,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.19-brightgreen)
 
+[English](README.en.md) | 简体中文
+
 **EN**: An MCP server that wraps Claude Code's code-review skill (5 parallel reviewer subagents, 0–100 confidence scoring, keeps findings ≥ 80). Run reviews — PR / branch / working dir / last commit, effort `low→max`, optional fix mode — from ZCode or any MCP client and get the full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI.
 
 把 **Claude Code 的 code review 能力**封装成 MCP server，让 ZCode（或任何 MCP 客户端）直接调用：
@@ -200,7 +202,7 @@ v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `sh
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（63 条，免费）+ 审计修复单测（146 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（146 条，免费）+ stdio 握手/环境检查
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）
@@ -209,7 +211,7 @@ node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立
 
 `validation-test.mjs` 覆盖：相对 `repoPath` 拒绝、恶意 `pr` 拒绝、多行 `outputLanguage` 拒绝、空仓库拒绝、非 git 目录拒绝、`maxBudgetUsd=0` 被 schema 接受、`baseRef` 以 `-` 开头拒绝、`focus` 含控制字符/超长拒绝、guard 未生效时两个工具都 fail-closed 拒跑、以及 `CLAUDE_REVIEW_ALLOW_UNGUARDED=1` 的显式解锁。全部在付费调用之前返回——唯一例外是"clean repo 通过 preflight"这条（它会真的发起一次有预算上限的付费 run），默认跳过，设 `CC_REVIEW_ALLOW_PAID_PROBE=1` 才执行。
 
-`shell-guard-test.mjs` 覆盖：链式/重定向/替换命令必须拦、`git log --format="%h; %s"` 这类引号内分隔符必须放行、引号不配对 fail-closed、hook 进程的 stdin→deny 契约、Edit/Write/Read 的仓库边界与 `.git/`/密钥路径拦截，以及一次真实 5-subagent review 的 17 条命令回放（确认被拦的命令不会被误报成"逃逸"）。
+`shell-guard-test.mjs` 覆盖：链式/重定向/替换命令必须拦、`git log --format="%h; %s"` 这类引号内分隔符必须放行、引号不配对 fail-closed、hook 进程的 stdin→deny 契约、Edit/Write/Read 的仓库边界与 `.git/`/密钥路径拦截、仓库内 junction/软链接逃逸（realpath 边界），以及一次真实 5-subagent review 的 17 条命令回放（确认被拦的命令不会被误报成"逃逸"）。
 
 `audit-fixes-test.mjs` 覆盖三轮独立审计的每条修复：deny 列表覆盖面与"同一规则同时出现在 allow/deny 里变成死规则"的冲突、**allow 规则被 deny 规则前缀遮蔽**（`Bash(git remote -v)` vs `Bash(git remote:*)`，真实 review 发现的）、`postToPR` 授权不是死代码、版本比较（含预发布号）、git hardening 的 `-c` 参数、`repoRunsGitPrograms` 的精确性（fsmonitor 布尔不误伤、LFS 全局驱动不误伤、`[include]` 链与 `.gitattributes`↔config 交叉核对都查得出）、hook 的 `git --output=` 规则、提示词里 caller 数据只能是数据，以及一次真实 review 的命令回放（allowlist 与 deny 两侧都要放行）。
 

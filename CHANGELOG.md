@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.1 — 2026-10-17
+
+Security fixes from an independent cross-audit of the v1.7.0 liveness gate — four FALSE-DOWNGRADE holes, each letting a repo-chosen program execute under the reviewer's first read-only git command while the gate reported only a note:
+
+- **H1** paths with spaces were truncated to the first token before the liveness probe (`C:...dir with spacewatch.exe` → `C:...dir` → "dead"). Now every space-boundary prefix is probed, quote-stripped both raw and separator-swapped.
+- **H2** the .gitattributes cross-check stopped at the first `diff=/filter=` match per file — a live driver listed after a dead one passed silently. All references on all lines are now evaluated.
+- **H3** the one-directory-deep .gitattributes scan had an inverted condition — NO real subdirectory was ever scanned. Fixed.
+- **H4** git worktrees/submodules: `.git` is a FILE (`gitdir: ...`) and the pointer file was scanned as config text, so the real config (per-worktree AND the common config named by `commondir`) was never checked. Both are now followed.
+- **M1** dead-UNC existsSync probes stalled ~21s each in the request path — UNC values are now always treated as live (refuse, safe direction). **M2** commented config lines no longer refuse. **M3** drive-relative paths probe against the repo's drive, not the server cwd's.
+- 6 new regression tests lock H1-H4 + M2 (the worktree test builds a real `git worktree`). Suite: 67 + 158 + smoke.
+
 ## 1.8.0 — 2026-10-17
 
 - **Async review jobs (the big one).** Real reviews take 2-15 minutes, but MCP clients commonly cut tool calls at ~30s — in a real-world test the calling agent had to re-implement the invocation by hand to work around it. `claude_code_review` now returns a **jobId in under a second** (after the full free preflight: validation, hardening gate, git preflight, gateway probe — synchronous errors still return synchronously), runs the review in the background, and the report is fetched with the new **`claude_review_status`** tool (poll while running, full result when done, `cancel: true` aborts and stops billing, no-arg lists jobs). `waitForResult: true` restores the synchronous contract. Verified with a real paid run: 297ms to jobId, 195s to report. `npm run init` now also writes `timeoutMs: 1800000` into the registration.

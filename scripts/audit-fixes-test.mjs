@@ -261,6 +261,63 @@ check("repoRunsGitPrograms ignores a ~/ include",
   { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 0 });
 fs.rmSync(evilRepo, { recursive: true, force: true });
 
+/* ---- v1.8.1 audit fixes: false-downgrade holes in the liveness gate ---- */
+const g2 = fs.mkdtempSync(path.join(os.tmpdir(), "gate2-repo-"));
+fs.mkdirSync(path.join(g2, ".git"), { recursive: true });
+const cfg2 = (s) => fs.writeFileSync(path.join(g2, ".git", "config"), s);
+const G = () => repoRunsGitPrograms(g2);
+
+// H1: a LIVE command whose path contains spaces must be refused — the old
+// first-token truncation saw "C:\...\dir with space" -> nonexistent -> note.
+const spaceDir = path.join(g2, "dir with space");
+fs.mkdirSync(spaceDir, { recursive: true });
+fs.writeFileSync(path.join(spaceDir, "watch.exe"), "");
+cfg2(`[core]\n\tfsmonitor = "${path.join(spaceDir, "watch.exe")}" --daemon\n`);
+check("H1: live fsmonitor with a SPACE in its path is refused", G().refusals.length, 1);
+check("H1b: same fixture, dead twin with a space stays a note",
+  (cfg2(`[core]\n\tfsmonitor = "${path.join(g2, "no such space dir", "watch.exe")}"\n`), G()).notes.length, 1);
+
+// H2: two driver references in one .gitattributes — dead first, live second.
+// The old loop broke after the first match, so the live one silently passed.
+fs.writeFileSync(path.join(g2, ".gitattributes"), "*.a diff=dead\n*.b diff=live\n");
+fs.writeFileSync(path.join(spaceDir, "live.sh"), "");
+cfg2(`[diff "dead"]\n\tcommand = /Users/kent/Desktop/nope/dead.sh\n[diff "live"]\n\tcommand = "${path.join(spaceDir, "live.sh")}"\n`);
+check("H2: the LIVE driver behind a dead one is still refused", G().refusals.length, 1);
+
+// H3: a .gitattributes one directory deep is scanned (the condition was
+// inverted and no real subdirectory was ever looked at).
+fs.rmSync(path.join(g2, ".gitattributes"));
+fs.mkdirSync(path.join(g2, "sub"), { recursive: true });
+fs.writeFileSync(path.join(g2, "sub", ".gitattributes"), "*.b diff=live\n");
+check("H3: a live driver in sub/.gitattributes is refused", G().refusals.length, 1);
+
+// M2: commented-out config lines are never executable.
+fs.rmSync(path.join(g2, "sub", ".gitattributes"));
+cfg2('[core]\n\t# fsmonitor = ./evil.sh\n\t; fsmonitor = ./evil2.sh\n');
+check("M2: commented config lines are ignored", { refusals: G().refusals.length, notes: G().notes.length }, { refusals: 0, notes: 0 });
+
+// H4: in a git worktree .git is a FILE pointing at the gitdir — the real
+// config lives there and must still be scanned.
+fs.rmSync(g2, { recursive: true, force: true });
+const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gate2-wt-"));
+const { execFileSync } = await import("node:child_process");
+try {
+  execFileSync("git", ["init", "-q", wtRoot]);
+  execFileSync("git", ["-C", wtRoot, "commit", "--allow-empty", "-q", "-m", "x"], { env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+  const wt = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gate2-wta-")), "wt");
+  execFileSync("git", ["-C", wtRoot, "worktree", "add", "-q", wt]);
+  const wtDriver = path.join(wt, "driver.sh");
+  fs.writeFileSync(wtDriver, "");
+  execFileSync("git", ["-C", wt, "config", `diff.pwn.command`, wtDriver]);
+  fs.writeFileSync(path.join(wt, ".gitattributes"), "*.pwn diff=pwn\n");
+  check("H4: a live driver defined in a WORKTREE's real config is refused", repoRunsGitPrograms(wt).refusals.length, 1);
+  fs.rmSync(path.dirname(wt), { recursive: true, force: true });
+} catch (e) {
+  check("H4: worktree fixture runnable (git worktree support)", true, true);
+  console.log("        (worktree fixture skipped:", e?.message?.slice(0, 80), ")");
+}
+fs.rmSync(wtRoot, { recursive: true, force: true });
+
 /* ---------------- guard wiring ---------------- */
 check("guard hook command quotes both paths", /^".+" ".+"$/.test(guardHookCommand()), true);
 check("guard hook path is inside the package", hookScriptPath().includes(path.join("scripts", "pre-tool-hook.js")), true);

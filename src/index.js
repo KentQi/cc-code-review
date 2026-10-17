@@ -331,7 +331,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.8.0";
+const SERVER_VERSION = "1.8.1";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {

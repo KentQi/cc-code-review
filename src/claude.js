@@ -1149,18 +1149,33 @@ const INCLUDE_PATH = /^\s*path\s*=\s*(.+?)\s*$/i;
  * form counts as dead. Bare commands (`sh -c ...`) resolve through PATH and
  * shells we do not fully model, so they stay refusals.
  */
-function deadPathOnThisMachine(value) {
+function deadPathOnThisMachine(value, repoPath) {
   const v = String(value || "").trim().replace(/^["']|["']$/g, "");
   if (!v) return false;
   const isAbs = v.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(v) || v.startsWith("\\\\");
   if (!isAbs) return false; // relative/bare: resolves against cwd/PATH — not provably dead
-  // Strip a trailing " argument" part: hooksPath takes a directory, drivers take
-  // "cmd arg..."; for liveness only the leading path token matters.
-  const token = v.split(/\s+/)[0];
+  // UNC paths are never "dead": an existsSync against a dead server stalls ~21s
+  // per probe, and reachability of the share is not proof about the target.
+  if (v.startsWith("\\\\")) return false;
+  // A drive-RELATIVE path (/x or \x) resolves against the REPO's drive for git,
+  // not this server's cwd drive — anchor it there before probing.
+  const anchored = /^[\\/][^\\/]/.test(v) && repoPath && /^[a-zA-Z]:/.test(repoPath)
+    ? repoPath.slice(0, 2) + v : v;
+  // H1: a path containing SPACES must not be truncated to its first token —
+  // "C:\Program Files\t\watch.exe" truncated to "C:\Program" would look dead
+  // while git happily executes the full path. Probe every prefix that ends at a
+  // space boundary (longest first, then shorter): if ANY exists, it is live.
+  const pieces = anchored.split(/\s+/);
+  const prefixes = [];
+  for (let i = pieces.length; i >= 1; i--) prefixes.push(pieces.slice(0, i).join(" "));
   try {
-    if (fs.existsSync(token)) return false;
-    const swapped = token.replace(/[\\/]/g, (c) => (c === "/" ? "\\" : "/"));
-    if (fs.existsSync(swapped)) return false;
+    for (const p of prefixes) {
+      for (const cand of [p, p.replace(/"/g, "")]) {
+        if (fs.existsSync(cand)) return false;
+        const swapped = cand.replace(/[\\/]/g, (c) => (c === "/" ? "\\" : "/"));
+        if (fs.existsSync(swapped)) return false;
+      }
+    }
   } catch { return false; }
   return true;
 }
@@ -1202,7 +1217,26 @@ function repoConfigFiles(repoPath) {
   };
   try {
     const st = fs.statSync(gitDir);
-    walk(st.isDirectory() ? path.join(gitDir, "config") : gitDir, ".git/config", 0);
+    if (st.isDirectory()) {
+      walk(path.join(gitDir, "config"), ".git/config", 0);
+    } else {
+      // A worktree (or submodule): .git is a FILE "gitdir: <path>". The real
+      // config lives in the gitdir — scanning the pointer file scans nothing.
+      const text = fs.readFileSync(gitDir, "utf8");
+      const m = /^gitdir:\s*(.+)$/m.exec(text);
+      if (m) {
+        const real = m[1].trim();
+        walk(path.join(real, "config"), `${path.basename(repoPath)}/.git -> gitdir/config`, 0);
+        const wtCfg = path.join(real, "config.worktree");
+        if (fs.existsSync(wtCfg)) walk(wtCfg, `${path.basename(repoPath)}/.git -> config.worktree`, 0);
+        // By default `git config` inside a worktree writes the COMMON config;
+        // the gitdir's `commondir` file names it (relative to the gitdir).
+        try {
+          const cd = fs.readFileSync(path.join(real, "commondir"), "utf8").trim();
+          if (cd) walk(path.join(real, cd, "config"), `${path.basename(repoPath)}/.git -> commondir/config`, 0);
+        } catch { /* no commondir file: not a worktree gitdir */ }
+      }
+    }
   } catch { /* no .git: nothing repo-controlled to scan */ }
   return out;
 }
@@ -1212,7 +1246,7 @@ function repoAttributeFiles(repoPath) {
   const rels = [".gitattributes", path.join(".git", "info", "attributes")];
   try {
     for (const e of fs.readdirSync(repoPath, { withFileTypes: true })) {
-      if (!e.isDirectory() || e.name === ".git" || e.name === "node_modules") rels.push(path.join(e.name, ".gitattributes"));
+      if (e.isDirectory() && e.name !== ".git" && e.name !== "node_modules") rels.push(path.join(e.name, ".gitattributes"));
     }
   } catch { /* unreadable dir: the top-level scans still ran */ }
   const out = [];
@@ -1270,7 +1304,7 @@ export function repoRunsGitPrograms(repoPath) {
 
   const classify = (label, line, val) => {
     const shown = `${label}: ${line.trim().slice(0, 120)}`;
-    if (deadPathOnThisMachine(val)) notes.push(`${shown} — path does not exist on this machine (stale cross-machine config); cannot execute, proceeding`);
+    if (deadPathOnThisMachine(val, repoPath)) notes.push(`${shown} — path does not exist on this machine (stale cross-machine config); cannot execute, proceeding`);
     else refusals.push(shown);
   };
 
@@ -1282,9 +1316,11 @@ export function repoRunsGitPrograms(repoPath) {
       for (const line of sec.lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
+        // git config comments: # or ; to end of line — never executable
+        if (/^\s*[#;]/.test(line)) continue;
         const hp = valueOf(line, HOOKS_PATH);
         if (hp) {
-          const dead = deadPathOnThisMachine(hp);
+          const dead = deadPathOnThisMachine(hp, repoPath);
           notes.push(`${label}: ${trimmed.slice(0, 120)}${dead
             ? " — hooksPath points at a path that does not exist on this machine (stale cross-machine config); ignored"
             : " — noted, not refused: git hooks fire only on mutating operations, which the review allowlist never grants; this server's own git calls also neutralise core.hooksPath via -c"}`);
@@ -1297,13 +1333,13 @@ export function repoRunsGitPrograms(repoPath) {
           // The include itself is not execution; repoConfigFiles() already walked a
           // readable target and its contents are evaluated like any other config.
           // A dead target is a git no-op (git silently ignores unreadable includes).
-          if (deadPathOnThisMachine(raw)) notes.push(`${label}: ${trimmed.slice(0, 120)} — include target does not exist on this machine; git ignores it`);
+          if (deadPathOnThisMachine(raw, repoPath)) notes.push(`${label}: ${trimmed.slice(0, 120)} — include target does not exist on this machine; git ignores it`);
           continue;
         }
         if (!isCmdLine(line)) continue;
         const val = rhs(line) ?? "";
         if (dm) {
-          const dead = deadPathOnThisMachine(val);
+          const dead = deadPathOnThisMachine(val, repoPath);
           if (!dead) driverLive.set(dm[1].toLowerCase(), true);
           else if (!driverLive.has(dm[1].toLowerCase())) driverLive.set(dm[1].toLowerCase(), false);
           continue;
@@ -1317,14 +1353,15 @@ export function repoRunsGitPrograms(repoPath) {
   }
 
   for (const { label: aLabel, text: aText } of repoAttributeFiles(repoPath)) {
+    // EVERY driver reference on EVERY line matters (H2): stopping at the first
+    // match let a live driver hide behind a dead one listed earlier.
     for (const line of aText.split(/\r?\n/)) {
-      const m = /\b(?:diff|filter)\s*=\s*([\w.-]+)/i.exec(line);
-      if (!m) continue;
-      const live = driverLive.get(m[1].toLowerCase()) === true;
-      const shown = `${aLabel}: ${line.trim().slice(0, 120)} (driver "${m[1]}" is defined in the repo's git config)`;
-      if (live) refusals.push(shown);
-      else if (driverLive.has(m[1].toLowerCase())) notes.push(`${shown} — the driver's command points at a path that does not exist on this machine; cannot execute, proceeding`);
-      break;
+      for (const m of line.matchAll(/\b(?:diff|filter)\s*=\s*([\w.-]+)/gi)) {
+        const live = driverLive.get(m[1].toLowerCase()) === true;
+        const shown = `${aLabel}: ${line.trim().slice(0, 120)} (driver "${m[1]}" is defined in the repo's git config)`;
+        if (live) refusals.push(shown);
+        else if (driverLive.has(m[1].toLowerCase())) notes.push(`${shown} — the driver's command points at a path that does not exist on this machine; cannot execute, proceeding`);
+      }
     }
   }
   return { refusals, notes };

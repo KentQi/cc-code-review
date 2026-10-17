@@ -141,29 +141,48 @@ const entry = {
 };
 
 let config = {};
+let sawParseProblem = false;
 try {
   config = JSON.parse(fs.readFileSync(zcodeConfigPath, "utf8"));
-} catch { /* missing or unparsable: start fresh (we only create it if missing) */
-  const raw = fs.existsSync(zcodeConfigPath) ? fs.readFileSync(zcodeConfigPath, "utf8") : null;
+} catch (e) {
+  sawParseProblem = true;
+  const raw = fs.existsSync(zcodeConfigPath) && fs.statSync(zcodeConfigPath).isFile()
+    ? fs.readFileSync(zcodeConfigPath, "utf8") : null;
   if (raw && raw.trim()) {
-    bad(`cannot parse ${zcodeConfigPath} — fix it manually, then re-run; nothing was written`);
+    bad(`cannot parse ${zcodeConfigPath} (${e?.message || e}) — fix it manually, then re-run; nothing was written`);
+    process.exit(1);
+  }
+  config = {};
+}
+// A top-level JSON value that is not an object (null/123/true/"str"/[]) cannot
+// carry servers; treat it like an unparsable file rather than crashing.
+if (sawParseProblem || typeof config !== "object" || config === null || Array.isArray(config)) {
+  if (typeof config !== "object" || config === null || Array.isArray(config)) {
+    bad(`${zcodeConfigPath} is not a JSON object — fix it manually, then re-run; nothing was written`);
     process.exit(1);
   }
 }
-config.mcp = config.mcp && typeof config.mcp === "object" ? config.mcp : {};
-config.mcp.servers = config.mcp.servers && typeof config.mcp.servers === "object" ? config.mcp.servers : {};
+config.mcp = config.mcp && typeof config.mcp === "object" && !Array.isArray(config.mcp) ? config.mcp : {};
+config.mcp.servers = config.mcp.servers && typeof config.mcp.servers === "object" && !Array.isArray(config.mcp.servers) ? config.mcp.servers : {};
 
 const prev = config.mcp.servers["cc-code-review"];
-if (prev && prev.command === entry.command && JSON.stringify(prev.args) === JSON.stringify(entry.args)
-    && JSON.stringify(prev.env || {}) === JSON.stringify(entry.env || {})) {
+const prevObj = prev && typeof prev === "object" && !Array.isArray(prev) ? prev : null;
+// Migration: `environment` is a legacy key ZCode's strict schema silently drops
+// (CLI parsing tolerates it; the desktop path expects `env`) — carrying it
+// forward forever looks configured while doing nothing.
+if (prevObj && prevObj.environment != null) delete prevObj.environment;
+// Preserve a user-customized timeout; only stamp the default when absent.
+const timeoutMs = prevObj?.timeoutMs ?? entry.timeoutMs;
+const finalEntry = { ...(prevObj || {}), ...entry, timeoutMs };
+if (prevObj && prevObj.command === entry.command && JSON.stringify(prevObj.args) === JSON.stringify(entry.args)
+    && JSON.stringify(prevObj.env || {}) === JSON.stringify(entry.env || {}) && prevObj.timeoutMs === timeoutMs) {
   ok("already registered with the correct paths for this machine — nothing to change");
 } else {
-  // Preserve unknown extra fields (enabled / timeoutMs / cwd) on an existing entry.
-  config.mcp.servers["cc-code-review"] = { ...(prev && typeof prev === "object" ? prev : {}), ...entry };
+  config.mcp.servers["cc-code-review"] = finalEntry;
   const dir = path.dirname(zcodeConfigPath);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(zcodeConfigPath, JSON.stringify(config, null, 2) + "\n");
-  ok(prev ? `updated existing entry (was: ${prev.command} ${(prev.args || [])[0] ?? ""})` : "created new entry");
+  ok(prevObj ? `updated existing entry (was: ${prevObj.command} ${(prevObj.args || [])[0] ?? ""})` : "created new entry");
 }
 say(`  ${JSON.stringify({ "cc-code-review": config.mcp.servers["cc-code-review"] }, null, 2).split("\n").slice(1, -1).join("\n")}`);
 say("");

@@ -504,6 +504,7 @@ for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
 process.on("exit", () => {
   for (const c of liveChildren) { try { killTree(c); } catch { /* best effort */ }
   }
+  guardSettingsInFlight.clear(); // exit: nothing is in-flight any more
   cleanupGuardSettings();
   // Our throwaway git HOME (built lazily in gitSpawnOpts) — sync removal in an
   // exit handler is safe and stops one temp dir leaking per server process.
@@ -637,9 +638,23 @@ export function removeGuardSettings(file) {
 // check per process. cleanupGuardSettings() is called by the env tool and on
 // process exit so nothing survives the server.
 const guardSettingsFiles = new Set();
+// Files handed to a run that has not spawned claude yet. cleanupGuardSettings()
+// skips these: between writeGuardSettings() and the spawn sit several awaits,
+// and a concurrent claude_review_env could delete the file in that window — the
+// review would then run with --settings pointing at nothing, i.e. unguarded
+// while the report claimed the hardening was on.
+const guardSettingsInFlight = new Set();
+export function markGuardSettingsInFlight(file, on) {
+  if (!file) return;
+  if (on) guardSettingsInFlight.add(file);
+  else guardSettingsInFlight.delete(file);
+}
 export function cleanupGuardSettings() {
-  for (const f of guardSettingsFiles) removeGuardSettings(f);
-  guardSettingsFiles.clear();
+  for (const f of [...guardSettingsFiles]) {
+    if (guardSettingsInFlight.has(f)) continue;
+    removeGuardSettings(f);
+    guardSettingsFiles.delete(f);
+  }
 }
 
 /**
@@ -907,6 +922,9 @@ export function runClaude({
       return;
     }
     liveChildren.add(child);
+    // claude has read --settings at startup by the time spawn returns; from here
+    // the guard file is fair game for cleanup again (see guardSettingsInFlight).
+    guardSettingsInFlight.delete(guardSettings);
 
     const started = Date.now();
     const soChunks = [];
@@ -1225,7 +1243,10 @@ function repoConfigFiles(repoPath) {
       const text = fs.readFileSync(gitDir, "utf8");
       const m = /^gitdir:\s*(.+)$/m.exec(text);
       if (m) {
-        const real = m[1].trim();
+        // Submodules carry a RELATIVE gitdir (`gitdir: ../.git/modules/sub`)
+        // resolved against the superproject (= repoPath here) — resolve against
+        // it, never against this server's cwd.
+        const real = path.resolve(repoPath, m[1].trim());
         walk(path.join(real, "config"), `${path.basename(repoPath)}/.git -> gitdir/config`, 0);
         const wtCfg = path.join(real, "config.worktree");
         if (fs.existsSync(wtCfg)) walk(wtCfg, `${path.basename(repoPath)}/.git -> config.worktree`, 0);

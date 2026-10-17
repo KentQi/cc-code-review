@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.8.2 — 2026-10-17
+
+Loop-tested with a 10-case MECE suite (scripts/cross-cases.mjs, free via a stub claude + one paid e2e) plus two more independent audits; all findings fixed:
+
+- **[H] submodule relative gitdir**: repoConfigFiles resolved gitdir paths against the server cwd — a submodule gitdir config (relative form) was never scanned. Now resolved against the superproject.
+- **[M] pre-spawn guard-file race**: a concurrent claude_review_env could delete a pending run guard settings file between write and spawn — the review then ran unguarded while the report claimed hardening. Guard files are now marked in-flight until claude has spawned.
+- **[M] client-cancel orphan**: cancelling the initial async claude_code_review call now also aborts the background job (was recoverable only via the job list).
+- **[M] init**: legacy environment key migrated away; user-custom timeoutMs preserved (was clobbered to 1800000); the nothing-to-change fast path also compares timeoutMs; non-object config.json (null/number/array) and EISDIR now fail cleanly instead of crashing.
+- New: scripts/cross-cases.mjs (10 MECE cases, 44 checks) + scripts/stub-claude.mjs; cc-loop state under .cc-loop/ (untracked).
+
 ## 1.8.1 — 2026-10-17
 
 Security fixes from an independent cross-audit of the v1.7.0 liveness gate — four FALSE-DOWNGRADE holes, each letting a repo-chosen program execute under the reviewer's first read-only git command while the gate reported only a note:

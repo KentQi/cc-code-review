@@ -1,6 +1,6 @@
 {
   "name": "cc-code-review",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "description": "MCP server (cc-code-review) that wraps Claude Code's headless mode to run the code-review skill (5 parallel reviewer subagents, 0-100 confidence scoring, >=80 filter) and returns the findings to ZCode or any other MCP client.",
   "type": "module",
   "main": "src/index.js",

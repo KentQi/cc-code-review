@@ -27,7 +27,7 @@ import {
   PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN,
   supportsFlag, supportsStreamJson, supportsPermissionPrompts,
   writeGuardSettings, guardState, guardSelfTest, hookScriptPath, removeGuardSettings,
-  cleanupGuardSettings, settingsParseProblem, peekSettingsEnv,
+  cleanupGuardSettings, settingsParseProblem, peekSettingsEnv, markGuardSettingsInFlight,
   analyseCommand, gitWriteFlagReason, shellGuardNote, shellChainingNote,
   probeGateway, gatewayTarget, authEnvResidue, modelEnvOverrides, gitPreflight,
   buildClaudeEnv, repoRunsGitPrograms,
@@ -331,7 +331,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.8.1";
+const SERVER_VERSION = "1.8.2";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -630,6 +630,9 @@ server.tool(
     if (!hard.ok) return err(hard.error);
     const { guard, guardSettings, permissionMode, permissionPrompts, hardening } = hard;
     const guardSetupNote = hard.note;
+    // Guarded from here until runClaude's spawn returns: a concurrent
+    // claude_review_env must not delete this file before claude has read it.
+    markGuardSettingsInFlight(guardSettings, true);
 
     if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
       return err(`repoPath does not exist or is not a directory: ${repoPath}`);
@@ -925,6 +928,9 @@ server.tool(
       startedAt, state: "running", result: null, abort: jobAbort,
     };
     reviewJobs.set(jobId, job);
+    // The client cancelling THIS initial call must not orphan the background
+    // run: tie its signal to the job's abort as well.
+    extra?.signal?.addEventListener("abort", () => jobAbort.abort(), { once: true });
     void executeRun(jobAbort.signal, undefined)
       .then((result) => { job.result = result; job.state = "done"; job.finishedAt = Date.now(); })
       .catch((e) => { job.result = err(`review job crashed: ${e?.message || e}`); job.state = "done"; job.finishedAt = Date.now(); })

@@ -1,6 +1,6 @@
 {
   "name": "cc-code-review",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "MCP server (cc-code-review) that wraps Claude Code's headless mode to run the code-review skill (5 parallel reviewer subagents, 0-100 confidence scoring, >=80 filter) and returns the findings to ZCode or any other MCP client.",
   "type": "module",
   "main": "src/index.js",
@@ -41,6 +41,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
+    "init": "node scripts/init.mjs",
     "smoke": "node scripts/smoke-test.mjs",
     "validate": "node scripts/validation-test.mjs",
     "test": "node scripts/shell-guard-test.mjs && node scripts/audit-fixes-test.mjs && node scripts/smoke-test.mjs"

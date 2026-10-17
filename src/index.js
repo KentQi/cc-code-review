@@ -323,7 +323,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.6.0";
+const SERVER_VERSION = "1.7.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -712,14 +712,20 @@ server.tool(
 
     // Repo-controlled git config that runs programs cannot be neutralised with
     // -c overrides (an arbitrary .gitattributes filter driver), so refuse it.
-    const gitProgramHits = repoRunsGitPrograms(repoPath);
-    if (gitProgramHits.length) {
+    // Dead config — a path carried over from another OS that does not exist on
+    // this machine — cannot execute and is only noted in the report.
+    const gitPrograms = repoRunsGitPrograms(repoPath);
+    if (gitPrograms.refusals.length) {
       return err(
         `Refusing to review ${repoPath}: its own git configuration executes programs, which would run on the first git command the reviewer makes:\n` +
-        gitProgramHits.slice(0, 5).map((h) => `- ${h}`).join("\n") +
+        gitPrograms.refusals.slice(0, 5).map((h) => `- ${h}`).join("\n") +
         `\nRemove the offending entries (.git/config / .gitattributes), or review a copy of the repository.`
       );
     }
+    const gitProgramNotes = gitPrograms.notes.length
+      ? `note: stale/cross-machine git config in the repo (harmless on this machine, kept as a note):\n` +
+        gitPrograms.notes.slice(0, 5).map((h) => `- ${h}`).join("\n") + "\n\n"
+      : "";
 
     // Snapshot the working tree so a fix run can be verified against disk
     // instead of trusting the reviewer's own claim that it applied the fixes.
@@ -842,7 +848,7 @@ server.tool(
         ? `⚠ the gateway endpoint changed during the run (${gwBefore.url} → ${gwAfter.url}) — CC Switch likely switched providers mid-review, so the report may mix two models.`
         : "");
 
-    const warnings = [guardSetupNote, repoWarning.trim(), denialNote, guardNote, chainNote, fixNote, gwNote].filter(Boolean).join("\n\n");
+    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote].filter(Boolean).join("\n\n");
 
     const meta = {
       status: status2,

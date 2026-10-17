@@ -1126,7 +1126,6 @@ const CONFIG_CMD_PATTERNS = [
   /\bexternal\s*=/i,
   /\bdiffFilter\s*=/i,
   /\bdriver\s*=/i,
-  /\bhooksPath\s*=/i,
   /\bcommand\s*=/i,
   /\bprocess\s*=/i,
   /\bfilter\s*\.[\w.-]+\s*\.\s*(clean|smudge|process)\s*=/i,
@@ -1135,9 +1134,43 @@ const CONFIG_CMD_PATTERNS = [
 // `core.fsmonitor` is a command only when it is not a boolean (`true` uses git's
 // built-in monitor and is harmless — and is neutralised by -c anyway).
 const FSMONITOR_CMD = /\bfsmonitor\s*=\s*(.+)/i;
-// `[include] path = ...` pulls in another config file — but only when the path is
-// chosen by the repo. `~/...` is the user's own config.
+// `core.hooksPath` and `[include] path` are PATH-valued, not command-valued.
+const HOOKS_PATH = /\bhooksPath\s*=\s*(.+)/i;
 const INCLUDE_PATH = /^\s*path\s*=\s*(.+?)\s*$/i;
+
+/**
+ * Can we PROVE this config value cannot execute on THIS machine?
+ *
+ * A repository cloned from (or copied via a full-folder copy from) another OS
+ * routinely carries absolute paths that are dead here — e.g. a Mac developer's
+ * `core.hooksPath = /Users/kent/Desktop/proj/.githooks` on Windows. A dead path
+ * cannot run anything, so it is a note, not a refusal. The check must err
+ * towards "live": only an absolute path that does not exist in either separator
+ * form counts as dead. Bare commands (`sh -c ...`) resolve through PATH and
+ * shells we do not fully model, so they stay refusals.
+ */
+function deadPathOnThisMachine(value) {
+  const v = String(value || "").trim().replace(/^["']|["']$/g, "");
+  if (!v) return false;
+  const isAbs = v.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(v) || v.startsWith("\\\\");
+  if (!isAbs) return false; // relative/bare: resolves against cwd/PATH — not provably dead
+  // Strip a trailing " argument" part: hooksPath takes a directory, drivers take
+  // "cmd arg..."; for liveness only the leading path token matters.
+  const token = v.split(/\s+/)[0];
+  try {
+    if (fs.existsSync(token)) return false;
+    const swapped = token.replace(/[\\/]/g, (c) => (c === "/" ? "\\" : "/"));
+    if (fs.existsSync(swapped)) return false;
+  } catch { return false; }
+  return true;
+}
+
+/** Extract the value side of a `key = value` config line (null when not one). */
+const valueOf = (line, re) => {
+  const m = re.exec(line);
+  return m ? m[1] : null;
+};
+
 const isCmdLine = (line) => {
   const fm = FSMONITOR_CMD.exec(line);
   if (fm) return !/^(true|false|1|0|yes|no|on|off)$/i.test(fm[1].trim());
@@ -1192,29 +1225,109 @@ function repoAttributeFiles(repoPath) {
   return out;
 }
 
+/**
+ * Does the repository's own git config / attributes try to run a program?
+ *
+ * `-c` overrides neutralise the keys we know about, but `.gitattributes` can name
+ * an arbitrary filter driver (`*.foo diff=evil`), and `diff.evil.command` then
+ * executes. That surface cannot be closed with `-c`, so it is refused instead.
+ *
+ * Liveness-aware (v1.7.0): a config value whose path provably does not exist on
+ * THIS machine — typically an absolute path that arrived from another OS via a
+ * full-folder copy or a moved clone (`core.hooksPath = /Users/kent/...` on
+ * Windows) — cannot execute anything, so it becomes a note, not a refusal.
+ * `core.hooksPath` is a note even when live: git hooks fire on mutating
+ * operations (commit/merge/rebase/...), none of which the review allowlist
+ * grants, and this server's own git calls neutralise the key via
+ * `-c core.hooksPath=` anyway.
+ *
+ * Returns { refusals: [...], notes: [...] } — the caller refuses on refusals
+ * and surfaces notes in the report.
+ */
 export function repoRunsGitPrograms(repoPath) {
-  const hits = [];
+  const refusals = [];
+  const notes = [];
   const configs = repoConfigFiles(repoPath);
-  // driver names the repo's own config defines (a section header alone is inert;
-  // it only matters together with a .gitattributes reference)
-  const definedDrivers = new Set();
-  for (const { label, text } of configs) {
-    const line = text.split(/\r?\n/).find(isCmdLine);
-    if (line) hits.push(`${label}: ${line.trim().slice(0, 120)}`);
-    for (const m of text.matchAll(/^\s*\[\s*(?:diff|filter)\s+"([^"]+)"\s*\]\s*$/gim)) {
-      definedDrivers.add(m[1].toLowerCase());
-    }
-  }
-  for (const { label, text } of repoAttributeFiles(repoPath)) {
+
+  // Split a config file's text into sections keyed by header, so a driver's
+  // command lines can be attributed to that driver for the attributes cross-check.
+  const sectionsOf = (text) => {
+    const out = [];
+    let cur = { header: null, lines: [] };
     for (const line of text.split(/\r?\n/)) {
-      const m = /\b(?:diff|filter)\s*=\s*([\w.-]+)/i.exec(line);
-      if (m && definedDrivers.has(m[1].toLowerCase())) {
-        hits.push(`${label}: ${line.trim().slice(0, 120)} (driver "${m[1]}" is defined in .git/config)`);
-        break;
+      const h = /^\s*\[\s*([^\]]+?)\s*\]\s*$/.exec(line);
+      if (h) { out.push(cur); cur = { header: h[1], lines: [] }; } else cur.lines.push(line);
+    }
+    out.push(cur);
+    return out;
+  };
+
+  // value side of any `key = value` line, quotes stripped
+  const rhs = (line) => {
+    const m = /^[^=]*=\s*(.*)$/.exec(line);
+    return m ? m[1].trim().replace(/^["']|["']$/g, "") : null;
+  };
+
+  const classify = (label, line, val) => {
+    const shown = `${label}: ${line.trim().slice(0, 120)}`;
+    if (deadPathOnThisMachine(val)) notes.push(`${shown} — path does not exist on this machine (stale cross-machine config); cannot execute, proceeding`);
+    else refusals.push(shown);
+  };
+
+  // driver name -> does its section (across ALL config files) carry a LIVE command?
+  const driverLive = new Map();
+  for (const { label, text } of configs) {
+    for (const sec of sectionsOf(text)) {
+      const dm = /^\s*(?:diff|filter)\s+"([^"]+)"\s*$/i.exec(sec.header || "");
+      for (const line of sec.lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const hp = valueOf(line, HOOKS_PATH);
+        if (hp) {
+          const dead = deadPathOnThisMachine(hp);
+          notes.push(`${label}: ${trimmed.slice(0, 120)}${dead
+            ? " — hooksPath points at a path that does not exist on this machine (stale cross-machine config); ignored"
+            : " — noted, not refused: git hooks fire only on mutating operations, which the review allowlist never grants; this server's own git calls also neutralise core.hooksPath via -c"}`);
+          continue;
+        }
+        const inc = INCLUDE_PATH.exec(line);
+        if (inc && /^include/i.test(sec.header || "")) {
+          const raw = inc[1].trim().replace(/^["']|["']$/g, "");
+          if (!raw || raw.startsWith("~/")) continue;
+          // The include itself is not execution; repoConfigFiles() already walked a
+          // readable target and its contents are evaluated like any other config.
+          // A dead target is a git no-op (git silently ignores unreadable includes).
+          if (deadPathOnThisMachine(raw)) notes.push(`${label}: ${trimmed.slice(0, 120)} — include target does not exist on this machine; git ignores it`);
+          continue;
+        }
+        if (!isCmdLine(line)) continue;
+        const val = rhs(line) ?? "";
+        if (dm) {
+          const dead = deadPathOnThisMachine(val);
+          if (!dead) driverLive.set(dm[1].toLowerCase(), true);
+          else if (!driverLive.has(dm[1].toLowerCase())) driverLive.set(dm[1].toLowerCase(), false);
+          continue;
+        }
+        classify(label, line, val);
       }
     }
+    for (const m of text.matchAll(/^\s*\[\s*(?:diff|filter)\s+"([^"]+)"\s*\]\s*$/gim)) {
+      if (!driverLive.has(m[1].toLowerCase())) driverLive.set(m[1].toLowerCase(), false);
+    }
   }
-  return hits;
+
+  for (const { label: aLabel, text: aText } of repoAttributeFiles(repoPath)) {
+    for (const line of aText.split(/\r?\n/)) {
+      const m = /\b(?:diff|filter)\s*=\s*([\w.-]+)/i.exec(line);
+      if (!m) continue;
+      const live = driverLive.get(m[1].toLowerCase()) === true;
+      const shown = `${aLabel}: ${line.trim().slice(0, 120)} (driver "${m[1]}" is defined in the repo's git config)`;
+      if (live) refusals.push(shown);
+      else if (driverLive.has(m[1].toLowerCase())) notes.push(`${shown} — the driver's command points at a path that does not exist on this machine; cannot execute, proceeding`);
+      break;
+    }
+  }
+  return { refusals, notes };
 }
 
 /** Cheap async git preflight: does the repo have commits / uncommitted work? */

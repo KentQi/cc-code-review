@@ -48,22 +48,29 @@ ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --
 
 ## 注册到 ZCode（已完成则跳过）
 
-用户级配置 `~/.zcode/cli/config.json`（对所有 workspace 生效）：
+**推荐：一条命令自动配置（v1.7.0 起）**。克隆/安装本仓库后，在里面跑：
+
+```bash
+npm install
+npm run init
+```
+
+`init` 会做一轮**免费自检**（claude CLI 解析与版本、加固 flag 地板、shell guard 实测、skill 状态、git/gh、网关连通性），然后**按本机环境**把注册写进 `~/.zcode/cli/config.json`——node 用的是当前运行的绝对路径、入口文件用本仓库的绝对路径、网关凭据（如果检测到 CC Switch / settings.json / 环境变量配置）自动带上。Windows/macOS/Linux 无需手改任何路径。写完重启 ZCode（或重连 MCP）即可，工具名：`mcp__cc-code-review__claude_code_review` 等。
+
+手动配置（等效，适合不想跑脚本的人）——注意 `command` 必须是本机 node 的**绝对路径**，`args` 必须是本仓库 `src/index.js` 的**绝对路径**：
 
 ```json
 {
   "mcp": {
     "servers": {
       "cc-code-review": {
-        "command": "C:\\Program Files\\nodejs\\node.exe",
-        "args": ["C:/Users/<你>/.zcode/mcp/cc-code-review/src/index.js"]
+        "command": "<本机 node 绝对路径>",
+        "args": ["<本仓库>/src/index.js"]
       }
     }
   }
 }
 ```
-
-macOS 把 `command` 换成本机 node 绝对路径（如 `/usr/local/bin/node` 或 `/opt/homebrew/bin/node`）。改完重启 ZCode（或重连 MCP）。工具名：`mcp__cc-code-review__claude_code_review` 等。
 
 > 工具名（`claude_code_review` / `claude_review_followup` / `claude_review_env`）与环境变量前缀（`CLAUDE_REVIEW_*`）**保持稳定**，不随 server 名改变——已注册过的调用方与脚本无需跟着改，改的只是 server 键名（工具前缀从 `mcp__claude-review__*` 变成 `mcp__cc-code-review__*`）。
 
@@ -134,11 +141,14 @@ hook 还有第二条确定性规则：**git 的 `--output=` / `--output-director
 
 Edit / Write / NotebookEdit / Read 也被 hook 审查，且以 `CLAUDE_REVIEW_REPO_ROOT` 为界：目标路径必须解析到被审仓库内，`.git/**`、`.env*`、`id_rsa*`/`*.pem`/`*.key` 等密钥路径一律 deny；没有传 `repoRoot`（hook 配置没生效）时 fail-closed 全部拒绝，而不是放行。边界判定走 **realpath**（两侧都解析真实路径），所以仓库里的目录 junction/软链接（`repo/link -> ~/.ssh` 这种"词法在仓库内、实际在外面"的逃逸）也会被拦下（有回归测试锁定）；未命中已有目标的写入按"最近的已存在祖先"解析。
 
-**仓库即代码执行面（v1.5.0 新增）**
+**仓库即代码执行面（v1.5.0 新增，v1.7.0 起按"存活"判定）**
 
-git 会执行**仓库自己**的配置：`core.fsmonitor`、`diff.<driver>.command`、`.gitattributes` 的 filter/textconv 驱动、`core.hooksPath`、`[include] path = ../x`（可指向仓库外）。`-c` 覆盖只能 Neutralise 已知键，驱动名是任意的。所以每次运行前会扫描 `.git/config`（含 include 链）与各级 `.gitattributes`：**发现仓库控制的程序执行就直接拒跑**，而不是带病开审。
+git 会执行**仓库自己**的配置：`core.fsmonitor`、`diff.<driver>.command`、`.gitattributes` 的 filter/textconv 驱动、`core.hooksPath`、`[include] path = ../x`（可指向仓库外）。`-c` 覆盖只能中和已知键，驱动名是任意的。所以每次运行前会扫描 `.git/config`（含 include 链）与各级 `.gitattributes`：**发现仓库控制的程序执行就直接拒跑**，而不是带病开审。
 
-扫描是精确的，不会误伤普通仓库：`.gitattributes` 里写了 `*.png filter=lfs` 但驱动定义在用户全局 config（git-lfs 的常见装法）时**不**拒；`core.fsmonitor = true`（布尔，且本来就被 `-c` 中和）也**不**拒。
+扫描是精确的，不会误伤普通仓库：`.gitattributes` 里写了 `*.png filter=lfs` 但驱动定义在用户全局 config（git-lfs 的常见装法）时**不**拒；`core.fsmonitor = true`（布尔，且本来就被 `-c` 中和）也**不**拒。v1.7.0 起进一步区分"活的"与"死的"配置：
+
+- **死路径降级为提示**：从另一台机器整目录拷贝/迁移过来的仓库，`.git/config` 里常带着原机器的绝对路径（如在 Windows 上看到 `core.hooksPath = /Users/kent/Desktop/...`）。路径在本机**不存在就执行不了任何东西**——降级为报告中的一条 note，不再阻塞 review（有回归测试锁定）。
+- **`core.hooksPath` 即使是活的也只提示不拒**：git hooks 只在 commit/merge/rebase 这类**变更型**操作时触发，而评审 allowlist 从不授权任何变更型 git 命令；本 MCP 自己的 git 调用也总是带着 `-c core.hooksPath=` 中和它。fsmonitor/textconv/external/filter 驱动则不同——它们在 `git status`/`git diff` 这些**只读命令**上就会触发，所以活的一律拒，死的提示后放行。
 
 **纵深失效即拒跑（fail closed）**
 
@@ -202,7 +212,8 @@ v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `sh
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（146 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（152 条，免费）+ stdio 握手/环境检查
+npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）

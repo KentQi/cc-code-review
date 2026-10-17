@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.0 — 2026-10-17
+
+- **`npm run init` — environment-aware installer/self-check.** No OS-specific paths anywhere in setup: node, the package location, claude/git/gh, and gateway credentials are all derived from the machine it runs on, and the ZCode registration is written with those values (existing entries updated in place, unknown fields preserved). Runs the free self-check first (CLI + flag floors + live shell-guard test + skill + git/gh + gateway probe).
+- **Repo git-config gate is now liveness-aware.** A repository copied from another machine routinely carries the original machine's absolute paths (`core.hooksPath = /Users/kent/...` on Windows — a real incident that blocked a review); a path that provably does not exist on this machine cannot execute anything, so it now becomes a note in the report instead of a refusal. `core.hooksPath` is a note even when live: git hooks fire only on mutating operations the review allowlist never grants, and the server's own git calls neutralize the key via `-c`. fsmonitor/textconv/external/filter drivers still refuse when live (they fire on read commands) and note when dead. Dead `[include]` targets note (git silently ignores them). `repoRunsGitPrograms()` now returns `{refusals, notes}`; locked by 14 deterministic tests (live fixtures create real files, so behavior is OS-independent).
+
 ## 1.6.0 — 2026-10-16
 
 Renamed to **cc-code-review** (was `claude-review-mcp` / `claude-code-review-mcp`). Tool names (`claude_code_review` etc.) and the `CLAUDE_REVIEW_*` environment variables are unchanged, so existing callers keep working; only the MCP server key changes.

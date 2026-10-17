@@ -182,46 +182,83 @@ for (const key of ["core.fsmonitor=", "diff.external=", "credential.helper=", "c
 }
 check("git hardening is -c key=value pairs", GIT_HARDENING_ARGS.length % 2, 0);
 
-// repoRunsGitPrograms must catch a repo that would execute code on `git status`
+// repoRunsGitPrograms must catch a repo that would execute code on `git status`.
+// Shape is {refusals, notes}: live program config refuses; DEAD config (paths
+// that do not exist on this machine — cross-OS leftovers from a copied clone)
+// downgrades to a note. "Live" fixtures create the file so the test is
+// deterministic on every OS.
 const evilRepo = fs.mkdtempSync(path.join(os.tmpdir(), "evil-repo-"));
 fs.mkdirSync(path.join(evilRepo, ".git"), { recursive: true });
-fs.writeFileSync(path.join(evilRepo, ".git", "config"), "[core]\n\tfsmonitor = /tmp/evil.sh\n");
-check("repoRunsGitPrograms detects core.fsmonitor", repoRunsGitPrograms(evilRepo).length > 0, true);
-fs.writeFileSync(path.join(evilRepo, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
-check("repoRunsGitPrograms is quiet for a normal repo", repoRunsGitPrograms(evilRepo), []);
+const evilScript = path.join(evilRepo, "evil.sh");
+fs.writeFileSync(evilScript, "#!/bin/sh\n");
+const setConfig = (text) => fs.writeFileSync(path.join(evilRepo, ".git", "config"), text);
+const gate = (p) => repoRunsGitPrograms(p);
+
+setConfig(`[core]\n\tfsmonitor = ${evilScript}\n`);
+check("repoRunsGitPrograms refuses a LIVE core.fsmonitor (file exists)", gate(evilRepo).refusals.length, 1);
+setConfig(`[core]\n\tfsmonitor = /Users/kent/Desktop/does-not-exist/fs.sh\n`);
+check("repoRunsGitPrograms downgrades a DEAD cross-OS fsmonitor to a note",
+  { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 1 });
+setConfig("[core]\n\trepositoryformatversion = 0\n");
+check("repoRunsGitPrograms is quiet for a normal repo",
+  { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 0 });
 // A .gitattributes driver reference is only live when the repo's OWN config
 // defines that driver — otherwise git falls back to its built-in diff and runs
 // nothing. (This is what keeps ordinary git-lfs repos, whose filter lives in the
 // user's global config, from being refused.)
 fs.writeFileSync(path.join(evilRepo, ".gitattributes"), "*.foo diff=evil\n");
 check("repoRunsGitPrograms ignores an unreferenced driver name",
-  repoRunsGitPrograms(evilRepo), []);
+  { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 0 });
+// relative commands resolve via cwd/PATH and are never provably dead -> refused
 fs.writeFileSync(path.join(evilRepo, ".git", "config"),
   '[filter "evil"]\n\tprocess = ./evil.sh\n');
-check("repoRunsGitPrograms detects a .gitattributes filter driver",
-  repoRunsGitPrograms(evilRepo).length > 0, true);
+check("repoRunsGitPrograms refuses a .gitattributes filter driver (relative command)",
+  gate(evilRepo).refusals.length, 1);
+// ...but the same driver with a dead absolute command only notes
+fs.writeFileSync(path.join(evilRepo, ".git", "config"),
+  '[filter "evil"]\n\tprocess = /Users/kent/Desktop/does-not-exist/evil.sh\n');
+check("repoRunsGitPrograms notes a driver whose command path is dead",
+  { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 1 });
 // an include can pull a second config file with the command in it
 // (git resolves include paths relative to .git/, so ../ lands in the repo root)
-fs.writeFileSync(path.join(evilRepo, ".git", "config"), '[include]\n\tpath = ../evil.inc\n');
-fs.writeFileSync(path.join(evilRepo, "evil.inc"), '[diff "x"]\n\tcommand = ./x.sh\n');
+setConfig('[include]\n\tpath = ../evil.inc\n');
+fs.writeFileSync(path.join(evilRepo, "evil.inc"), '[core]\n\tfsmonitor = ./watch.sh\n');
 check("repoRunsGitPrograms follows an [include] path",
-  repoRunsGitPrograms(evilRepo).some((h) => h.includes("include")), true);
+  gate(evilRepo).refusals.some((h) => h.includes("include")), true);
 fs.rmSync(path.join(evilRepo, "evil.inc"), { force: true });
+// an include pointing at a path that does not exist on this machine is a git
+// no-op (git silently ignores unreadable includes) — note, not refusal
+setConfig("[include]\n\tpath = /Users/kent/Desktop/does-not-exist/extra.inc\n");
+check("repoRunsGitPrograms notes a dead include target",
+  { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 1 });
 // a boolean fsmonitor is not a command (it is neutralised by -c anyway), so a
 // repo that merely ran `git config core.fsmonitor true` must still be reviewable
-fs.writeFileSync(path.join(evilRepo, ".git", "config"), "[core]\n\tfsmonitor = true\n");
-check("repoRunsGitPrograms tolerates core.fsmonitor=true", repoRunsGitPrograms(evilRepo), []);
-// ...but a hook PATH is a program
-fs.writeFileSync(path.join(evilRepo, ".git", "config"), "[core]\n\tfsmonitor = /usr/local/bin/watchman\n");
-check("repoRunsGitPrograms still detects a fsmonitor hook path",
-  repoRunsGitPrograms(evilRepo).length > 0, true);
+setConfig("[core]\n\tfsmonitor = true\n");
+check("repoRunsGitPrograms tolerates core.fsmonitor=true",
+  { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 0 });
+// THE CLONED-FROM-MAC CASE (real incident): core.hooksPath pointing at the
+// original machine's absolute path. hooksPath is a note EVEN WHEN LIVE: git
+// hooks fire only on mutating operations, which the review allowlist never
+// grants, and this server's own git calls neutralise it via -c core.hooksPath=.
+setConfig("[core]\n\thooksPath = /Users/kent/Desktop/projects/ordering_system/.githooks\n");
+check("repoRunsGitPrograms does NOT refuse a stale cross-OS hooksPath (the cloned-repo incident)",
+  gate(evilRepo).refusals.length, 0);
+check("...and explains it in a note", gate(evilRepo).notes.length, 1);
+setConfig(`[core]\n\thooksPath = ${evilRepo}\n`);
+check("repoRunsGitPrograms notes a LIVE hooksPath too (never refused — mutations are not allowlisted)",
+  { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 1 });
+// a LIVE absolute fsmonitor (file exists) still refuses — the real threat
+setConfig(`[core]\n\tfsmonitor = ${evilScript}\n`);
+check("repoRunsGitPrograms still refuses a live absolute fsmonitor path",
+  gate(evilRepo).refusals.length, 1);
 // an ordinary remote/alias config must never be flagged
-fs.writeFileSync(path.join(evilRepo, ".git", "config"),
-  '[remote "origin"]\n\turl = https://github.com/o/r.git\n[alias]\n\tlg = log --oneline\n[core]\n\teditor = vim\n');
-check("repoRunsGitPrograms ignores a normal config", repoRunsGitPrograms(evilRepo), []);
+setConfig('[remote "origin"]\n\turl = https://github.com/o/r.git\n[alias]\n\tlg = log --oneline\n[core]\n\teditor = vim\n');
+check("repoRunsGitPrograms ignores a normal config",
+  { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 0 });
 // a ~/ include is the user's own config, not repo-controlled
-fs.writeFileSync(path.join(evilRepo, ".git", "config"), "[include]\n\tpath = ~/.gitconfig-extra\n");
-check("repoRunsGitPrograms ignores a ~/ include", repoRunsGitPrograms(evilRepo), []);
+setConfig("[include]\n\tpath = ~/.gitconfig-extra\n");
+check("repoRunsGitPrograms ignores a ~/ include",
+  { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 0 });
 fs.rmSync(evilRepo, { recursive: true, force: true });
 
 /* ---------------- guard wiring ---------------- */

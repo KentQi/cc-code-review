@@ -47,15 +47,24 @@ Notes:
 
 ## Register with ZCode (skip if already done)
 
-User-level config `~/.zcode/cli/config.json` (applies to all workspaces):
+**Recommended: one command, auto-configured (since v1.7.0)**. Clone/install this package, then inside it run:
+
+```bash
+npm install
+npm run init
+```
+
+`init` runs a **free self-check** (claude CLI resolution and version, hardening-flag floors, a live shell-guard test, skill status, git/gh, gateway reachability) and then writes the registration into `~/.zcode/cli/config.json` **derived from this machine** — node gets the currently running absolute path, the entry file gets this checkout's absolute path, and gateway credentials (when a CC Switch / settings.json / environment configuration is detected) are carried over automatically. No Windows/macOS/Linux paths to edit by hand. Restart ZCode (or reconnect the MCP) afterwards; tool names: `mcp__cc-code-review__claude_code_review` and friends.
+
+Manual config (equivalent, for those who prefer not to run a script) — note `command` must be YOUR machine's node absolute path and `args` the absolute path of this checkout's `src/index.js`:
 
 ```json
 {
   "mcp": {
     "servers": {
       "cc-code-review": {
-        "command": "C:\\Program Files\\nodejs\\node.exe",
-        "args": ["C:/Users/<you>/.zcode/mcp/cc-code-review/src/index.js"]
+        "command": "<absolute path to your node>",
+        "args": ["<this checkout>/src/index.js"]
       }
     }
   }
@@ -133,11 +142,14 @@ The hook has a second deterministic rule: **git's `--output=` / `--output-direct
 
 Edit / Write / NotebookEdit / Read are hooked too and bounded by `CLAUDE_REVIEW_REPO_ROOT`: the target path must resolve inside the repo under review; `.git/**`, `.env*`, `id_rsa*`/`*.pem`/`*.key` and other secret paths are always denied; without a `repoRoot` (the hook config did not apply) everything fails closed instead of passing through. The boundary check goes through **realpath** (both sides resolved to their on-disk real paths), so in-repo directory junctions/symlinks (`repo/link -> ~/.ssh` — lexically inside, physically outside) are blocked as well (locked by regression tests); writes to not-yet-existing targets are anchored on their nearest existing ancestor.
 
-**The repo as a code-execution surface (added v1.5.0)**
+**The repo as a code-execution surface (added v1.5.0; liveness-aware since v1.7.0)**
 
 git executes the **repository's own** configuration: `core.fsmonitor`, `diff.<driver>.command`, `.gitattributes` filter/textconv drivers, `core.hooksPath`, `[include] path = ../x` (which can point outside the repo). `-c` overrides can only neutralize known keys, and driver names are arbitrary. So every run first scans `.git/config` (including the include chain) and every `.gitattributes`: **discovering repo-controlled program execution refuses the run outright** rather than reviewing a compromised tree.
 
-The scan is precise and does not punish normal repos: a `.gitattributes` saying `*.png filter=lfs` with the driver defined in the user's **global** config (the common git-lfs install) does **not** trigger a refusal; `core.fsmonitor = true` (a boolean, already neutralized by `-c`) does **not** either.
+The scan is precise and does not punish normal repos: a `.gitattributes` saying `*.png filter=lfs` with the driver defined in the user's **global** config (the common git-lfs install) does **not** trigger a refusal; `core.fsmonitor = true` (a boolean, already neutralized by `-c`) does **not** either. Since v1.7.0 it further distinguishes **live** from **dead** config:
+
+- **Dead paths downgrade to a note**: a repository copied wholesale from another machine routinely carries the original machine's absolute paths (e.g. `core.hooksPath = /Users/kent/Desktop/...` seen on Windows). A path that does not exist on this machine cannot execute anything — it becomes a note in the report instead of blocking the review (locked by regression tests).
+- **`core.hooksPath` is a note even when live**: git hooks fire only on **mutating** operations (commit/merge/rebase/...), none of which the review allowlist ever grants, and this server's own git calls always neutralize the key via `-c core.hooksPath=`. fsmonitor/textconv/external/filter drivers are different — they fire on **read** commands like `git status`/`git diff` — so a live one still refuses and a dead one proceeds with a note.
 
 **Fail closed when a defense layer is missing**
 
@@ -201,7 +213,8 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (146, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (152, free) + stdio handshake/env check
+npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)

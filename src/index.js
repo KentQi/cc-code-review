@@ -339,7 +339,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.8.4";
+const SERVER_VERSION = "1.9.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -1013,7 +1013,8 @@ server.tool(
 server.tool(
   "claude_review_followup",
   "Continue the conversation of a previous claude_code_review run (same reviewer context, e.g. " +
-  "'为什么第 2 条是问题？' or 're-check after my fix'). Pass the session_id returned by claude_code_review.",
+  "'为什么第 2 条是问题？' or 're-check after my fix'). Pass the session_id returned by claude_code_review. " +
+  "Async by default (returns a jobId; poll claude_review_status) — waitForResult=true blocks synchronously.",
   {
     sessionId: z.string().describe("session_id returned by a previous claude_code_review / claude_review_followup call"),
     message: z.string().describe("Question or instruction for the reviewer"),
@@ -1022,6 +1023,8 @@ server.tool(
     model: z.string().optional(),
     timeoutMinutes: z.number().int().min(1).max(60).default(Math.min(10, ENV.timeoutMinutes)),
     maxBudgetUsd: z.number().min(0).max(50).optional(),
+    waitForResult: z.boolean().default(false)
+      .describe("Block synchronously for the reply. Default false: returns a jobId at once (poll claude_review_status) — use that with clients that cut tool calls at ~30s."),
   },
   async (args, extra) => {
     const { sessionId, message, model, timeoutMinutes } = args;
@@ -1060,6 +1063,9 @@ server.tool(
     const [budgetFlagSupported, streamJsonSupported] = await Promise.all([
       supportsFlag(cli, "--max-budget-usd"), supportsStreamJson(cli),
     ]);
+    const startedAt = Date.now();
+    const jobAbort = new AbortController();
+    const executeFollowup = async (signal) => {
     const run = await runClaude({
       cli,
       repoPath,
@@ -1080,7 +1086,7 @@ server.tool(
       },
       guardSettings,
       timeoutMs: timeoutMinutes * 60_000,
-      signal: extra?.signal,
+      signal,
     });
 
     const logFile = writeLogFile(run.stdout, run.stderr);
@@ -1115,6 +1121,34 @@ server.tool(
         bashCalls: Array.isArray(run.bashCommands) ? run.bashCommands.length : undefined,
       },
     };
+    }; // end executeFollowup
+
+    if (args.waitForResult) return executeFollowup(extra?.signal);
+
+    const jobId = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const job = {
+      id: jobId, repoPath, scope: `followup session=${String(sessionId).slice(0, 8)}`, fix: false, effort: "-",
+      startedAt, state: "running", result: null, abort: jobAbort,
+    };
+    reviewJobs.set(jobId, job);
+    if (extra?.signal) {
+      if (extra.signal.aborted) jobAbort.abort();
+      else extra.signal.addEventListener("abort", () => jobAbort.abort(), { once: true });
+    }
+    void executeFollowup(jobAbort.signal)
+      .then((result) => { job.result = result; job.state = "done"; job.finishedAt = Date.now(); })
+      .catch((e) => { job.result = err(`followup job crashed: ${e?.message || e}`); job.state = "done"; job.finishedAt = Date.now(); })
+      .finally(() => pruneReviewJobs());
+    return {
+      content: [{
+        type: "text",
+        text:
+          `Followup started in the background (free preflight passed).\njobId: ${jobId}\n` +
+          `Poll claude_review_status with {"jobId": "${jobId}"} for the reply; {"jobId": "${jobId}", "cancel": true} aborts it. ` +
+          `(waitForResult=true would have blocked synchronously — use the async form with clients that cut tool calls.)`,
+      }],
+      structuredContent: { jobId, status: "running", repoPath, sessionId, startedAt },
+    };
   }
 );
 
@@ -1122,7 +1156,7 @@ server.tool(
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-log("ready — tools: claude_code_review (async by default), claude_review_status, claude_review_followup, claude_review_env");
+log("ready — tools: claude_code_review (async), claude_review_status, claude_review_followup (async), claude_review_env");
 
 // Client went away (stdio closed): stop any in-flight review instead of letting
 // it run to its timeout and keep billing. claude.js registers an "exit" handler

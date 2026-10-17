@@ -92,7 +92,7 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
   const bad = await s.req("tools/call", { name: "no_such_tool", arguments: {} });
   check("C1", "unknown tool -> JSON-RPC error", !!bad.error || bad.result?.isError === true);
   const cancelErr = await s.call("claude_review_followup", { sessionId: "x", message: "hi", repoPath: mkRepo("c1") });
-  check("C1", "followup missing-session failure is a tool error, not a crash", cancelErr.result?.isError === true || cancelErr.error != null);
+  check("C1", "followup handled without crash (async jobId or clear error)", !!cancelErr.result?.structuredContent?.jobId || cancelErr.result?.isError === true || cancelErr.error != null, textOf(cancelErr).slice(0, 120));
   s.kill();
 }
 

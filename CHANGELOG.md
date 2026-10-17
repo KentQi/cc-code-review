@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.0 — 2026-10-18
+
+- **claude_review_followup is async too** — the last M from the audits: it was the only remaining synchronous agentic call, cut off by ~30s client tool timeouts. Same job pattern as claude_code_review: jobId at once, poll/fetch/cancel via claude_review_status, waitForResult=true restores the sync contract, client-cancel of the initial call aborts the job.
+
 ## 1.8.4 — 2026-10-18
 
 - npm overrides pin @hono/node-server to 1.19.9 (within the SDK declared range). The lockfile had resolved 2.1.5 whose engines require Node >=20, so npm install under engine-strict failed on the declared Node >=18.19 floor. We only use StdioServerTransport; the sole hono importer (streamableHttp) is never loaded. Missed in the 1.8.3 batch — closes the last M from the fourth audit.

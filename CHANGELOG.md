@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.8.4 — 2026-10-18
+
+- npm overrides pin @hono/node-server to 1.19.9 (within the SDK declared range). The lockfile had resolved 2.1.5 whose engines require Node >=20, so npm install under engine-strict failed on the declared Node >=18.19 floor. We only use StdioServerTransport; the sole hono importer (streamableHttp) is never loaded. Missed in the 1.8.3 batch — closes the last M from the fourth audit.
+
 ## 1.8.3 — 2026-10-18
 
 Fixes from a fourth multi-expert audit (reliability / universality / usability; 5 independent auditors, no H findings):

@@ -98,11 +98,15 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 
 Returns: a markdown report (Review Summary / Findings / Notes) + metadata (`session_id`, spend, turns, log path). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
 
-### 2. `claude_review_followup` — follow-up questions / re-review
+### 2. `claude_review_status` — poll / fetch / cancel a background review (free)
+
+`claude_code_review` is **async by default**: after all free preflight checks pass it returns a jobId in under a second — real reviews take 2-15 minutes and most MCP clients cut tool calls at ~30s. This tool: with jobId, poll (reports elapsed time) or fetch the finished report; with jobId + cancel=true, abort and stop billing; without arguments, list this process's jobs. Clients that want the synchronous contract pass waitForResult: true to claude_code_review.
+
+### 3. `claude_review_followup` — follow-up questions / re-review
 
 Continue the conversation using the `session_id` returned by the previous run (`claude --resume`).
 
-### 3. `claude_review_env` — environment self-check (free)
+### 4. `claude_review_env` — environment self-check (free)
 
 CLI resolution result and its source, version, `--effort`/`--max-budget-usd` support, skill status, gateway reachability (loopback TCP preflight), leftover auth-variable warnings, `git`/`gh` availability, `CLAUDE_CODE_EFFORT_LEVEL` override warnings. The first line is a machine-readable `verdict: OK|NOT_FOUND|MISCONFIGURED`. `installSkill: true` manually (re)installs the skill.
 

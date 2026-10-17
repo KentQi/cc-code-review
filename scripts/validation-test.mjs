@@ -92,7 +92,7 @@ check("empty repo refused", r.result?.isError === true && /no commits and no unc
 //    Claude credits", and on a credentialed machine this was the one check that
 //    broke that promise. Skipped by default; note the skip so the count stays honest.
 if (process.env.CC_REVIEW_ALLOW_PAID_PROBE === "1") {
-  r = await call("claude_code_review", { repoPath: cleanRepo, scope: "auto", maxBudgetUsd: 0.02, timeoutMinutes: 2 });
+  r = await call("claude_code_review", { repoPath: cleanRepo, scope: "auto", maxBudgetUsd: 0.02, timeoutMinutes: 2, waitForResult: true });
   check("clean repo passes preflight (only later failure possible)", !/no commits and no uncommitted changes|not a version-controlled|must be an absolute/i.test(textOf(r)), textOf(r).slice(0, 200));
 } else {
   console.log("skip  clean repo passes preflight (starts a paid run; set CC_REVIEW_ALLOW_PAID_PROBE=1 to include)");

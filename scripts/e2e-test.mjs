@@ -50,7 +50,7 @@ const started = Date.now();
 const res = await request("tools/call", {
   name: "claude_code_review",
   arguments: {
-    repoPath,
+    repoPath, waitForResult: true,
     scope: "working-dir",
     outputLanguage: "中文",
     timeoutMinutes: 12,

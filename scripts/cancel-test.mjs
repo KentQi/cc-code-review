@@ -79,7 +79,7 @@ send({
   jsonrpc: "2.0", id: callId, method: "tools/call",
   params: {
     name: "claude_code_review",
-    arguments: { repoPath, scope: "auto", effort: "high", timeoutMinutes: 10, maxBudgetUsd: 5, maxTurns: 100 },
+    arguments: { repoPath, waitForResult: true, scope: "auto", effort: "high", timeoutMinutes: 10, maxBudgetUsd: 5, maxTurns: 100 },
   },
 });
 

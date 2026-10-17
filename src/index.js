@@ -60,6 +60,14 @@ function nonNegative(v, d) {
 }
 
 const LOG_KEEP = 20;
+// Background review jobs (async mode). Results are kept in-memory for the life
+// of the server process — a restart clears them, which the status tool says.
+const reviewJobs = new Map();
+const JOB_KEEP = 10;
+function pruneReviewJobs() {
+  const finished = [...reviewJobs.values()].filter((j) => j.state === "done");
+  for (const j of finished.slice(0, Math.max(0, finished.length - JOB_KEEP))) reviewJobs.delete(j.id);
+}
 function logsDir() {
   // 0700 so review logs (they quote repo code) stay private from other local users on macOS/Linux.
   // Overridable because Windows has no POSIX mode bits: CLAUDE_REVIEW_LOG_DIR lets a user point
@@ -323,7 +331,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.7.0";
+const SERVER_VERSION = "1.8.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -583,6 +591,8 @@ server.tool(
       .describe(`API spend cap for this run via --max-budget-usd (default ${ENV.maxBudgetUsd}); 0 disables. On third-party gateways this depends on usage data the gateway returns.`),
     installSkillIfMissing: z.boolean().default(ENV.autoInstallSkill)
       .describe("Auto-install the bundled code-review skill into ~/.claude/skills when missing (default true)"),
+    waitForResult: z.boolean().default(false)
+      .describe("Block until the review finishes and return the report synchronously (2-15 min). Default false: returns a jobId at once — poll claude_review_status(jobId). Only set true if your MCP client has no ~30s tool-call timeout."),
   },
   async (args, extra) => {
     const {
@@ -719,7 +729,8 @@ server.tool(
       return err(
         `Refusing to review ${repoPath}: its own git configuration executes programs, which would run on the first git command the reviewer makes:\n` +
         gitPrograms.refusals.slice(0, 5).map((h) => `- ${h}`).join("\n") +
-        `\nRemove the offending entries (.git/config / .gitattributes), or review a copy of the repository.`
+        `\nRemove the offending entries (.git/config / .gitattributes), or review a copy of the repository. ` +
+        `(cc-code-review server v${SERVER_VERSION}; dead cross-machine paths are normally only a note — if you expected this to pass, the host may be running an older server process: restart ZCode / reconnect the MCP.)`
       );
     }
     const gitProgramNotes = gitPrograms.notes.length
@@ -733,12 +744,20 @@ server.tool(
 
     log(`review start: repo=${repoPath} scope=${scope}${pr ? ` pr=${pr}` : ""} pipeline=${skillMode} effort=${effort}${effortFlagSupported ? "" : "(keyword)"} fix=${fix}`);
 
-    // Best-effort progress notifications while the review runs.
-    const token = extra?._meta?.progressToken;
+    // A real review runs 2-15 minutes, and many MCP clients (ZCode included) cut
+    // tool calls at ~30s — a synchronous contract can never complete there, and
+    // callers end up re-implementing the invocation by hand. Default is therefore
+    // ASYNC: this call returns a jobId right after the free preflight above, and
+    // the report is fetched with claude_review_status(jobId). waitForResult=true
+    // restores the synchronous contract for clients with long (or no) timeouts.
     const startedAt = Date.now();
+    const jobAbort = new AbortController();
+    const executeRun = async (signal, progressToken) => {
+    // Best-effort progress notifications while the review runs.
+    const token = progressToken ?? null;
     const progressTimer = token == null ? null : setInterval(() => {
       const mins = Math.round((Date.now() - startedAt) / 60000);
-      extra.sendNotification({
+      extra?.sendNotification?.({
         method: "notifications/progress",
         params: { progressToken: token, progress: mins, total: timeoutMinutes, message: `claude review in progress (${mins}min elapsed)` },
       }).catch(() => {});
@@ -764,7 +783,7 @@ server.tool(
       },
       guardSettings,
       timeoutMs: timeoutMinutes * 60_000,
-      signal: extra?.signal,
+      signal,
     });
     if (progressTimer) clearInterval(progressTimer);
 
@@ -894,6 +913,75 @@ server.tool(
         permissionDenials: meta.permissionDenials,
       },
     };
+    }; // end executeRun
+
+    if (args.waitForResult) return executeRun(extra?.signal, extra?._meta?.progressToken);
+
+    // Async mode: hand back a jobId at once; the run continues in the background
+    // (the server outlives this request) and its result waits in the job registry.
+    const jobId = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const job = {
+      id: jobId, repoPath, scope: scope + (pr ? ` pr=${pr}` : ""), fix, effort,
+      startedAt, state: "running", result: null, abort: jobAbort,
+    };
+    reviewJobs.set(jobId, job);
+    void executeRun(jobAbort.signal, undefined)
+      .then((result) => { job.result = result; job.state = "done"; job.finishedAt = Date.now(); })
+      .catch((e) => { job.result = err(`review job crashed: ${e?.message || e}`); job.state = "done"; job.finishedAt = Date.now(); })
+      .finally(() => pruneReviewJobs());
+    return {
+      content: [{
+        type: "text",
+        text:
+          `Review started in the background (all free preflight checks passed — guard verified, gateway reachable, skill ready).\n` +
+          `jobId: ${jobId}\n` +
+          `A real review takes 2-15 minutes. Poll it with the claude_review_status tool: pass {"jobId": "${jobId}"} — while running it reports elapsed time, when finished it returns the full report (same shape a synchronous call would). ` +
+          `Pass {"jobId": "${jobId}", "cancel": true} to abort and stop billing. (This async default exists because MCP clients commonly cut tool calls at ~30s; use waitForResult=true only if your client has no such timeout.)`,
+      }],
+      structuredContent: { jobId, status: "running", repoPath, scope, effort, fix, startedAt },
+    };
+  }
+);
+
+/* ------------------------------------------------------------------ */
+/* Tool 2b: claude_review_status — poll/fetch/cancel a background job  */
+/* ------------------------------------------------------------------ */
+
+server.tool(
+  "claude_review_status",
+  "Poll a background review started by claude_code_review (which returns fast with a jobId because real reviews take 2-15 minutes). " +
+  "With jobId: returns elapsed time while running, or the full report/result when finished. With cancel=true: aborts the run and stops billing. " +
+  "Without jobId: lists the recent jobs of this server process.",
+  {
+    jobId: z.string().optional().describe("The jobId returned by claude_code_review"),
+    cancel: z.boolean().default(false).describe("Abort the running job (kills the claude process tree, stops billing)"),
+  },
+  async ({ jobId, cancel }) => {
+    if (!jobId) {
+      if (!reviewJobs.size) {
+        return { content: [{ type: "text", text: "no review jobs in this server process yet — start one with claude_code_review (it returns a jobId immediately)" }] };
+      }
+      const lines = [...reviewJobs.values()].map((j) =>
+        `${j.id}  ${j.state}${j.state === "running" ? ` (${Math.round((Date.now() - j.startedAt) / 1000)}s elapsed)` : ""}  ${j.scope}  ${j.repoPath}${j.fix ? "  [fix]" : ""}`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+    const job = reviewJobs.get(jobId);
+    if (!job) {
+      return err(`unknown jobId "${jobId}" — jobs live in the server process that created them (a ZCode restart clears them); list current jobs by calling this tool without jobId.`);
+    }
+    if (job.state === "running") {
+      if (cancel) {
+        job.abort.abort();
+        return { content: [{ type: "text", text: `cancellation requested for ${jobId} — the claude process tree is being killed; poll again in a few seconds for the final state (billing stops within ~2s of the kill).` }] };
+      }
+      const secs = Math.round((Date.now() - job.startedAt) / 1000);
+      return {
+        content: [{ type: "text", text: `still running: ${secs}s elapsed (${job.scope}, ${job.repoPath}). Reviews typically take 2-15 minutes — poll again in a minute or two. Cancel with {"jobId": "${jobId}", "cancel": true}.` }],
+        structuredContent: { jobId, status: "running", elapsedSec: secs },
+      };
+    }
+    if (cancel) return { content: [{ type: "text", text: `job ${jobId} already finished — nothing to cancel.` }] };
+    return job.result;
   }
 );
 
@@ -1013,7 +1101,7 @@ server.tool(
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-log("ready — tools: claude_code_review, claude_review_followup, claude_review_env");
+log("ready — tools: claude_code_review (async by default), claude_review_status, claude_review_followup, claude_review_env");
 
 // Client went away (stdio closed): stop any in-flight review instead of letting
 // it run to its timeout and keep billing. claude.js registers an "exit" handler

@@ -72,7 +72,7 @@ send({ jsonrpc: "2.0", method: "notifications/initialized" });
 // 2. tools/list
 const tools = await request("tools/list", {});
 const names = (tools.result?.tools || []).map((t) => t.name);
-for (const expected of ["claude_code_review", "claude_review_followup", "claude_review_env"]) {
+for (const expected of ["claude_code_review", "claude_review_status", "claude_review_followup", "claude_review_env"]) {
   if (!names.includes(expected)) fail(`tools/list missing ${expected}; got: ${names.join(", ")}`);
 }
 console.log("ok: tools/list ->", names.join(", "));

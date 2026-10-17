@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.8.0 — 2026-10-17
+
+- **Async review jobs (the big one).** Real reviews take 2-15 minutes, but MCP clients commonly cut tool calls at ~30s — in a real-world test the calling agent had to re-implement the invocation by hand to work around it. `claude_code_review` now returns a **jobId in under a second** (after the full free preflight: validation, hardening gate, git preflight, gateway probe — synchronous errors still return synchronously), runs the review in the background, and the report is fetched with the new **`claude_review_status`** tool (poll while running, full result when done, `cancel: true` aborts and stops billing, no-arg lists jobs). `waitForResult: true` restores the synchronous contract. Verified with a real paid run: 297ms to jobId, 195s to report. `npm run init` now also writes `timeoutMs: 1800000` into the registration.
+- The repo-gate refusal message now stamps the server version, so "stale server process" incidents (a v1.6.0 refusing what v1.7.0 allows) are diagnosable.
+
+
 ## 1.7.0 — 2026-10-17
 
 - **`npm run init` — environment-aware installer/self-check.** No OS-specific paths anywhere in setup: node, the package location, claude/git/gh, and gateway credentials are all derived from the machine it runs on, and the ZCode registration is written with those values (existing entries updated in place, unknown fields preserved). Runs the free self-check first (CLI + flag floors + live shell-guard test + skill + git/gh + gateway probe).

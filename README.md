@@ -97,11 +97,15 @@ npm run init
 
 返回：markdown 报告（Review Summary / Findings / Notes）+ 元数据（`session_id`、花费、轮数、日志路径）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
 
-### 2. `claude_review_followup` — 追问 / 复核
+### 2. `claude_review_status` — 轮询/获取/取消后台 review 任务（免费）
+
+`claude_code_review` 默认**异步**：免费预检全部通过后立刻返回 jobId（<1 秒）——因为真实 review 要 2-15 分钟，而多数 MCP 客户端 ~30 秒就掐断工具调用。本工具：传 jobId 轮询（运行中报已耗时）或取回完整报告；传 jobId + cancel=true 中止并停止计费；不传参数列出本进程的任务。需要同步语义的客户端在 claude_code_review 里传 waitForResult: true。
+
+### 3. `claude_review_followup` — 追问 / 复核
 
 拿着上一次返回的 `session_id` 继续对话（`claude --resume`）。
 
-### 3. `claude_review_env` — 环境自检（免费）
+### 4. `claude_review_env` — 环境自检（免费）
 
 CLI 解析结果与来源、版本、`--effort`/`--max-budget-usd` 支持情况、skill 状态、网关连通性（回环网关 TCP 预检）、宿主环境中残留的认证变量告警、`git`/`gh` 可用性、`CLAUDE_CODE_EFFORT_LEVEL` 覆盖告警。首行输出机器可读的 `verdict: OK|NOT_FOUND|MISCONFIGURED`。`installSkill: true` 可手动（重）装 skill。
 

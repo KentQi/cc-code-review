@@ -133,6 +133,10 @@ if (t) {
 const entry = {
   command: process.execPath,          // THIS machine's node, absolute, any OS
   args: [SERVER],                     // THIS checkout's entry file, absolute
+  // Many clients default to a ~30s tool-call timeout; claude_review_followup
+  // and waitForResult=true runs need far more. Async-mode reviews don't, but a
+  // generous timeout hurts nothing.
+  timeoutMs: 1_800_000,
   ...(Object.keys(envBlock).length ? { env: envBlock } : {}),
 };
 

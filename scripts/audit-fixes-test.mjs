@@ -14,7 +14,7 @@ import {
 import {
   versionAtLeast, PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN,
   GIT_HARDENING_ARGS, repoRunsGitPrograms, guardHookCommand, hookScriptPath,
-  guardState, gitWriteFlagReason,
+  guardState, gitWriteFlagReason, gitSpawnOpts, guardSelfTest,
 } from "../src/claude.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -182,6 +182,19 @@ for (const key of ["core.fsmonitor=", "diff.external=", "credential.helper=", "c
 }
 check("git hardening is -c key=value pairs", GIT_HARDENING_ARGS.length % 2, 0);
 
+// gitSpawnOpts is the isolation half of the same hardening (the -c half is
+// GIT_HARDENING_ARGS). EVERY git spawn must use both: fix-mode verification
+// (gitStatusSnapshot) used to spawn bare `git status`, the one call that could
+// still execute repo-controlled programs and read the user's global config.
+{
+  const o = gitSpawnOpts(process.cwd());
+  check("gitSpawnOpts cuts the system/global config", o.env.GIT_CONFIG_NOSYSTEM, "1");
+  check("gitSpawnOpts points HOME at an empty dir", o.env.HOME === o.env.USERPROFILE && !fs.existsSync(path.join(o.env.HOME, ".gitconfig")), true);
+  check("gitSpawnOpts disables the git terminal prompt", o.env.GIT_TERMINAL_PROMPT, "0");
+  check("gitSpawnOpts keeps the large maxBuffer (porcelain > 1MB repos)", o.maxBuffer >= 64 * 1024 * 1024, true);
+  check("gitSpawnOpts carries cwd through", o.cwd, process.cwd());
+}
+
 // repoRunsGitPrograms must catch a repo that would execute code on `git status`.
 // Shape is {refusals, notes}: live program config refuses; DEAD config (paths
 // that do not exist on this machine — cross-OS leftovers from a copied clone)
@@ -231,6 +244,23 @@ fs.rmSync(path.join(evilRepo, "evil.inc"), { force: true });
 setConfig("[include]\n\tpath = /Users/kent/Desktop/does-not-exist/extra.inc\n");
 check("repoRunsGitPrograms notes a dead include target",
   { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 1 });
+// a live driver hidden behind a DEEP include chain must still be refused: the
+// walk used to stop at depth 3, so chain-of-4 configs slipped through.
+{
+  const deep = fs.mkdtempSync(path.join(os.tmpdir(), "deep-inc-"));
+  fs.mkdirSync(path.join(deep, ".git"), { recursive: true });
+  const sh = path.join(deep, "w.sh");
+  fs.writeFileSync(sh, "#!/bin/sh\n");
+  // .git/config -> inc1 -> inc2 -> inc3 -> inc4 (carries the live fsmonitor)
+  fs.writeFileSync(path.join(deep, ".git", "config"), "[include]\n\tpath = ../inc1\n");
+  fs.writeFileSync(path.join(deep, "inc1"), "[include]\n\tpath = inc2\n");
+  fs.writeFileSync(path.join(deep, "inc2"), "[include]\n\tpath = inc3\n");
+  fs.writeFileSync(path.join(deep, "inc3"), "[include]\n\tpath = inc4\n");
+  fs.writeFileSync(path.join(deep, "inc4"), `[core]\n\tfsmonitor = ${sh}\n`);
+  check("repoRunsGitPrograms follows a 4-level include chain to a live driver",
+    gate(deep).refusals.length, 1);
+  fs.rmSync(deep, { recursive: true, force: true });
+}
 // a boolean fsmonitor is not a command (it is neutralised by -c anyway), so a
 // repo that merely ran `git config core.fsmonitor true` must still be reviewable
 setConfig("[core]\n\tfsmonitor = true\n");
@@ -322,6 +352,17 @@ fs.rmSync(wtRoot, { recursive: true, force: true });
 check("guard hook command quotes both paths", /^".+" ".+"$/.test(guardHookCommand()), true);
 check("guard hook path is inside the package", hookScriptPath().includes(path.join("scripts", "pre-tool-hook.js")), true);
 check("guard state is one of on/off/failed", ["on", "off", "failed"].includes(guardState().state), true);
+// The self-test cache carries a TTL now (a long-lived server outlives any one
+// install), and TTL re-verification goes through the same {refresh:true} path
+// claude_review_env uses — lock that it re-probes and agrees with the cached
+// verdict instead of returning a stale object.
+{
+  const a = await guardSelfTest();
+  const b = await guardSelfTest({ refresh: true });
+  check("guardSelfTest refresh re-probes and agrees with the cached verdict",
+    { aOk: a.ok, bOk: b.ok, agree: a.ok === b.ok, distinctProbes: a !== b },
+    { aOk: true, bOk: true, agree: true, distinctProbes: true });
+}
 
 /* ---------------- allowlist replay of a real run's Bash calls ---------------- */
 // The shell-guard replay proves the HOOK allows these; this proves the

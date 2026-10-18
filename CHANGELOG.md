@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.9.2 — 2026-10-18
+
+Fixes verified from another max-effort self-audit (the MCP reviewing its own whole repo — root-commit..HEAD — through the code-review skill; 13 findings reported, 11 verified TRUE and fixed, 1 verified FALSE, 1 documentation-level):
+
+- **[H] the review's own `git status` bypassed git hardening** — gitStatusSnapshot spawned plain `git status --porcelain`, so a repo's `core.fsmonitor` / external diff driver could execute there while every other git call was hardened with `-c` + gitSpawnOpts. Now the only unhardened git spawn site in the codebase is gone (both git call sites go through the same helpers).
+- **[H] sessionId / model reached the CLI unvalidated** — a sessionId like `--resume-evil` or a model like `--evil` was interpolated into argv; both are now validated (plain-id charset, length, no leading `-`) on review and followup, before any paid call.
+- **[H] followup had no repo/VCS gate** — resuming a session in a non-repo directory produced a doomed paid call; followup now runs the same isRepo check and git preflight as review, with clear errors. ghPreflight is deliberately NOT added: the followup schema carries no scope, and refusing unconditionally would block local-scope followups on machines without gh — a resumed PR-scoped conversation instead surfaces gh's error to the model.
+- **[H] repoPath `~user` form silently expanded to nothing** — `~kent/foo` passed through as a relative path; now refused with a message naming the supported `~/` form.
+- **[M] pre-spawn abort leaked the guard file** — a client cancelling during preflight left guard settings marked in-flight; an already-aborted signal is now re-checked right before spawn, and the guard settings are removed.
+- **[M] guardSelfTest had no cache TTL** — every env probe re-ran the full self-test; results are cached for 5 minutes with `{refresh:true}` (what claude_review_env uses) still forcing a re-probe.
+- **[M] huge stderr could still be truncated at the head** — log files kept the first 8000 chars only; now head + tail (last 16000) with an explicit omission marker.
+- **[M] include-chain depth capped at 3** — a repo chaining four+ `[include]` levels could hide a driver beyond the scan; the walk now goes 5 deep with cycle protection.
+- **[M] init clobbered user env keys and ignored timeoutMs** — the env merge could drop user-added keys on re-registration; now a union with derived gateway keys winning, and the nothing-to-change fast path compares the merged env.
+- **[L] stub pidfile could land in the package dir** — moved to the OS temp dir via STUB_PID_FILE, and cross-cases C8 now passes an explicit per-run pidfile (no more vacuous pass).
+- [L, verified FALSE] the audit claimed `\\?\`-prefixed paths escape the Windows path handling — Node's path.isAbsolute accepts them and they pass through untouched; no change.
+- [L] audit note M2: the redundant second markGuardSettingsInFlight in claude_code_review removed — prepareRunHardening already marks for both tools, so the extra call was reading noise.
+- [Docs] both READMEs now state that redirects (`>`, `<`, `2>/dev/null`) are denied by design like chaining, and the zh README's stale check counts (63/158/44) were corrected to the real 67/165/50.
+- Suite: 67 + 165 + smoke, validate 16, cross-cases 50/50 (6 new checks: gitSpawnOpts shape, include depth 4, self-test agreement, ~user form, followup sessionId/model/non-repo gates, init env union).
+- Audit-quality caveat: this round's reviewer worked inline (TaskCreate=5, TaskUpdate=8, Task/Agent calls = 0) instead of dispatching the 5 parallel subagents — `reviewer_subagents_spawned: 0` is visible in the run metadata, exactly the degradation the field exists to expose.
+
 ## 1.9.1 — 2026-10-18
 
 Fixes verified from a max-effort self-audit (the MCP reviewing its own repo through the code-review skill; 2 H reported, 1 verified false, 1 fixed):

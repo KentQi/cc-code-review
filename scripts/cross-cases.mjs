@@ -118,14 +118,29 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
   const repo = gitRepo("c2");
   const cases = [
     [{ repoPath: "relative/path" }, /absolute/i],
+    [{ repoPath: "~kent/foo" }, /~user form/i],
     [{ repoPath: repo, pr: '1"; rm -rf / #' }, /pr must be/i],
     [{ repoPath: repo, outputLanguage: "En\n`x`" }, /single line/i],
     [{ repoPath: repo, scope: "branch", baseRef: "--output=/tmp/x" }, /must not start with/i],
     [{ repoPath: repo, focus: "a\u0000b" }, /control/i],
+    [{ repoPath: repo, model: "--evil" }, /model must be a plain model id/i],
   ];
   for (const [args, re] of cases) {
     const r = await s.call("claude_code_review", args);
     check("C2", `refused: ${Object.keys(args).filter((k) => k !== "repoPath").join("/") || "relative"}`, r.result?.isError === true && re.test(textOf(r)), textOf(r).slice(0, 80));
+  }
+  // followup: sessionId and model land in claude's argv (--resume / --model),
+  // so a leading "-" must be refused before the paid preflight; the repo
+  // preflight (isRepo + git) must match the full review's.
+  const nonRepo = fs.mkdtempSync(path.join(tmp, "c2nonrepo-"));
+  const fuCases = [
+    [{ sessionId: "--resume-evil", message: "hi", repoPath: repo }, /sessionId must be a plain session token/],
+    [{ sessionId: "abc123", message: "hi", repoPath: repo, model: "--evil" }, /model must be a plain model id/],
+    [{ sessionId: "abc123", message: "hi", repoPath: nonRepo }, /not a version-controlled repository/],
+  ];
+  for (const [args, re] of fuCases) {
+    const r = await s.call("claude_review_followup", args);
+    check("C2", `followup refused: ${Object.keys(args).filter((k) => !["message", "repoPath"].includes(k)).join("/")}`, r.result?.isError === true && re.test(textOf(r)), textOf(r).slice(0, 80));
   }
   s.kill();
 }
@@ -148,11 +163,11 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
 
 /* ================= C4 installer ================= */
 {
-  const runInit = (home, pre) => {
+  const runInit = (home, pre, extraEnv = {}) => {
     fs.mkdirSync(path.join(home, ".zcode", "cli"), { recursive: true });
     if (pre) fs.writeFileSync(path.join(home, ".zcode", "cli", "config.json"), pre);
     const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "init.mjs")], {
-      env: { ...process.env, USERPROFILE: home, HOME: home, CLAUDE_CODE_PATH: STUB },
+      env: { ...process.env, USERPROFILE: home, HOME: home, CLAUDE_CODE_PATH: STUB, ...extraEnv },
       encoding: "utf8", timeout: 120_000, windowsHide: true,
     });
     return { code: r.status, out: r.stdout + r.stderr };
@@ -172,6 +187,20 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
   const e3 = cfg3.mcp.servers["cc-code-review"];
   check("C4", "existing entry updated, extra field + sibling preserved", e3.command === process.execPath && e3.enabled === true && cfg3.mcp.servers.other?.command === "keep", JSON.stringify(cfg3));
   check("C4", "legacy `environment` key migrated away (strict schema drops unknown keys)", e3.environment == null && (e3.env == null || e3.env.X === undefined), JSON.stringify(e3));
+  // re-init with a gateway in play: derived env keys are stamped, but keys the
+  // user added by hand must survive (they used to be silently dropped).
+  const h4 = fs.mkdtempSync(path.join(tmp, "c4d-"));
+  const pre4 = JSON.stringify({ mcp: { servers: { "cc-code-review": {
+    command: "old", args: ["old"], timeoutMs: 60000,
+    env: { HTTP_PROXY: "http://proxy:8080", DISABLE_TELEMETRY: "1", ANTHROPIC_API_KEY: "user-key" },
+  } } } });
+  const r4 = runInit(h4, pre4, { ANTHROPIC_BASE_URL: "http://127.0.0.1:15721", ANTHROPIC_AUTH_TOKEN: "gw-token" });
+  const e4 = JSON.parse(fs.readFileSync(path.join(h4, ".zcode", "cli", "config.json"), "utf8")).mcp.servers["cc-code-review"];
+  check("C4", "re-init keeps user-added env keys; derived gateway keys win; timeout preserved",
+    r4.code === 0 && e4?.env?.HTTP_PROXY === "http://proxy:8080" && e4?.env?.DISABLE_TELEMETRY === "1"
+    && e4?.env?.ANTHROPIC_BASE_URL === "http://127.0.0.1:15721" && e4?.env?.ANTHROPIC_AUTH_TOKEN === "gw-token"
+    && e4?.env?.ANTHROPIC_API_KEY === "user-key" && e4?.timeoutMs === 60000,
+    JSON.stringify(e4));
 }
 
 /* ================= C5 security gate ================= */
@@ -257,7 +286,10 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
 /* ================= C8 async job model (stub claude) ================= */
 {
   const repo = gitRepo("c8");
-  const s = startServer({ CLAUDE_CODE_PATH: STUB });
+  // Per-run pidfile path (the stub honours STUB_PID_FILE): parallel CI jobs
+  // sharing one tmpdir must not read — or delete — each other's stub pid.
+  const pidFile = path.join(tmp, `stub-claude-c8-${process.pid}-${Date.now()}.pid`);
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_PID_FILE: pidFile });
   await s.ready;
   const t0 = Date.now();
   const r = await s.call("claude_code_review", { repoPath: repo, scope: "last-commit", effort: "low" });
@@ -270,9 +302,9 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
   check("C8", "finished poll returns the full report", /STUB-REPORT-OK/.test(textOf(p2)) && p2.result?.structuredContent?.status === "success" && p2.result.structuredContent.sessionId === "stub-session-0001", textOf(p2).slice(0, 200));
   const unknown = await s.call("claude_review_status", { jobId: "job-nope" });
   check("C8", "unknown jobId -> clear error", unknown.result?.isError === true);
-  // cancel path + process-tree kill. The stub writes its pid to the OS temp dir;
-  // wait for it to APPEAR first — reading a missing file used to pass vacuously.
-  const pidFile = path.join(os.tmpdir(), "stub-claude-test.pid");
+  // cancel path + process-tree kill. The stub writes its pid to the per-run
+  // STUB_PID_FILE; wait for it to APPEAR first — reading a missing file used to
+  // pass vacuously.
   fs.rmSync(pidFile, { force: true });
   const r3 = await s.call("claude_code_review", { repoPath: repo, scope: "last-commit" });
   const j3 = r3.result?.structuredContent?.jobId;

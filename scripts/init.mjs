@@ -173,9 +173,16 @@ const prevObj = prev && typeof prev === "object" && !Array.isArray(prev) ? prev 
 if (prevObj && prevObj.environment != null) delete prevObj.environment;
 // Preserve a user-customized timeout; only stamp the default when absent.
 const timeoutMs = prevObj?.timeoutMs ?? entry.timeoutMs;
-const finalEntry = { ...(prevObj || {}), ...entry, timeoutMs };
+// env: the derived keys (gateway BASE_URL/tokens) must win, but keys the user
+// added by hand (HTTP_PROXY, DISABLE_TELEMETRY, their own ANTHROPIC_*) are NOT
+// derived here — dropping them on every re-init silently broke working setups.
+// Merge: user keys outside the derived set survive, derived keys overwrite.
+const prevEnv = prevObj?.env && typeof prevObj.env === "object" && !Array.isArray(prevObj.env) ? prevObj.env : {};
+const derivedEnv = entry.env && typeof entry.env === "object" ? entry.env : {};
+const mergedEnv = { ...prevEnv, ...derivedEnv };
+const finalEntry = { ...(prevObj || {}), ...entry, timeoutMs, ...(Object.keys(mergedEnv).length ? { env: mergedEnv } : {}) };
 if (prevObj && prevObj.command === entry.command && JSON.stringify(prevObj.args) === JSON.stringify(entry.args)
-    && JSON.stringify(prevObj.env || {}) === JSON.stringify(entry.env || {}) && prevObj.timeoutMs === timeoutMs) {
+    && JSON.stringify(prevObj.env || {}) === JSON.stringify(mergedEnv) && prevObj.timeoutMs === timeoutMs) {
   ok("already registered with the correct paths for this machine — nothing to change");
 } else {
   config.mcp.servers["cc-code-review"] = finalEntry;

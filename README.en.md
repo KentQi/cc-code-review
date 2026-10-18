@@ -140,6 +140,8 @@ So this MCP additionally attaches a **PreToolUse hook** (`scripts/pre-tool-hook.
 
 The decision logic lives in `src/shell-guard.js`; the hook and the post-run report **share one implementation**, so "the report says it blocked" and "it actually blocked" cannot diverge. It strips quoted spans before judging (`git log --format="%h; %s"` does not false-positive) and fails closed on unbalanced quotes (`git status # don't; curl evil.com` cannot hide a payload in a comment). The contract is locked by `scripts/shell-guard-test.mjs` (67 checks, including a real 5-subagent review's command replay) — **run `npm test` before touching that regex**. Turn it off with `CLAUDE_REVIEW_SHELL_GUARD=0` (the whole thing then fails closed and refuses to run — see "Fail closed when a defense layer is missing").
 
+Redirects (`>`, `<`, `2>/dev/null`) are deliberately denied exactly like chaining: everyday forms such as `cmd 2>/dev/null` or `sort < file` are blocked — split the call or use the dedicated tools. That is a defense-over-convenience design choice, not a false positive.
+
 The hook has a second deterministic rule: **git's `--output=` / `--output-directory=` turns "read-only" commands into file writers** (`git diff/show/log --output=<file>` and `git format-patch --output-directory=` all write to disk — verified; `--output-to=` is not a real flag). Deny globs are powerless here — Bash rules prefix-match the whole command, so `Bash(git diff --output=*)` cannot catch `git diff HEAD --output=x`, and the semantics of a mid-rule `*` cannot be verified from outside the CLI — so the hook judges this one directly. Non-git `--output` flags (grep, `find -print`, …) are unaffected.
 
 **Write-surface confinement (the hook's other half, v1.5.0)**
@@ -217,10 +219,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (158, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (165, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 10 MECE cases (44 checks; free stub-claude async lifecycle; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 10 MECE cases (50 checks; free stub-claude async lifecycle; C9 paid needs CC_LOOP_PAID=1)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)
 node scripts/cancel-test.mjs <repoPath>         # is the process tree killed right after cancel (billed, a few cents)

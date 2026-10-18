@@ -727,15 +727,31 @@ export function guardState() {
  * import broken) is meant to fail closed via `onFailure: "block"`, but that
  * behaviour is CLI-version dependent — so the server verifies it directly with
  * two synthetic payloads: one chained command that MUST be denied and one clean
- * command that must NOT be. One ~50ms spawn each, run once per process.
+ * command that must NOT be. One ~50ms spawn each.
+ *
+ * Cached per process, but a long-lived MCP server outlives any single install:
+ * the hook script (or node) can be replaced or deleted underneath us — an npm
+ * update, a version-manager switch, AV quarantine — while the cached "ok" keeps
+ * vouching for a guard that no longer fires. So the cache carries a TTL and is
+ * re-verified (3 cheap spawns) at most every SELF_TEST_TTL_MS.
  */
+const SELF_TEST_TTL_MS = 5 * 60 * 1000;
 let guardSelfTestCache;
+let guardSelfTestCacheAt = 0;
 export async function guardSelfTest({ refresh = false } = {}) {
-  if (!refresh && guardSelfTestCache !== undefined) return guardSelfTestCache;
+  if (!refresh && guardSelfTestCache !== undefined && Date.now() - guardSelfTestCacheAt < SELF_TEST_TTL_MS) {
+    return guardSelfTestCache;
+  }
+  const result = await guardSelfTestProbe();
+  guardSelfTestCache = result;
+  guardSelfTestCacheAt = Date.now();
+  return result;
+}
+
+async function guardSelfTestProbe() {
   const st = shellGuardStatus();
   if (!st.enabled) {
-    guardSelfTestCache = { ok: false, reason: st.reason };
-    return guardSelfTestCache;
+    return { ok: false, reason: st.reason };
   }
   const probe = (payload, via = "argv") => new Promise((resolve) => {
     let child;
@@ -777,34 +793,30 @@ export async function guardSelfTest({ refresh = false } = {}) {
 
   const bad = await probe({ tool_name: "Bash", tool_input: { command: "git status; echo PWNED" } });
   if (decisionOf(bad) !== "deny") {
-    guardSelfTestCache = {
+    return {
       ok: false,
       reason: `the hook did not deny a chained command (exit ${bad.code ?? "?"}${bad.error ? `, spawn error ${bad.error}` : ""})`,
     };
-    return guardSelfTestCache;
   }
   const good = await probe({ tool_name: "Bash", tool_input: { command: "git status" } });
   if (decisionOf(good) === "deny") {
-    guardSelfTestCache = {
+    return {
       ok: false,
       reason: `the hook denied a clean command (${good.decision?.hookSpecificOutput?.permissionDecisionReason || "no reason"})`,
     };
-    return guardSelfTestCache;
   }
   // Same deny probe, but through the shell-rendered command line — the path the
   // CLI actually takes. On Windows this is `cmd /d /s /c` on the quoted string,
   // on unix `/bin/sh -c`; if quoting cannot survive it, the guard is not real.
   const shelled = await probe({ tool_name: "Bash", tool_input: { command: "git status; echo PWNED" } }, "shell");
   if (decisionOf(shelled) !== "deny") {
-    guardSelfTestCache = {
+    return {
       ok: false,
       reason: `the hook command does not survive shell rendering (${shelled.error ? `spawn error ${shelled.error}` : `exit ${shelled.code ?? "?"}, no deny decision`}) — ` +
         `check guardHookCommand() quoting for node at ${process.execPath} and the hook at ${HOOK_SCRIPT}`,
     };
-    return guardSelfTestCache;
   }
-  guardSelfTestCache = { ok: true, reason: "verified: chained commands are denied (direct and via the shell-rendered command), clean ones allowed" };
-  return guardSelfTestCache;
+  return { ok: true, reason: "verified: chained commands are denied (direct and via the shell-rendered command), clean ones allowed" };
 }
 
 /**
@@ -910,6 +922,17 @@ export function runClaude({
     // what it says instead of leaving the decision to whatever fallback applies.
     if (flags.permissionPrompts) args.push("--permission-prompts", "none");
     if (guardSettings) args.push("--settings", guardSettings);
+
+    // The abort check at the top ran before argv was built; re-check immediately
+    // before spawn. A cancel landing inside that window would otherwise still
+    // fork a real claude process (and its first network round-trip bills) before
+    // the onAbort killTree below takes effect.
+    if (signal?.aborted) {
+      guardSettingsInFlight.delete(guardSettings);
+      removeGuardSettings(guardSettings);
+      resolve({ ok: false, json: null, stdout: "", stderr: "", timedOut: false, cancelled: true, exitCode: null, durationMs: 0 });
+      return;
+    }
 
     let child;
     try {
@@ -1105,7 +1128,7 @@ export const GIT_HARDENING_ARGS = [
 
 /** git spawn options shared by every git call this server makes. */
 let gitEmptyHome;
-function gitSpawnOpts(cwd, extraEnv = {}) {
+export function gitSpawnOpts(cwd, extraEnv = {}) {
   if (!gitEmptyHome) {
     try {
       gitEmptyHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-code-review-git-"));
@@ -1234,7 +1257,10 @@ function repoConfigFiles(repoPath) {
   const seen = new Set();
   const gitDir = path.join(repoPath, ".git");
   const walk = (file, label, depth) => {
-    if (depth > 3 || seen.has(file)) return;
+    // Include chains deeper than this are exotic; the cap bounds the read count
+    // (seen dedupes) while still following nested includes several levels in,
+    // so a live driver cannot hide behind extra indirection.
+    if (depth > 5 || seen.has(file)) return;
     seen.add(file);
     let text;
     try { text = fs.readFileSync(file, "utf8"); } catch { return; }

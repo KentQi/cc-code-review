@@ -30,8 +30,10 @@ if (args.includes("--help")) {
 }
 
 // headless review: drain stdin, sleep, emit result
-// in the OS temp dir, not the package dir — "npm pack" ships scripts/ wholesale
-const pidFile = path.join(os.tmpdir(), "stub-claude-test.pid");
+// in the OS temp dir, not the package dir — "npm pack" ships scripts/ wholesale.
+// STUB_PID_FILE lets the test harness give each run its own path, so parallel
+// CI jobs sharing one tmpdir cannot read (or delete) each other's pid.
+const pidFile = process.env.STUB_PID_FILE?.trim() || path.join(os.tmpdir(), "stub-claude-test.pid");
 try { fs.writeFileSync(pidFile, String(process.pid)); } catch { /* best effort */ }
 process.stdin.resume();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

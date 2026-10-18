@@ -137,7 +137,9 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 > ⚠️ **`--settings` 替换的是整个 `hooks` 键**：注入的临时文件里只有本 MCP 的 hook，用户 `~/.claude/settings.json` 里自己配置的 hooks 在**本次子进程内不会生效**（其它键如 `env`、`model`、`permissions` 不受影响）。这是 CLI 的行为，不是遗漏——如果你依赖自己的 hook 在 review 期间运行，目前需要另想办法。
 
-判定逻辑在 `src/shell-guard.js`，hook 与运行后的报告**共用同一份实现**，"报告说拦了"和"实际拦了"不可能不一致。它先剥掉引号 span 再判定，`git log --format="%h; %s"` 不会误报；引号不配对时 fail-closed（`git status # don't; curl evil.com` 这种把 payload 藏进注释的写法藏不住）。契约由 `scripts/shell-guard-test.mjs` 锁定（63 条，含一次真实 5-subagent review 的命令回放）——**改那行正则前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
+判定逻辑在 `src/shell-guard.js`，hook 与运行后的报告**共用同一份实现**，"报告说拦了"和"实际拦了"不可能不一致。它先剥掉引号 span 再判定，`git log --format="%h; %s"` 不会误报；引号不配对时 fail-closed（`git status # don't; curl evil.com` 这种把 payload 藏进注释的写法藏不住）。契约由 `scripts/shell-guard-test.mjs` 锁定（67 条，含一次真实 5-subagent review 的命令回放）——**改那行正则前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
+
+重定向（`>`、`<`、`2>/dev/null`）被刻意与链式命令同等拒绝：`cmd 2>/dev/null`、`sort < file` 这类日常写法会被拦下，请拆成多次调用或改用专用工具——这是防御优先于便利的设计选择，不是误报。
 
 hook 还有第二条确定性规则：**git 的 `--output=` / `--output-directory=` 会让"只读"命令写文件**（`git diff/show/log --output=<file>`、`git format-patch --output-directory=` 实测都会落盘；`--output-to=` 不是真实旗标）。deny glob 对这条无能为力——Bash 规则是整条命令前缀匹配，`Bash(git diff --output=*)` 拦不住 `git diff HEAD --output=x`，而中间带 `*` 的规则语义无法从 CLI 外验证——所以这一条由 hook 直接判掉。注意 `grep --output`、`find -print` 等非 git 的 `--output` 不受影响。
 
@@ -216,10 +218,10 @@ v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `sh
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（158 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（165 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
-node scripts/cross-cases.mjs                    # 10 个 MECE 用例（44 项检查；含桩 claude 的免费异步生命周期；C9 付费需 CC_LOOP_PAID=1）
+node scripts/cross-cases.mjs                    # 10 个 MECE 用例（50 项检查；含桩 claude 的免费异步生命周期；C9 付费需 CC_LOOP_PAID=1）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）
 node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立刻杀掉（计费，几美分）

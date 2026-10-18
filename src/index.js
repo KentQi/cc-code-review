@@ -30,7 +30,7 @@ import {
   cleanupGuardSettings, settingsParseProblem, peekSettingsEnv, markGuardSettingsInFlight,
   analyseCommand, gitWriteFlagReason, shellGuardNote, shellChainingNote,
   probeGateway, gatewayTarget, authEnvResidue, modelEnvOverrides, gitPreflight,
-  buildClaudeEnv, repoRunsGitPrograms,
+  buildClaudeEnv, repoRunsGitPrograms, gitSpawnOpts, GIT_HARDENING_ARGS,
 } from "./claude.js";
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
@@ -85,7 +85,14 @@ function writeLogFile(stdout, stderr) {
   try {
     const dir = logsDir();
     const file = path.join(dir, `run-${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.log`);
-    fs.writeFileSync(file, `# claude stdout\n${stdout}\n\n# claude stderr (tail)\n${stderr.slice(-8000)}\n`, { mode: 0o600 });
+    // stderr can run to megabytes (a gateway error loop). Keep the HEAD (the
+    // first failure — usually the root cause) AND the TAIL (the last state):
+    // a tail-only log buries the ECONNREFUSED that explains everything.
+    const STDERR_HEAD = 8000, STDERR_TAIL = 16000;
+    const stderrPart = stderr.length > STDERR_HEAD + STDERR_TAIL
+      ? `${stderr.slice(0, STDERR_HEAD)}\n... [stderr truncated in this log: ${stderr.length - STDERR_HEAD - STDERR_TAIL} chars omitted] ...\n${stderr.slice(-STDERR_TAIL)}`
+      : stderr;
+    fs.writeFileSync(file, `# claude stdout\n${stdout}\n\n# claude stderr\n${stderrPart}\n`, { mode: 0o600 });
     // retention: keep the newest LOG_KEEP logs
     try {
       const olds = fs.readdirSync(dir).filter((f) => f.startsWith("run-")).map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
@@ -121,6 +128,17 @@ function requireAbsoluteRepoPath(p) {
   const expanded = (p === "~" || p.startsWith("~/") || p.startsWith("~\\"))
     ? path.join(os.homedir(), p.slice(2))
     : p;
+  // `~user/...` is a shell expansion this server cannot (and must not guess
+  // another user's home to) perform — name it instead of falling through to
+  // the generic "must be absolute" error.
+  if (p.startsWith("~") && expanded === p) {
+    return {
+      ok: false,
+      error:
+        `repoPath "${p}" uses the ~user form, which is not supported — pass an absolute path, ` +
+        `or ~/ to mean your own home directory.`,
+    };
+  }
   // path.isAbsolute("/tmp/repo") is true on win32, where it would silently
   // resolve against the server's own drive — not the path the caller typed.
   if (process.platform === "win32" && /^[\\/]/.test(expanded) && !/^\\\\/.test(expanded)) {
@@ -197,6 +215,49 @@ function validateBaseRef(ref) {
 }
 
 /**
+ * sessionId goes straight into argv as `--resume <sessionId>` (claude.js). A
+ * leading "-" would be parsed as another claude flag instead of the value, so
+ * the shape is enforced here — the same rule, for the same reason, that
+ * validateBaseRef applies to refs echoed into git commands. Real session ids
+ * are UUIDs / hex / sess_-style tokens; the charset below covers all of them.
+ */
+function validateSessionId(id) {
+  const s = String(id ?? "").trim();
+  if (!s) return { ok: false, error: "sessionId is required (pass the session_id returned by a previous claude_code_review run)." };
+  if (s.length > 128) return { ok: false, error: "sessionId must be <= 128 chars" };
+  if (!/^[A-Za-z0-9._-]+$/.test(s) || s.startsWith("-")) {
+    return {
+      ok: false,
+      error:
+        `sessionId must be a plain session token (letters, digits, ".", "_", "-"; no leading "-") — got ${JSON.stringify(id)}. ` +
+        `It is passed to claude as --resume <sessionId>, so a leading "-" would be parsed as a claude option.`,
+    };
+  }
+  return { ok: true, sessionId: s };
+}
+
+/**
+ * `model` goes straight into argv as `--model <model>` — same leading-"-"
+ * argv-injection rule as sessionId, plus a charset that covers real model ids
+ * (claude-sonnet-4-5, us.anthropic.claude-*, openrouter-style org/model).
+ */
+function validateModel(model) {
+  if (model == null || model === "") return { ok: true, model: undefined };
+  const s = String(model).trim();
+  if (!s) return { ok: true, model: undefined };
+  if (s.length > 80) return { ok: false, error: "model must be <= 80 chars" };
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$/.test(s)) {
+    return {
+      ok: false,
+      error:
+        `model must be a plain model id (letters, digits, ".", "_", "-", "/", ":", "@", "+"; no leading "-") — got ${JSON.stringify(model)}. ` +
+        `It is passed to claude as --model <model>, so a leading "-" would be parsed as a claude option.`,
+    };
+  }
+  return { ok: true, model: s };
+}
+
+/**
  * `focus` is caller-supplied text that lands in the reviewer prompt. It is data,
  * never instructions: cap it, and refuse control characters / NUL so it cannot
  * restructure the prompt it is being interpolated into.
@@ -241,12 +302,14 @@ function logNoteOf(logFile) {
 /** `git status --porcelain` output (or null when git/unavailable). */
 async function gitStatusSnapshot(repoPath) {
   try {
-    // env: buildClaudeEnv() — on a GUI-launched macOS host the inherited PATH is
-    // launchd's sparse one and `git` is not on it, which made fix-mode
-    // verification silently report "nothing changed".
-    const { stdout } = await execFileAsync("git", ["status", "--porcelain"], {
-      cwd: repoPath, timeout: 20000, windowsHide: true, env: buildClaudeEnv(),
-    });
+    // Same hardening as every other git spawn: the -c overrides beat the repo's
+    // own config (fsmonitor / hooksPath / editor / credential helpers ...) and
+    // the empty HOME + GIT_CONFIG_NOSYSTEM cut the user's global config, so
+    // fix-mode verification cannot be the one git call that still executes
+    // repo-controlled programs. buildClaudeEnv() (inside gitSpawnOpts) also
+    // keeps the macOS-launchd sparse-PATH fix — without it `git` itself was not
+    // found and verification silently reported "nothing changed".
+    const { stdout } = await execFileAsync("git", [...GIT_HARDENING_ARGS, "status", "--porcelain"], gitSpawnOpts(repoPath));
     return stdout;
   } catch {
     return null;
@@ -339,7 +402,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.9.1";
+const SERVER_VERSION = "1.9.2";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -618,6 +681,8 @@ server.tool(
     if (!baseRefCheck.ok) return err(baseRefCheck.error);
     const focusCheck = validateFocus(focus);
     if (!focusCheck.ok) return err(focusCheck.error);
+    const modelCheck = validateModel(model);
+    if (!modelCheck.ok) return err(modelCheck.error);
     const { pr } = prCheck;
     const outputLanguage = langCheck.lang;
 
@@ -639,9 +704,8 @@ server.tool(
     if (!hard.ok) return err(hard.error);
     const { guard, guardSettings, permissionMode, permissionPrompts, hardening } = hard;
     const guardSetupNote = hard.note;
-    // Guarded from here until runClaude's spawn returns: a concurrent
-    // claude_review_env must not delete this file before claude has read it.
-    markGuardSettingsInFlight(guardSettings, true);
+    // (prepareRunHardening already marked guardSettings in-flight for BOTH
+    // agentic tools — one marking site, no second call needed here.)
 
     if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
       return err(`repoPath does not exist or is not a directory: ${repoPath}`);
@@ -781,7 +845,7 @@ server.tool(
       prompt,
       allowedTools,
       disallowedTools,
-      model: model || ENV.model,
+      model: modelCheck.model || ENV.model,
       maxTurns,
       maxBudgetUsd,
       effort,
@@ -1034,6 +1098,15 @@ server.tool(
     if (!langCheck.ok) return err(langCheck.error);
     const outputLanguage = langCheck.lang;
 
+    // Cheap input validation before the paid preflight: sessionId and model both
+    // land in claude's argv (--resume / --model), so a leading "-" must be
+    // refused here — the same rule validateBaseRef applies to refs echoed into
+    // git commands.
+    const sessionCheck = validateSessionId(sessionId);
+    if (!sessionCheck.ok) return err(sessionCheck.error);
+    const modelCheck = validateModel(model);
+    if (!modelCheck.ok) return err(modelCheck.error);
+
     const repoCheck = requireAbsoluteRepoPath(args.repoPath);
     if (!repoCheck.ok) return err(repoCheck.error);
     const repoPath = repoCheck.path;
@@ -1050,6 +1123,28 @@ server.tool(
 
     if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
       return err(`repoPath does not exist or is not a directory: ${repoPath}`);
+    }
+
+    // The followup child runs the same allowlisted git reads from cwd=repoPath,
+    // so it gets the same repo preflight as a full review: a directory that is
+    // no longer a repository (moved, or .git removed since the original run)
+    // would otherwise spawn a paid run that fails late, and a broken git
+    // surfaces as a timeout instead of git's own error.
+    if (!isRepo(repoPath)) {
+      return err(
+        `${repoPath} is not a version-controlled repository (no .git/.hg/.svn found). ` +
+        `The followup resumes a review session inside that repository, so it cannot run here — ` +
+        `point repoPath at the repository the original review ran in.`
+      );
+    }
+    const pre = await gitPreflight(repoPath);
+    if (pre.gitError) {
+      const e = pre.gitError;
+      const detail = [e.code, e.message].filter(Boolean).join(": ") || String(e);
+      return err(
+        `git failed in ${repoPath} (${detail}). The followup cannot run there — ` +
+        `check that git can access the repo (ownership/safe.directory, permissions), then retry.`
+      );
     }
 
     // Same repo-controlled git-config gate as a full review: the followup child
@@ -1099,7 +1194,7 @@ server.tool(
       prompt: buildFollowupPrompt(message, outputLanguage),
       allowedTools: reviewAllowedTools(),
       disallowedTools: reviewDisallowedTools({ fix: false }),
-      model: model || ENV.model,
+      model: modelCheck.model || ENV.model,
       maxTurns: 30,
       maxBudgetUsd,
       resumeSessionId: sessionId,

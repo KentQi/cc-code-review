@@ -221,10 +221,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (192, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (199, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 11 MECE cases (60 checks; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 12 MECE cases (65 checks; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)
 node scripts/cancel-test.mjs <repoPath>         # is the process tree killed right after cancel (billed, a few cents)

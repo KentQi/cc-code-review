@@ -25,7 +25,7 @@ import { promisify } from "node:util";
 import {
   resolveClaudeCliSettled, claudeVersion, claudeSemver, versionAtLeast,
   PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN, supportsFlag,
-  guardState, guardSelfTest, gatewayTarget, probeGateway,
+  guardState, guardSelfTest, gatewayTarget, probeGateway, buildClaudeEnv,
 } from "../src/claude.js";
 import { skillStatus, installBundledSkill } from "../src/skill.js";
 
@@ -91,7 +91,9 @@ say("");
 say("helpers:");
 for (const [name, args] of [["git", ["--version"]], ["gh", ["--version"]]]) {
   try {
-    const { stdout } = await execFileAsync(name, args, { timeout: 15000, windowsHide: true });
+    // buildClaudeEnv(): a GUI/service-launched init inherits a sparse PATH;
+    // the review itself always probes with this env (src/index.js env tool).
+    const { stdout } = await execFileAsync(name, args, { timeout: 15000, windowsHide: true, env: buildClaudeEnv() });
     ok(`${name}: ${String(stdout).trim().split(/\r?\n/)[0]}`);
   } catch {
     bad(`${name}: NOT available — ${name === "git" ? "git-based scopes will fail" : "PR scopes will fail (local scopes still work)"}`);
@@ -146,8 +148,25 @@ try {
   config = JSON.parse(fs.readFileSync(zcodeConfigPath, "utf8"));
 } catch (e) {
   sawParseProblem = true;
-  const raw = fs.existsSync(zcodeConfigPath) && fs.statSync(zcodeConfigPath).isFile()
-    ? fs.readFileSync(zcodeConfigPath, "utf8") : null;
+  // Two shapes must exit cleanly instead of crashing later (CHANGELOG 1.8.3
+  // claimed this and it was never true):
+  //  - config.json is a DIRECTORY: readFileSync throws EISDIR, and the write
+  //    below would throw EISDIR too — say so here.
+  //  - config.json exists but is unreadable (EACCES / locked): the recovery
+  //    read must not throw out of this catch.
+  let isFile = false;
+  try { isFile = fs.statSync(zcodeConfigPath).isFile(); } catch { /* missing: fine */ }
+  if (!isFile && fs.existsSync(zcodeConfigPath)) {
+    bad(`${zcodeConfigPath} is not a regular file (is it a directory?) — fix it manually, then re-run; nothing was written`);
+    process.exit(1);
+  }
+  let raw = null;
+  if (isFile) {
+    try { raw = fs.readFileSync(zcodeConfigPath, "utf8"); } catch (readErr) {
+      bad(`cannot read ${zcodeConfigPath} (${readErr?.message || readErr}) — fix its permissions, then re-run; nothing was written`);
+      process.exit(1);
+    }
+  }
   if (raw && raw.trim()) {
     bad(`cannot parse ${zcodeConfigPath} (${e?.message || e}) — fix it manually, then re-run; nothing was written`);
     process.exit(1);
@@ -188,7 +207,12 @@ if (prevObj && prevObj.command === entry.command && JSON.stringify(prevObj.args)
   config.mcp.servers["cc-code-review"] = finalEntry;
   const dir = path.dirname(zcodeConfigPath);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(zcodeConfigPath, JSON.stringify(config, null, 2) + "\n");
+  try {
+    fs.writeFileSync(zcodeConfigPath, JSON.stringify(config, null, 2) + "\n");
+  } catch (e) {
+    bad(`cannot write ${zcodeConfigPath} (${e?.message || e}) — the file may be read-only or locked; nothing was written`);
+    process.exit(1);
+  }
   ok(prevObj ? `updated existing entry (was: ${prevObj.command} ${(prevObj.args || [])[0] ?? ""})` : "created new entry");
 }
 say(`  ${JSON.stringify({ "cc-code-review": config.mcp.servers["cc-code-review"] }, null, 2).split("\n").slice(1, -1).join("\n")}`);

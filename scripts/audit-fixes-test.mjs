@@ -460,7 +460,7 @@ check("hook allows a plain git diff",
     type: "assistant",
     message: { role: "assistant", model: "claude-opus-5", content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "git diff HEAD" } }] },
   });
-  check("streamEventFacts keeps the Bash command", bash.bashCommand, "git diff HEAD");
+  check("streamEventFacts keeps the Bash command", bash.bashCommands, ["git diff HEAD"]);
   check("streamEventFacts tags the parent model", bash.model, { model: "claude-opus-5", subagent: false });
 
   const dispatch = streamEventFacts({
@@ -468,14 +468,37 @@ check("hook allows a plain git diff",
     message: { role: "assistant", model: "claude-opus-5", content: [{ type: "tool_use", id: "a1", name: "Agent", input: { description: "Bug scan of HEAD commit", subagent_type: "general-purpose" } }] },
   });
   check("streamEventFacts extracts an Agent dispatch",
-    dispatch.agentDispatch, { id: "a1", description: "Bug scan of HEAD commit", subagentType: "general-purpose" });
+    dispatch.agentDispatches, [{ id: "a1", description: "Bug scan of HEAD commit", subagentType: "general-purpose" }]);
 
   // Older CLIs name the same tool Task; both must be captured.
   const legacy = streamEventFacts({
     type: "assistant",
     message: { role: "assistant", content: [{ type: "tool_use", id: "a2", name: "Task", input: { description: "legacy dispatch" } }] },
   });
-  check("streamEventFacts also captures a Task dispatch", legacy.agentDispatch?.description, "legacy dispatch");
+  check("streamEventFacts also captures a Task dispatch", legacy.agentDispatches?.[0]?.description, "legacy dispatch");
+
+  // The skill dispatches ALL FIVE reviewers in ONE message so they run in
+  // parallel. A single-valued field kept only the last one — this is the exact
+  // regression that made 1.10.0 surface 1 of 5 reports.
+  const parallel = streamEventFacts({
+    type: "assistant",
+    message: {
+      role: "assistant", model: "claude-opus-5",
+      content: [1, 2, 3, 4, 5].map((i) => ({ type: "tool_use", id: `p${i}`, name: "Agent", input: { description: `reviewer ${i}` } })),
+    },
+  });
+  check("streamEventFacts keeps all five parallel dispatches", parallel.agentDispatches.map((d) => d.id), ["p1", "p2", "p3", "p4", "p5"]);
+
+  // ...and all five tool_results arrive in one user event.
+  const parallelRes = streamEventFacts({
+    type: "user",
+    message: { role: "user", content: [1, 2, 3, 4, 5].map((i) => ({ type: "tool_result", tool_use_id: `p${i}`, content: `report ${i}` })) },
+  });
+  check("streamEventFacts keeps all five results", parallelRes.agentResults.map((r) => r.id), ["p1", "p2", "p3", "p4", "p5"]);
+  check("streamEventFacts keeps every Bash call in one event", streamEventFacts({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "tool_use", id: "b1", name: "Bash", input: { command: "git status" } }, { type: "tool_use", id: "b2", name: "Bash", input: { command: "git diff" } }] },
+  }).bashCommands, ["git status", "git diff"]);
 
   const subMsg = streamEventFacts({
     type: "assistant",
@@ -488,13 +511,23 @@ check("hook allows a plain git diff",
     type: "user",
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: "a1", content: "SUBAGENT REPORT BODY" }] },
   });
-  check("streamEventFacts pairs the tool_result report", res.agentResult, { id: "a1", text: "SUBAGENT REPORT BODY" });
+  check("streamEventFacts pairs the tool_result report", res.agentResults, [{ id: "a1", text: "SUBAGENT REPORT BODY" }]);
 
   const res2 = streamEventFacts({
     type: "user",
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: "a1", content: [{ type: "text", text: "part1" }, { type: "text", text: "part2" }] }] },
   });
-  check("streamEventFacts joins array tool_result content", res2.agentResult.text, "part1\npart2");
+  check("streamEventFacts joins array tool_result content", res2.agentResults[0].text, "part1\npart2");
+
+  // Async background agents: the tool_result is a launch ack; the report is in
+  // task_notification (claude 2.1.x shape).
+  const note = streamEventFacts({
+    type: "system", subtype: "task_notification",
+    task_id: "agent-9", tool_use_id: "a9", status: "completed",
+    summary: "REAL ASYNC REPORT BODY",
+  });
+  check("streamEventFacts extracts a task_notification",
+    note.taskNotification, { toolUseId: "a9", status: "completed", report: "REAL ASYNC REPORT BODY" });
 
   check("streamEventFacts passes the result event through",
     streamEventFacts({ type: "result", subtype: "success" }).result?.subtype, "success");
@@ -555,6 +588,26 @@ check("hook allows a plain git diff",
   const noReq = buildModelProvenance({ requestedModel: null, mainModels: ["step-5-preview"] });
   check("no requested model + foreign tag is flagged", noReq.substituted, true);
   check("note explains the default-model case", /no --model/.test(noReq.note), true);
+}
+
+/* ---------------- init.mjs exits cleanly on a broken config ---------------- */
+// CHANGELOG 1.8.3 claimed EISDIR / unreadable config.json exit cleanly; both
+// actually crashed with an uncaught stack trace. This locks the clean exit:
+// config.json present as a DIRECTORY, HOME/USERPROFILE redirected so nothing
+// outside the temp tree is touched.
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccinit-"));
+  const cfgDir = path.join(home, ".zcode", "cli");
+  fs.mkdirSync(path.join(cfgDir, "config.json"), { recursive: true }); // a DIRECTORY, not a file
+  const r = spawnSync(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "init.mjs")], {
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+    encoding: "utf8",
+    timeout: 120000,
+  });
+  const out = `${r.stdout || ""}${r.stderr || ""}`;
+  check("init.mjs exits 1 on a config.json directory", r.status, 1);
+  check("init.mjs names the problem instead of crashing", /not a regular file/.test(out), true);
+  check("init.mjs did not throw an uncaught EISDIR stack", /\bEISDIR\b[\s\S]*\n\s+at /.test(out), false);
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);

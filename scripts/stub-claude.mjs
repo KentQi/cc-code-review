@@ -48,27 +48,53 @@ if (args.includes("stream-json")) {
   const say = (o) => console.log(JSON.stringify(o));
   say({ type: "system", subtype: "init", session_id: result.session_id });
   // A claude 2.1.x headless run forwards subagent activity to the parent
-  // stream: the Agent dispatch, that subagent's own messages (tagged with
-  // agent_id + the model it actually ran on) and the tool_result carrying its
-  // final report. Emit five of them, plus the stderr line the real CLI writes
-  // when a gateway/settings rewrite substituted the model — the shapes the
-  // report's provenance + reviewer-report extraction must survive.
+  // stream, and the skill dispatches ALL FIVE reviewers in ONE message so they
+  // run in parallel — so this emits one assistant event with five Agent
+  // tool_use blocks, one user event with five tool_results, and the reports.
+  //
+  // Two delivery shapes occur in the real CLI, both exercised here:
+  //  - async background agents (the 2.1.x default for general-purpose): the
+  //    tool_result is only "Async agent launched successfully…", the report
+  //    arrives in a system/task_notification keyed by the same tool_use id;
+  //  - synchronous dispatches: the tool_result itself carries the report.
+  // Reviewers #1-#3 are async (one "stopped" by a budget cap), #4-#5 sync.
   const subagentModel = process.env.STUB_SUBAGENT_MODEL || "MiniMax-M3.1-Flash";
+  const ids = [1, 2, 3, 4, 5].map((i) => `stub-tool-agent-${i}`);
+  say({
+    type: "assistant",
+    message: {
+      role: "assistant", model: "stub-main-model",
+      content: ids.map((toolId, i) => ({
+        type: "tool_use", id: toolId, name: "Agent",
+        input: { description: `STUB reviewer #${i + 1}`, subagent_type: "general-purpose", prompt: "review this" },
+      })),
+    },
+  });
   for (let i = 1; i <= 5; i++) {
-    const toolId = `stub-tool-agent-${i}`;
     say({
-      type: "assistant",
-      message: { role: "assistant", model: "stub-main-model", content: [{ type: "tool_use", id: toolId, name: "Agent", input: { description: `STUB reviewer #${i}`, subagent_type: "general-purpose", prompt: "review this" } }] },
+      type: "user",
+      message: {
+        role: "user",
+        content: [{
+          type: "tool_result", tool_use_id: ids[i - 1],
+          content: i <= 3
+            ? "Async agent launched successfully. The agent is working in the background. Do NOT Read or tail this file."
+            : `STUB-SUBAGENT-REPORT-${i}: findings from reviewer ${i}`,
+        }],
+      },
     });
     say({
       type: "assistant",
       message: { role: "assistant", model: subagentModel, content: [{ type: "text", text: `STUB-SUBAGENT-${i}: working` }] },
-      agent_id: `stub-agent-${i}`, parent_tool_use_id: toolId, subagent_type: "general-purpose",
+      agent_id: `stub-agent-${i}`, parent_tool_use_id: ids[i - 1], subagent_type: "general-purpose",
     });
-    say({
-      type: "user",
-      message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: `STUB-SUBAGENT-REPORT-${i}: findings from reviewer ${i}` }] },
-    });
+    if (i <= 3) {
+      say({
+        type: "system", subtype: "task_notification", task_id: `stub-agent-${i}`,
+        tool_use_id: ids[i - 1], status: i === 3 ? "stopped" : "completed",
+        summary: `STUB-SUBAGENT-REPORT-${i}: async findings from reviewer ${i}${i === 3 ? " (budget stopped)" : ""}`,
+      });
+    }
   }
   process.stderr.write(`[claude-code:unrecognized_model] {"model":"${subagentModel}","query_source":"agent:builtin:general-purpose"}\n`);
 }

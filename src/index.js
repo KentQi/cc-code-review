@@ -307,8 +307,12 @@ function runResultText(report, meta) {
 function subagentReportsText(reports, cap = 4000) {
   if (!Array.isArray(reports) || !reports.length) return "";
   const blocks = reports.map((r, i) => {
-    const head = `### ${i + 1}. ${r.description || r.subagentType || "reviewer subagent"}${r.subagentType ? ` (${r.subagentType})` : ""}`;
-    const body = (r.report || "").trim() || "_(no report captured — see the full log)_";
+    const kind = [r.subagentType || null, r.async ? "async" : null, r.status || null].filter(Boolean).join(", ");
+    const head = `### ${i + 1}. ${r.description || r.subagentType || "reviewer subagent"}${kind ? ` (${kind})` : ""}`;
+    const body = (r.report || "").trim() ||
+      (r.status && r.status !== "completed"
+        ? `_(no report — the subagent ended with status "${r.status}" (e.g. a budget/turn cap stopped it); see the full log)_`
+        : "_(no report captured — see the full log)_");
     const shown = body.length > cap ? `${body.slice(0, cap)}\n…(truncated at ${cap} chars — full text in the log file)` : body;
     return `${head}\n\n${shown}`;
   });
@@ -422,7 +426,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.10.0";
+const SERVER_VERSION = "1.10.1";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -601,7 +605,11 @@ server.tool(
       lines.push(`  version floors: --permission-mode manual needs >= ${PERMISSION_MODE_MANUAL_MIN} (${manualOk === null ? "unknown version" : manualOk ? "ok" : "TOO OLD — hardened mode is skipped"}), --permission-prompts none needs >= ${PERMISSION_PROMPTS_MIN} (${promptsOk === null ? "unknown version" : promptsOk ? "ok" : "TOO OLD — skipped"})`);
       const guard = guardState();
       if (guard.state === "on") {
-        const self = await guardSelfTest();
+        // This is the diagnostic a user consults after replacing node / the
+        // hook script, so it must not trust a cached verdict: the 5-minute TTL
+        // cache is for the hot path (prepareRunHardening), and refresh:true
+        // forces a fresh probe here — the contract 1.9.2's CHANGELOG promised.
+        const self = await guardSelfTest({ refresh: true });
         lines.push(`  shell guard (PreToolUse hook blocking chained/substituted Bash commands): installed — ${self.ok ? "verified working (denies a chained command, allows a clean one)" : `NOT WORKING — ${self.reason}`}`);
       } else {
         lines.push(`  shell guard (PreToolUse hook blocking chained/substituted Bash commands): ${guard.state === "off" ? "OFF" : "FAILED"} — ${guard.reason}`);
@@ -760,16 +768,25 @@ server.tool(
     if (!hard.ok) return err(hard.error);
     const { guard, guardSettings, permissionMode, permissionPrompts, hardening } = hard;
     const guardSetupNote = hard.note;
+    // Any refusal between here and runClaude must release the guard file:
+    // prepareRunHardening marked it in-flight and only runClaude (or this
+    // helper) clears the mark — a leaked mark keeps the file undeletable
+    // until the 2h sweep (cleanupGuardSettings skips in-flight entries).
+    const preflightFail = (msg) => {
+      markGuardSettingsInFlight(guardSettings, false);
+      removeGuardSettings(guardSettings);
+      return err(msg);
+    };
     // (prepareRunHardening already marked guardSettings in-flight for BOTH
     // agentic tools — one marking site, no second call needed here.)
 
     if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
-      return err(`repoPath does not exist or is not a directory: ${repoPath}`);
+      return preflightFail(`repoPath does not exist or is not a directory: ${repoPath}`);
     }
     // Every documented scope (auto/pr/branch/working-dir/last-commit) is
     // git-based, so a non-repo directory can only produce a doomed paid run.
     if (!isRepo(repoPath)) {
-      return err(
+      return preflightFail(
         `${repoPath} is not a version-controlled repository (no .git/.hg/.svn found). ` +
         `Every review scope reads git history, so there is nothing to review here. ` +
         `Point repoPath at the repository root, or run \`git init\` and commit first.`
@@ -785,7 +802,7 @@ server.tool(
       // fail. Say exactly what git said so the cause is actionable.
       const e = pre.gitError;
       const detail = [e.code, e.message].filter(Boolean).join(": ") || String(e);
-      return err(
+      return preflightFail(
         `git failed in ${repoPath} (${detail}). Every review scope reads git history, so the review cannot run. ` +
         `If the repo lives on a network drive or in a sandbox, check that git can access it (ownership/safe.directory, permissions).`
       );
@@ -793,7 +810,7 @@ server.tool(
       if (pre.dirty) {
         repoWarning += `⚠ note: the repository has no commits yet, so history-based scopes (branch/pr/last-commit) have nothing to diff — the reviewer can only look at uncommitted files.\n\n`;
       } else {
-        return err(`Nothing to review: ${repoPath} has no commits and no uncommitted changes. Make a commit (or leave changes in the working tree) first.`);
+        return preflightFail(`Nothing to review: ${repoPath} has no commits and no uncommitted changes. Make a commit (or leave changes in the working tree) first.`);
       }
     }
 
@@ -802,7 +819,7 @@ server.tool(
     const gw = await probeGateway();
     const gwBefore = gatewayTarget(); // for the mid-run "gateway disappeared" check
     if (gw && gw.ok === false) {
-      return err(`Local gateway not reachable: ${gw.host} (${gw.reason}). If you use CC Switch / claude-code-router / a local proxy, start it first, then retry.`);
+      return preflightFail(`Local gateway not reachable: ${gw.host} (${gw.reason}). If you use CC Switch / claude-code-router / a local proxy, start it first, then retry.`);
     }
 
     // Skill: use user-managed > bundled(auto-install) > embedded fallback prompt.
@@ -845,7 +862,7 @@ server.tool(
     if (scope === "pr" || postToPR) {
       const ghOk = await ghPreflight();
       if (!ghOk.ok) {
-        return err(
+        return preflightFail(
           `gh is required for ${scope === "pr" ? "scope=pr" : "postToPR"} but is not usable (${ghOk.reason}). ` +
           `Install the GitHub CLI (https://cli.github.com), run \`gh auth login\`, then retry — or use a local scope (working-dir / last-commit) instead.`
         );
@@ -858,7 +875,7 @@ server.tool(
     // this machine — cannot execute and is only noted in the report.
     const gitPrograms = repoRunsGitPrograms(repoPath);
     if (gitPrograms.refusals.length) {
-      return err(
+      return preflightFail(
         `Refusing to review ${repoPath}: its own git configuration executes programs, which would run on the first git command the reviewer makes:\n` +
         gitPrograms.refusals.slice(0, 5).map((h) => `- ${h}`).join("\n") +
         `\nRemove the offending entries (.git/config / .gitattributes), or review a copy of the repository. ` +
@@ -1061,6 +1078,7 @@ server.tool(
         report: j.result,
         subagents: run.agentReports.map((r) => ({
           description: r.description, subagentType: r.subagentType || undefined,
+          async: r.async || undefined, status: r.status || undefined,
           report: r.report.length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : r.report,
         })),
         subagentsSpawned: meta.subagentsSpawned,
@@ -1204,9 +1222,18 @@ server.tool(
     const hard = await prepareRunHardening(cli);
     if (!hard.ok) return err(hard.error);
     const { guardSettings, permissionMode, permissionPrompts, hardening } = hard;
+    // Any refusal between here and runClaude must release the guard file:
+    // prepareRunHardening marked it in-flight and only runClaude (or this
+    // helper) clears the mark — a leaked mark keeps the file undeletable
+    // until the 2h sweep (cleanupGuardSettings skips in-flight entries).
+    const preflightFail = (msg) => {
+      markGuardSettingsInFlight(guardSettings, false);
+      removeGuardSettings(guardSettings);
+      return err(msg);
+    };
 
     if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
-      return err(`repoPath does not exist or is not a directory: ${repoPath}`);
+      return preflightFail(`repoPath does not exist or is not a directory: ${repoPath}`);
     }
 
     // The followup child runs the same allowlisted git reads from cwd=repoPath,
@@ -1215,7 +1242,7 @@ server.tool(
     // would otherwise spawn a paid run that fails late, and a broken git
     // surfaces as a timeout instead of git's own error.
     if (!isRepo(repoPath)) {
-      return err(
+      return preflightFail(
         `${repoPath} is not a version-controlled repository (no .git/.hg/.svn found). ` +
         `The followup resumes a review session inside that repository, so it cannot run here — ` +
         `point repoPath at the repository the original review ran in.`
@@ -1225,7 +1252,7 @@ server.tool(
     if (pre.gitError) {
       const e = pre.gitError;
       const detail = [e.code, e.message].filter(Boolean).join(": ") || String(e);
-      return err(
+      return preflightFail(
         `git failed in ${repoPath} (${detail}). The followup cannot run there — ` +
         `check that git can access the repo (ownership/safe.directory, permissions), then retry.`
       );
@@ -1237,7 +1264,7 @@ server.tool(
     // config only notes, matching the review path.)
     const gitPrograms = repoRunsGitPrograms(repoPath);
     if (gitPrograms.refusals.length) {
-      return err(
+      return preflightFail(
         `Refusing to run the followup in ${repoPath}: its own git configuration executes programs, which would run on the first git command the reviewer makes:\n` +
         gitPrograms.refusals.slice(0, 5).map((h) => `- ${h}`).join("\n") +
         `\nRemove the offending entries (.git/config / .gitattributes), or review a copy of the repository. (cc-code-review server v${SERVER_VERSION})`
@@ -1250,7 +1277,7 @@ server.tool(
 
     const gw = await probeGateway();
     if (gw && gw.ok === false) {
-      return err(`Local gateway not reachable: ${gw.host} (${gw.reason}). Start CC Switch / your local gateway, then retry.`);
+      return preflightFail(`Local gateway not reachable: ${gw.host} (${gw.reason}). Start CC Switch / your local gateway, then retry.`);
     }
 
     log(`followup start: session=${sessionId}`);
@@ -1281,7 +1308,7 @@ server.tool(
       model: modelCheck.model || ENV.model,
       maxTurns: 30,
       maxBudgetUsd,
-      resumeSessionId: sessionId,
+      resumeSessionId: sessionCheck.sessionId,
       flags: {
         effort: false,
         budget: budgetFlagSupported,

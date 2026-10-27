@@ -544,18 +544,31 @@ function toolResultText(content) {
  * One parsed stream-json event → the facts the report needs. Pure so the tests
  * (and the stub claude) can feed it synthetic events.
  *
- * claude 2.1+ DOES forward subagent activity to the parent stream: the Agent
- * (older CLIs: Task) dispatch tool_use carries the reviewer's description, the
- * matching tool_result carries that subagent's final report, and assistant
- * events tagged with agent_id carry the model the subagent actually ran on.
- * The pre-2.1 assumption that "subagent calls never reach the parent's stream"
- * no longer holds — and that forwarding is what makes both the reviewer
- * reports and the model provenance recoverable here.
+ * claude 2.1+ forwards subagent activity to the parent stream, and the skill
+ * dispatches all five reviewers in ONE message (so they run in parallel) —
+ * so every fact here is a LIST: one event can carry five Agent tool_use
+ * blocks, five tool_results, or several Bash calls. Single-valued fields
+ * silently kept only the last block and dropped the rest of the reviewers.
+ *
+ * Two report paths exist depending on how the CLI runs the dispatch:
+ *  - synchronous Task/Agent: the matching tool_result carries the report;
+ *  - async background agents (2.1.x default for general-purpose): the
+ *    tool_result is only a launch acknowledgement, and the real report
+ *    arrives later as a `system/task_notification` keyed by the same
+ *    tool call id (summary field, status completed/stopped).
  */
 export function streamEventFacts(obj) {
   const facts = {};
   if (!obj || typeof obj !== "object") return facts;
   if (obj.type === "result") { facts.result = obj; return facts; }
+  if (obj.type === "system" && obj.subtype === "task_notification" && typeof obj.tool_use_id === "string") {
+    facts.taskNotification = {
+      toolUseId: obj.tool_use_id,
+      status: String(obj.status ?? ""),
+      report: typeof obj.summary === "string" ? obj.summary : "",
+    };
+    return facts;
+  }
   const model = typeof obj?.message?.model === "string" ? obj.message.model : null;
   if (model) {
     const subagent = typeof obj.agent_id === "string" || typeof obj.parent_tool_use_id === "string";
@@ -563,22 +576,28 @@ export function streamEventFacts(obj) {
   }
   const content = obj?.message?.content;
   if (!Array.isArray(content)) return facts;
+  const bashCommands = [];
+  const agentDispatches = [];
+  const agentResults = [];
   for (const block of content) {
     if (block?.type !== "tool_use" && block?.type !== "tool_result") continue;
     if (block.type === "tool_use" && block.name === "Bash" && typeof block.input?.command === "string") {
-      facts.bashCommand = block.input.command;
+      bashCommands.push(block.input.command);
     }
     if (block.type === "tool_use" && (block.name === "Agent" || block.name === "Task")) {
-      facts.agentDispatch = {
+      agentDispatches.push({
         id: typeof block.id === "string" ? block.id : "",
         description: String(block.input?.description ?? ""),
         subagentType: String(block.input?.subagent_type ?? block.input?.agent_type ?? ""),
-      };
+      });
     }
     if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
-      facts.agentResult = { id: block.tool_use_id, text: toolResultText(block.content) };
+      agentResults.push({ id: block.tool_use_id, text: toolResultText(block.content) });
     }
   }
+  if (bashCommands.length) facts.bashCommands = bashCommands;
+  if (agentDispatches.length) facts.agentDispatches = agentDispatches;
+  if (agentResults.length) facts.agentResults = agentResults;
   return facts;
 }
 
@@ -1073,9 +1092,13 @@ export function runClaude({
       return;
     }
     liveChildren.add(child);
-    // claude has read --settings at startup by the time spawn returns; from here
-    // the guard file is fair game for cleanup again (see guardSettingsInFlight).
-    guardSettingsInFlight.delete(guardSettings);
+    // The guard file stays marked in-flight until the child EXITS (finish()
+    // below deletes the mark and the file). Releasing it when spawn() returns
+    // was wrong: spawn returns after fork/exec, while claude reads --settings
+    // later during its own startup — a concurrent claude_review_env could
+    // delete the file inside that window and the run would execute unguarded
+    // while the report still claimed hardening. finish() is the one place that
+    // unmarks, and the spawn-failure path above unmarks on its own.
 
     const started = Date.now();
     const soChunks = [];
@@ -1091,13 +1114,15 @@ export function runClaude({
     // stream-json puts the `result` event LAST, so a raw buffer truncated at
     // MAX_STREAM_BYTES would lose exactly the line we need. Parse each line as
     // it arrives instead, and keep the Bash commands for the shell-chaining
-    // report. Subagent activity (Agent/Task dispatches, their results and the
-    // model tags) IS forwarded to the parent stream by claude 2.1+ — collect
-    // it so the reviewer reports and the model provenance reach the caller.
+    // report. Subagent activity (Agent/Task dispatches, their results, async
+    // task_notification completions and the model tags) IS forwarded to the
+    // parent stream by claude 2.1+ — collect it so the reviewer reports and
+    // the model provenance reach the caller.
     let resultEvent = null;
     const bashCommands = [];
     const agentDispatches = [];
     const agentResults = new Map();
+    const taskNotifications = new Map();
     const mainModels = new Set();
     const subagentModels = new Set();
     let soPartial = Buffer.alloc(0);
@@ -1107,9 +1132,10 @@ export function runClaude({
       try { obj = JSON.parse(line); } catch { return; }
       const facts = streamEventFacts(obj);
       if (facts.result) { resultEvent = facts.result; return; }
-      if (facts.bashCommand) bashCommands.push(facts.bashCommand);
-      if (facts.agentDispatch) agentDispatches.push(facts.agentDispatch);
-      if (facts.agentResult) agentResults.set(facts.agentResult.id, facts.agentResult.text);
+      if (facts.bashCommands) bashCommands.push(...facts.bashCommands);
+      if (facts.agentDispatches) agentDispatches.push(...facts.agentDispatches);
+      if (facts.agentResults) for (const r of facts.agentResults) agentResults.set(r.id, r.text);
+      if (facts.taskNotification) taskNotifications.set(facts.taskNotification.toolUseId, facts.taskNotification);
       if (facts.model) (facts.model.subagent ? subagentModels : mainModels).add(facts.model.model);
     };
 
@@ -1168,6 +1194,7 @@ export function runClaude({
       clearTimeout(failsafe);
       signal?.removeEventListener("abort", onAbort);
       liveChildren.delete(child);
+      guardSettingsInFlight.delete(guardSettings); // final unmark point (see the mark site)
       removeGuardSettings(guardSettings);
       let stdout = Buffer.concat(soChunks).toString("utf8");
       let stderr = Buffer.concat(seChunks).toString("utf8");
@@ -1206,10 +1233,21 @@ export function runClaude({
         // Reviewer subagents as dispatched, paired with the final report each
         // one handed back (the tool_result whose id matches its dispatch).
         agentDispatches,
-        agentReports: agentDispatches.map((d) => ({
-          ...d,
-          report: agentResults.get(d.id) ?? "",
-        })),
+        agentReports: agentDispatches.map((d) => {
+          const note = taskNotifications.get(d.id);
+          const sync = agentResults.get(d.id) ?? "";
+          // Async background agents (2.1.x default for general-purpose): the
+          // tool_result is just "Async agent launched successfully...", and the
+          // completion notification carries the report. Prefer the notification;
+          // report its status so a budget-stopped agent is visibly stopped
+          // rather than an empty report.
+          return {
+            ...d,
+            report: note?.report || sync,
+            status: note?.status || undefined,
+            async: !!note,
+          };
+        }),
         // Model tags the session actually reported, split parent vs subagent.
         mainModels: [...mainModels],
         subagentModels: [...subagentModels],

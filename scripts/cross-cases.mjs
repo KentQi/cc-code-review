@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * cc-loop cross-case suite — 10 MECE cases over the whole MCP surface.
- * C1-C8, C10 are FREE (stub claude for the async lifecycle); C9 is the real
+ * cc-loop cross-case suite — 12 MECE cases over the whole MCP surface.
+ * C1-C8, C10-C12 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
  * paid end-to-end and only runs with --paid (CC_LOOP_PAID=1).
  * Exit 0 iff every executed case passes.
  */
@@ -390,11 +390,39 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   check("C11", "structuredContent carries the subagent reports",
     Array.isArray(sc.subagents) && sc.subagents.length === 5 && sc.subagents.every((a) => /STUB-SUBAGENT-REPORT-\d/.test(a.report || "")),
     JSON.stringify(sc.subagents || []).slice(0, 200));
+  check("C11", "async subagent completion is marked (and its status kept)",
+    sc.subagents?.[0]?.async === true && sc.subagents?.[0]?.status === "completed" && sc.subagents?.[2]?.status === "stopped",
+    JSON.stringify((sc.subagents || []).map((a) => [a.async, a.status])));
+  check("C11", "a stopped subagent is visible in the text, not silent",
+    /async, stopped/.test(text), text.slice(0, 300));
   check("C11", "model substitution is flagged in the text", /MODEL SUBSTITUTION/.test(text) && /MiniMax-M3\.1-Flash/.test(text), text.slice(0, 300));
   check("C11", "structuredContent records the provenance",
     sc.modelProvenance?.substituted === true && sc.modelProvenance.subagents.includes("MiniMax-M3.1-Flash"),
     JSON.stringify(sc.modelProvenance || {}));
   check("C11", "effective model appears in the metadata", /effective_model:/.test(text), text.slice(0, 300));
+  s.kill();
+}
+
+/* ================= C12 pre-run refusals do not leak the guard file ================= */
+{
+  // prepareRunHardening marks the guard settings file in-flight before the
+  // repo/gateway/gh preflight. Every refusal in that window used to return
+  // without releasing the mark, so cleanupGuardSettings() skipped the file and
+  // it survived for the life of the process (audit finding, fixed in 1.10.1).
+  const s = startServer({ CLAUDE_CODE_PATH: STUB });
+  await s.ready;
+  const dir = path.join(os.tmpdir(), "cc-code-review");
+  const ours = () => {
+    try { return fs.readdirSync(dir).filter((f) => f.startsWith(`guard-settings-${s.child.pid}-`)); } catch { return []; }
+  };
+  const before = ours().length;
+  // mkRepo() is a plain directory, not a git repo -> refusal AFTER the guard
+  // file was written (exactly the leaking window).
+  const r = await s.call("claude_code_review", { repoPath: mkRepo("c12"), scope: "auto" });
+  check("C12", "refusal happens after the guard file was written", r.result?.isError === true && /git failed|version-controlled|Nothing to review/.test(textOf(r)), textOf(r).slice(0, 160));
+  await s.call("claude_review_env", {}); // runs cleanupGuardSettings()
+  const after = ours().length;
+  check("C12", "a pre-run refusal does not leak the guard settings file", after <= before, `before=${before} after=${after} [${ours().join(",")}]`);
   s.kill();
 }
 

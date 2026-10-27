@@ -45,7 +45,32 @@ const result = {
   duration_ms: 4000, permission_denials: [], subagent_stats: { spawned: 5 },
 };
 if (args.includes("stream-json")) {
-  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: result.session_id }));
+  const say = (o) => console.log(JSON.stringify(o));
+  say({ type: "system", subtype: "init", session_id: result.session_id });
+  // A claude 2.1.x headless run forwards subagent activity to the parent
+  // stream: the Agent dispatch, that subagent's own messages (tagged with
+  // agent_id + the model it actually ran on) and the tool_result carrying its
+  // final report. Emit five of them, plus the stderr line the real CLI writes
+  // when a gateway/settings rewrite substituted the model — the shapes the
+  // report's provenance + reviewer-report extraction must survive.
+  const subagentModel = process.env.STUB_SUBAGENT_MODEL || "MiniMax-M3.1-Flash";
+  for (let i = 1; i <= 5; i++) {
+    const toolId = `stub-tool-agent-${i}`;
+    say({
+      type: "assistant",
+      message: { role: "assistant", model: "stub-main-model", content: [{ type: "tool_use", id: toolId, name: "Agent", input: { description: `STUB reviewer #${i}`, subagent_type: "general-purpose", prompt: "review this" } }] },
+    });
+    say({
+      type: "assistant",
+      message: { role: "assistant", model: subagentModel, content: [{ type: "text", text: `STUB-SUBAGENT-${i}: working` }] },
+      agent_id: `stub-agent-${i}`, parent_tool_use_id: toolId, subagent_type: "general-purpose",
+    });
+    say({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: `STUB-SUBAGENT-REPORT-${i}: findings from reviewer ${i}` }] },
+    });
+  }
+  process.stderr.write(`[claude-code:unrecognized_model] {"model":"${subagentModel}","query_source":"agent:builtin:general-purpose"}\n`);
 }
 console.log(JSON.stringify(result));
 try { fs.rmSync(pidFile, { force: true }); } catch { /* best effort */ }

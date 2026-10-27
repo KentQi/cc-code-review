@@ -95,7 +95,7 @@ npm run init
 | `maxBudgetUsd` | `5` | 0–50 | API 花费上限（`--max-budget-usd`，0 = 关闭；第三方网关下依赖网关返回 usage，按 Anthropic 官方单价估算，可能不准或提前中止） |
 | `installSkillIfMissing` | `true` | - | skill 缺失时自动安装 |
 
-返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（Review Summary / Findings / Notes）+ 元数据（`session_id`、花费、轮数、日志路径）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
+返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（Review Summary / Findings / Notes）+ 5 个评审子代理各自的报告（`## Reviewer subagent reports`）+ 元数据（`session_id`、花费、轮数、日志路径、模型溯源）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
 
 ### 2. `claude_review_status` — 轮询/获取/取消后台 review 任务（免费）
 
@@ -182,6 +182,8 @@ hook 没装上、`guardSelfTest()` 自检失败（hook 真的能拦下一条链�
 
 v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `shellGuardBlocked`（被 hook 拦下的链式命令数），并区分两类拒绝：链式命令被拦是 **hook 正常工作**（提示模型拆成多次调用即可，不算评审退化），只有其它拒绝才报"评审可能不完整"。若出现 `⚠ SHELL-CHAINED COMMANDS RAN WITHOUT BEING BLOCKED`，说明有命令绕过了 hook 真实执行了，此时才需要把该仓库当敌对环境处理。
 
+v1.10.0 起返回 **5 个评审子代理各自的报告**（`## Reviewer subagent reports` 小节 + structuredContent 的 `subagents[]`）——此前只有父代理的综合报告，子代理内容只存在于日志文件里，这正是"同样提示词在 Claude Code 里能看到五个专家干活、通过 MCP 只有一份综述"的原因。同时新增**模型溯源**：claude 2.1+ 会把子代理事件（含它实际使用的模型）转发到父流，MCP 据此比对"请求的模型 vs 实际运行的模型"，一旦发现被改写（CC Switch 等网关、或 `~/.claude/settings.json` env 里的 `CLAUDE_CODE_SUBAGENT_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL_NAME`——claude 会在 stderr 打 `[claude-code:unrecognized_model]`），就在结果里明确报 `⚠ MODEL SUBSTITUTION`：这份输出与直接在 Claude Code 里跑同一提示词**不可比**。运行前也会针对 settings.json env 里的同名改写与"进程环境的 `ANTHROPIC_BASE_URL` 被 settings 覆盖"提前预警。
+
 - 运行日志（含被审代码引用）写入 `%TEMP%/cc-code-review/`，目录 0700、文件 0600，只保留最近 20 份。
 - CLI 自带一份内置安全命令白名单（`ls`、`cat`、`echo` 等只读工具），即使不在 `--allowedTools` 里也会放行。已实测 `node -e`、`python -c`、`rm`、`git push`、`git commit`、`curl`、Write 工具调用**全部被拒**，所以这不是提权口子，但"只放行白名单里的命令"要按"白名单 + 这批内置只读命令"来理解。
 - 模型可以把被 hook 拦下的复合命令拆成多次允许的调用分别执行——hook 拦的是"一条命令里串多步"，不是"一个回合里做多件事"。真正的能力边界仍然是 manual 模式的 allowlist，hook 保证每一步都可被单独审计。
@@ -218,10 +220,10 @@ v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `sh
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（165 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（192 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
-node scripts/cross-cases.mjs                    # 10 个 MECE 用例（50 项检查；含桩 claude 的免费异步生命周期；C9 付费需 CC_LOOP_PAID=1）
+node scripts/cross-cases.mjs                    # 11 个 MECE 用例（60 项检查；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）
 node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立刻杀掉（计费，几美分）

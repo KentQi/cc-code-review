@@ -357,7 +357,7 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   const r1 = await s1.call("claude_code_review", { repoPath: mkRepo("c10"), scope: "auto" });
   check("C10", "guard off -> review refused (fail closed)", r1.result?.isError === true && /unguarded/i.test(textOf(r1)), textOf(r1).slice(0, 120));
   s1.kill();
-  const s2 = startServer({ CLAUDE_CODE_PATH: STUB, ANTHROPIC_BASE_URL: "http://127.0.0.1:9" });
+  const s2 = startServer({ CLAUDE_CODE_PATH: STUB, ANTHROPIC_BASE_URL: "http://127.0.0.1:9", CLAUDE_CONFIG_DIR: path.join(tmp, "c10-empty-config") });
   await s2.ready;
   const t0 = Date.now();
   const r2 = await s2.call("claude_code_review", { repoPath: gitRepo("c10b"), scope: "auto" });
@@ -368,6 +368,34 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   const r3 = await s3.call("claude_review_env", {});
   check("C10", "bad CLAUDE_CODE_PATH -> MISCONFIGURED verdict", /MISCONFIGURED/.test(textOf(r3)));
   s3.kill();
+}
+
+/* ================= C11 reviewer reports + model provenance (stub) ================= */
+{
+  // The stub emits what a claude 2.1.x headless run really emits: five Agent
+  // dispatches, each subagent's own messages (tagged with the model it ran on)
+  // and its final report, plus the [claude-code:unrecognized_model] stderr
+  // line a gateway/settings rewrite produces. The MCP must surface both the
+  // reports (the "complete output" gap vs interactive Claude Code) and the
+  // model substitution (why that output is not comparable).
+  const s = startServer({ CLAUDE_CODE_PATH: STUB });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c11"), scope: "last-commit", waitForResult: true });
+  const text = textOf(r);
+  const sc = r.result?.structuredContent || {};
+  check("C11", "reviewer subagent reports are surfaced in the text", /## Reviewer subagent reports \(5 dispatched\)/.test(text), text.slice(0, 200));
+  for (let i = 1; i <= 5; i++) {
+    check("C11", `subagent report #${i} reaches the caller`, text.includes(`STUB-SUBAGENT-REPORT-${i}`), text.slice(0, 200));
+  }
+  check("C11", "structuredContent carries the subagent reports",
+    Array.isArray(sc.subagents) && sc.subagents.length === 5 && sc.subagents.every((a) => /STUB-SUBAGENT-REPORT-\d/.test(a.report || "")),
+    JSON.stringify(sc.subagents || []).slice(0, 200));
+  check("C11", "model substitution is flagged in the text", /MODEL SUBSTITUTION/.test(text) && /MiniMax-M3\.1-Flash/.test(text), text.slice(0, 300));
+  check("C11", "structuredContent records the provenance",
+    sc.modelProvenance?.substituted === true && sc.modelProvenance.subagents.includes("MiniMax-M3.1-Flash"),
+    JSON.stringify(sc.modelProvenance || {}));
+  check("C11", "effective model appears in the metadata", /effective_model:/.test(text), text.slice(0, 300));
+  s.kill();
 }
 
 /* ---------- summary ---------- */

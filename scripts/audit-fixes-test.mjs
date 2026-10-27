@@ -15,6 +15,7 @@ import {
   versionAtLeast, PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN,
   GIT_HARDENING_ARGS, repoRunsGitPrograms, guardHookCommand, hookScriptPath,
   guardState, gitWriteFlagReason, gitSpawnOpts, guardSelfTest,
+  streamEventFacts, parseUnrecognizedModels, buildModelProvenance,
 } from "../src/claude.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -449,6 +450,112 @@ check("hook denies a git --output= call",
   hookVerdict({ tool_name: "Bash", tool_input: { command: "git diff --output=/tmp/x" } }).decision, "deny");
 check("hook allows a plain git diff",
   hookVerdict({ tool_name: "Bash", tool_input: { command: "git diff" } }).decision, null);
+
+/* ---------------- stream facts: subagents + model provenance ---------------- */
+// The reviewer reports and the model tags only exist in the stream-json events
+// claude 2.1+ forwards to the parent. These lock the extraction the report is
+// built on, using the exact event shapes a real run emits.
+{
+  const bash = streamEventFacts({
+    type: "assistant",
+    message: { role: "assistant", model: "claude-opus-5", content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "git diff HEAD" } }] },
+  });
+  check("streamEventFacts keeps the Bash command", bash.bashCommand, "git diff HEAD");
+  check("streamEventFacts tags the parent model", bash.model, { model: "claude-opus-5", subagent: false });
+
+  const dispatch = streamEventFacts({
+    type: "assistant",
+    message: { role: "assistant", model: "claude-opus-5", content: [{ type: "tool_use", id: "a1", name: "Agent", input: { description: "Bug scan of HEAD commit", subagent_type: "general-purpose" } }] },
+  });
+  check("streamEventFacts extracts an Agent dispatch",
+    dispatch.agentDispatch, { id: "a1", description: "Bug scan of HEAD commit", subagentType: "general-purpose" });
+
+  // Older CLIs name the same tool Task; both must be captured.
+  const legacy = streamEventFacts({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "tool_use", id: "a2", name: "Task", input: { description: "legacy dispatch" } }] },
+  });
+  check("streamEventFacts also captures a Task dispatch", legacy.agentDispatch?.description, "legacy dispatch");
+
+  const subMsg = streamEventFacts({
+    type: "assistant",
+    message: { role: "assistant", model: "MiniMax-M3.1-Flash", content: [{ type: "text", text: "working" }] },
+    agent_id: "agent-1", parent_tool_use_id: "a1",
+  });
+  check("streamEventFacts tags a subagent model", subMsg.model, { model: "MiniMax-M3.1-Flash", subagent: true });
+
+  const res = streamEventFacts({
+    type: "user",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "a1", content: "SUBAGENT REPORT BODY" }] },
+  });
+  check("streamEventFacts pairs the tool_result report", res.agentResult, { id: "a1", text: "SUBAGENT REPORT BODY" });
+
+  const res2 = streamEventFacts({
+    type: "user",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "a1", content: [{ type: "text", text: "part1" }, { type: "text", text: "part2" }] }] },
+  });
+  check("streamEventFacts joins array tool_result content", res2.agentResult.text, "part1\npart2");
+
+  check("streamEventFacts passes the result event through",
+    streamEventFacts({ type: "result", subtype: "success" }).result?.subtype, "success");
+  check("streamEventFacts survives garbage", streamEventFacts(null), {});
+  check("streamEventFacts ignores non-tool content",
+    streamEventFacts({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] } }), {});
+}
+
+/* ---------------- unrecognized_model stderr parsing ---------------- */
+{
+  const stderr = [
+    `[claude-code:unrecognized_model] {"model":"MiniMax-M3.1-Flash","query_source":"agent:builtin:general-purpose"}`,
+    `[claude-code:unrecognized_model] {"model":"step-5-preview","query_source":"agent:builtin:general-purpose"}`,
+    "some other stderr noise",
+    `[claude-code:unrecognized_model] {broken json`,
+  ].join("\n");
+  const parsed = parseUnrecognizedModels(stderr);
+  check("parseUnrecognizedModels extracts each line", parsed.length, 2);
+  check("parseUnrecognizedModels keeps model + query_source",
+    parsed[0], { model: "MiniMax-M3.1-Flash", querySource: "agent:builtin:general-purpose" });
+  check("parseUnrecognizedModels skips malformed lines", parsed[1].model, "step-5-preview");
+  check("parseUnrecognizedModels tolerates empty stderr", parseUnrecognizedModels(""), []);
+}
+
+/* ---------------- model provenance ---------------- */
+{
+  // A clean Claude-native run must not cry wolf.
+  const clean = buildModelProvenance({ requestedModel: "claude-opus-5", mainModels: ["claude-opus-5"], subagentModels: ["claude-opus-5"] });
+  check("clean run is not flagged as substituted", clean.substituted, false);
+  check("clean run has no note", clean.note, "");
+
+  // The CC Switch case: main on step-5-preview, subagents on MiniMax-M3.1-Flash.
+  const gw = buildModelProvenance({
+    requestedModel: "claude-opus-5",
+    mainModels: ["step-5-preview"],
+    subagentModels: ["MiniMax-M3.1-Flash"],
+    unrecognized: [{ model: "MiniMax-M3.1-Flash", querySource: "agent:builtin:general-purpose" }],
+  });
+  check("gateway substitution is flagged", gw.substituted, true);
+  check("substitution note names the requested model", /claude-opus-5/.test(gw.note), true);
+  check("substitution note names the main model", /step-5-preview/.test(gw.note), true);
+  check("substitution note names the subagent model", /MiniMax-M3\.1-Flash/.test(gw.note), true);
+  check("substitution note is actionable", /CLAUDE_CODE_SUBAGENT_MODEL/.test(gw.note), true);
+
+  // Alias and dated-snapshot forms are the same family, not a substitution.
+  check("alias opus -> claude-opus-5 is not a substitution",
+    buildModelProvenance({ requestedModel: "opus", mainModels: ["claude-opus-5"] }).substituted, false);
+  check("dated snapshot is not a substitution",
+    buildModelProvenance({ requestedModel: "claude-opus-5", mainModels: ["claude-opus-5-20260101"] }).substituted, false);
+  check("[1m] context suffix is not a substitution",
+    buildModelProvenance({ requestedModel: "claude-opus-5[1m]", mainModels: ["claude-opus-5"] }).substituted, false);
+
+  // No model observed at all (non-stream run) must stay silent.
+  check("no model tags observed -> no warning",
+    buildModelProvenance({ requestedModel: "claude-opus-5", mainModels: [], subagentModels: [] }).substituted, false);
+
+  // Nothing requested + a non-Claude tag is exactly the silent-rewrite case.
+  const noReq = buildModelProvenance({ requestedModel: null, mainModels: ["step-5-preview"] });
+  check("no requested model + foreign tag is flagged", noReq.substituted, true);
+  check("note explains the default-model case", /no --model/.test(noReq.note), true);
+}
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

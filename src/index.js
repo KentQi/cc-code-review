@@ -31,6 +31,7 @@ import {
   analyseCommand, gitWriteFlagReason, shellGuardNote, shellChainingNote,
   probeGateway, gatewayTarget, authEnvResidue, modelEnvOverrides, gitPreflight,
   buildClaudeEnv, repoRunsGitPrograms, gitSpawnOpts, GIT_HARDENING_ARGS,
+  buildModelProvenance,
 } from "./claude.js";
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
@@ -288,11 +289,30 @@ function runResultText(report, meta) {
     ...(meta.durationMs != null ? [`- wall_time_s: ${Math.round(meta.durationMs / 1000)}`] : []),
     ...(meta.skillMode ? [`- pipeline: ${meta.skillMode}`] : []),
     ...(meta.subagentsSpawned != null ? [`- reviewer_subagents_spawned: ${meta.subagentsSpawned}${meta.subagentsSpawned === 0 ? " (0 — the reviewer worked inline; normal for small diffs, but check permission_denials if the report looks thin)" : ""}`] : []),
+    ...(meta.effectiveModel ? [`- effective_model: ${meta.effectiveModel}`] : []),
     ...(meta.permissionDenials ? [`- permission_denials: ${meta.permissionDenials}`] : []),
     ...(typeof meta.logFile === "string" ? [`- full_log: ${meta.logFile}`] : []),
     ...(meta.logFile?.error ? [`- full_log: ${meta.logFile.error}`] : []),
   ];
   return lines.join("\n");
+}
+
+/**
+ * The reviewer subagents' own reports, appended after the synthesis. A direct
+ * Claude Code session shows all five experts working; the MCP used to hand
+ * back only the parent's summary, which is why its output could not reproduce
+ * the interactive run. Each report is capped in the text channel (the full
+ * stream stays in the log file); structuredContent carries the same reports.
+ */
+function subagentReportsText(reports, cap = 4000) {
+  if (!Array.isArray(reports) || !reports.length) return "";
+  const blocks = reports.map((r, i) => {
+    const head = `### ${i + 1}. ${r.description || r.subagentType || "reviewer subagent"}${r.subagentType ? ` (${r.subagentType})` : ""}`;
+    const body = (r.report || "").trim() || "_(no report captured — see the full log)_";
+    const shown = body.length > cap ? `${body.slice(0, cap)}\n…(truncated at ${cap} chars — full text in the log file)` : body;
+    return `${head}\n\n${shown}`;
+  });
+  return `## Reviewer subagent reports (${reports.length} dispatched)\n\n${blocks.join("\n\n")}`;
 }
 
 function logNoteOf(logFile) {
@@ -402,7 +422,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.9.2";
+const SERVER_VERSION = "1.10.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -501,6 +521,42 @@ async function prepareRunHardening(cli) {
   } else if (versionAtLeast(semver, PERMISSION_PROMPTS_MIN) === false) {
     permissionPrompts = false;
     notes.push(`⚠ claude ${semver} is older than ${PERMISSION_PROMPTS_MIN}, so --permission-prompts none is skipped (manual mode still applies).`);
+  }
+
+  // Pre-run model-substitution warning. `--setting-sources user` is what keeps
+  // the reviewed repo from hijacking the run, but it also loads the user's own
+  // settings.json env block — and a provider switcher (CC Switch & friends)
+  // rewrites the model names THERE: CLAUDE_CODE_SUBAGENT_MODEL pins every
+  // reviewer subagent, ANTHROPIC_DEFAULT_*_MODEL_NAME remaps the main model
+  // families. The run then bills under the substituted model and the report is
+  // no longer comparable to a direct Claude Code session. Say so up front —
+  // the post-run provenance note (buildModelProvenance) is the confirmation.
+  {
+    const s = peekSettingsEnv();
+    const remaps = Object.entries(s || {}).filter(([k]) =>
+      k === "CLAUDE_CODE_SUBAGENT_MODEL" || /^ANTHROPIC_DEFAULT_[A-Z]+_MODEL(_NAME)?$/.test(k));
+    if (remaps.length) {
+      notes.push(
+        `⚠ ~/.claude/settings.json env remaps the review's models: ` +
+        remaps.map(([k, v]) => `${k}=${v}`).join(", ") +
+        `. The reviewer subagents (and possibly the main session) will run on that model instead of the requested Claude model — ` +
+        `switch the provider back or unset those keys for a Claude-native review.`
+      );
+    }
+    // claude applies the settings.json env block over the process environment,
+    // so a caller-side ANTHROPIC_BASE_URL (or *_API_KEY) can be silently
+    // overridden — the run then bills against whichever gateway the settings
+    // file names, not the one the caller configured.
+    for (const key of ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]) {
+      const fromProcess = process.env[key];
+      const fromSettings = s?.[key];
+      if (fromProcess && fromSettings && fromProcess !== fromSettings) {
+        notes.push(
+          `⚠ ${key} is set to ${JSON.stringify(fromProcess)} in this server's environment but to ${JSON.stringify(fromSettings)} ` +
+          `in ~/.claude/settings.json — claude applies the settings value, so the run uses ${JSON.stringify(fromSettings)}.`
+        );
+      }
+    }
   }
 
   const hardening = {
@@ -930,6 +986,22 @@ server.tool(
     // the guard and the repo has to be treated as hostile.
     const chainNote = shellChainingNote(run.bashCommands, deniedCommands) || "";
 
+    // Model provenance: the report is only comparable to a direct Claude Code
+    // session if it actually ran on the requested Claude model. A gateway
+    // (CC Switch & friends) or ~/.claude/settings.json env
+    // (CLAUDE_CODE_SUBAGENT_MODEL / ANTHROPIC_DEFAULT_*_MODEL_NAME) rewrites
+    // the model per request — the CLI itself logs
+    // [claude-code:unrecognized_model] on stderr when it does. Without this
+    // note the caller diffs two reports produced by two different models.
+    const requestedModel = modelCheck.model || ENV.model || null;
+    const provenance = buildModelProvenance({
+      requestedModel,
+      mainModels: run.mainModels,
+      subagentModels: run.subagentModels,
+      unrecognized: run.unrecognizedModels,
+    });
+    const provenanceNote = provenance.note;
+
     // CC Switch rewrites ~/.claude/settings.json when the user switches provider.
     // If the gateway this run was configured with vanished OR CHANGED mid-run,
     // the report's provenance is unclear — say so instead of presenting it as
@@ -943,7 +1015,7 @@ server.tool(
         ? `⚠ the gateway endpoint changed during the run (${gwBefore.url} → ${gwAfter.url}) — CC Switch likely switched providers mid-review, so the report may mix two models.`
         : "");
 
-    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote].filter(Boolean).join("\n\n");
+    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote, provenanceNote].filter(Boolean).join("\n\n");
 
     const meta = {
       status: status2,
@@ -955,6 +1027,7 @@ server.tool(
       logFile,
       warning: warnings || undefined,
       subagentsSpawned: j.subagent_stats?.spawned ?? undefined,
+      effectiveModel: provenance.main.length ? provenance.main.join(", ") : undefined,
       permissionDenials: realDenials.length,
       shellGuardBlocked: guardBlocked.length,
       bashCalls: Array.isArray(run.bashCommands) ? run.bashCommands.length : undefined,
@@ -962,7 +1035,7 @@ server.tool(
         ? "PreToolUse hook (blocks chained/substituted Bash commands)"
         : `OFF — ${guard.reason}`,
     };
-    log(`review done: ${meta.status} cost=${meta.costUsd} turns=${meta.numTurns} subagents=${meta.subagentsSpawned} denials=${meta.permissionDenials} guardBlocked=${meta.shellGuardBlocked} bashCalls=${meta.bashCalls} guard=${guard.state}`);
+    log(`review done: ${meta.status} cost=${meta.costUsd} turns=${meta.numTurns} subagents=${meta.subagentsSpawned} denials=${meta.permissionDenials} guardBlocked=${meta.shellGuardBlocked} bashCalls=${meta.bashCalls} guard=${guard.state} model=${meta.effectiveModel || "?"}${provenance.substituted ? " SUBSTITUTED" : ""}`);
 
     if (!ok) {
       return {
@@ -978,14 +1051,25 @@ server.tool(
       };
     }
 
+    const reportsSection = subagentReportsText(run.agentReports);
     return {
-      content: [{ type: "text", text: (warnings ? warnings + "\n\n" : "") + runResultText(j.result, meta) }],
+      content: [{ type: "text", text: (warnings ? warnings + "\n\n" : "") + runResultText(j.result, meta) + (reportsSection ? `\n\n${reportsSection}` : "") }],
       structuredContent: {
         status: "success", sessionId: j.session_id, costUsd: meta.costUsd,
         numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, effort, fix, logFile,
         hardening,
         report: j.result,
+        subagents: run.agentReports.map((r) => ({
+          description: r.description, subagentType: r.subagentType || undefined,
+          report: r.report.length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : r.report,
+        })),
         subagentsSpawned: meta.subagentsSpawned,
+        modelProvenance: {
+          requested: provenance.requested,
+          main: provenance.main,
+          subagents: provenance.subagents,
+          substituted: provenance.substituted,
+        },
         permissionDenials: meta.permissionDenials,
       },
     };
@@ -1231,16 +1315,32 @@ server.tool(
       };
     }
     const chainNote = shellChainingNote(run.bashCommands);
+    // Same model-provenance check as a full review: a followup that silently
+    // answers on a substituted model is not the session the caller thinks it is.
+    const provenance = buildModelProvenance({
+      requestedModel: modelCheck.model || ENV.model || null,
+      mainModels: run.mainModels,
+      subagentModels: run.subagentModels,
+      unrecognized: run.unrecognizedModels,
+    });
     return {
       content: [{ type: "text", text: gitProgramNotes + runResultText(j.result, {
         status: status2,
         sessionId: j.session_id ?? sessionId,
         costUsd: j.total_cost_usd, numTurns: j.num_turns, durationMs: j.duration_ms, logFile,
-      }) + (chainNote ? `\n\n${chainNote}` : "") }],
+        warning: provenance.note || undefined,
+        effectiveModel: provenance.main.length ? provenance.main.join(", ") : undefined,
+      }) + (chainNote ? `\n\n${chainNote}` : "") + (provenance.note ? `\n\n${provenance.note}` : "") }],
       structuredContent: {
         status: status2, sessionId: j.session_id ?? sessionId,
         costUsd: j.total_cost_usd, numTurns: j.num_turns, durationMs: j.duration_ms, reply: j.result,
         hardening,
+        modelProvenance: {
+          requested: provenance.requested,
+          main: provenance.main,
+          subagents: provenance.subagents,
+          substituted: provenance.substituted,
+        },
         bashCalls: Array.isArray(run.bashCommands) ? run.bashCommands.length : undefined,
       },
     };

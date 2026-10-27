@@ -96,7 +96,7 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `maxBudgetUsd` | `5` | 0–50 | API spend cap (`--max-budget-usd`, 0 = disabled; behind third-party gateways this depends on the gateway reporting usage and is estimated at Anthropic list prices — may be inaccurate or trip early) |
 | `installSkillIfMissing` | `true` | - | auto-install the skill when missing |
 
-Returns (async by default: a jobId (<1s) plus the preflight verdict, with the report fetched via claude_review_status(jobId); with waitForResult: true the synchronous form below applies): a markdown report (Review Summary / Findings / Notes) + metadata (`session_id`, spend, turns, log path). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
+Returns (async by default: a jobId (<1s) plus the preflight verdict, with the report fetched via claude_review_status(jobId); with waitForResult: true the synchronous form below applies): a markdown report (Review Summary / Findings / Notes) + each of the 5 reviewer subagents' own reports (`## Reviewer subagent reports`) + metadata (`session_id`, spend, turns, log path, model provenance). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
 
 ### 2. `claude_review_status` — poll / fetch / cancel a background review (free)
 
@@ -183,6 +183,8 @@ When the hook is not installed, when `guardSelfTest()` fails (the hook must real
 
 Since v1.4.0 the metadata also carries `bashCalls` (Bash calls made this run) and `shellGuardBlocked` (chained commands blocked by the hook), and distinguishes two denial kinds: chained commands being blocked is the **hook working as intended** (the model should split them into separate calls — not a review degradation); only other denials report "the review may be incomplete". If you ever see `⚠ SHELL-CHAINED COMMANDS RAN WITHOUT BEING BLOCKED`, a command really executed past the hook — only then treat the repository as a hostile environment.
 
+Since v1.10.0 the result also carries **each of the 5 reviewer subagents' own reports** (a `## Reviewer subagent reports` section plus `subagents[]` in structuredContent). Before that only the parent's synthesis came back while the subagent reports lived in the log file alone — which is exactly why the same prompt showed five experts working in Claude Code but only one summary through this MCP. v1.10.0 also adds **model provenance**: claude 2.1+ forwards subagent events (including the model each actually ran on) to the parent stream, so the MCP compares requested vs effective model and reports `⚠ MODEL SUBSTITUTION` when a rewrite is detected — a CC Switch-style gateway, or `CLAUDE_CODE_SUBAGENT_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL_NAME` in `~/.claude/settings.json`'s env block (claude itself logs `[claude-code:unrecognized_model]` on stderr in that case). The note says plainly that such an output is **not comparable** to the same prompt run directly in Claude Code. The same rewrites — plus a process-env `ANTHROPIC_BASE_URL` silently overridden by the settings file — are also warned about before the run starts.
+
 - Run logs (which quote the code under review) go to `%TEMP%/cc-code-review/`, dir 0700, files 0600, keeping the newest 20. Guard temp files and the throwaway git HOME live in the same directory — cleaned on process exit, stale leftovers swept by the next run.
 - The CLI ships a built-in safe-command whitelist (`ls`, `cat`, `echo` and other read-only tools) that passes even outside `--allowedTools`. Verified that `node -e`, `python -c`, `rm`, `git push`, `git commit`, `curl` and Write tool calls are **all denied** — so this is not a privilege hole, but "only the whitelist passes" should be read as "whitelist + this batch of built-in read-only commands".
 - The model can split a hook-blocked compound command into several allowed calls — the hook blocks "many steps in one command", not "many things in one turn". The real capability boundary is still manual mode's allowlist; the hook guarantees each step is individually auditable.
@@ -219,10 +221,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (165, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (192, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 10 MECE cases (50 checks; free stub-claude async lifecycle; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 11 MECE cases (60 checks; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)
 node scripts/cancel-test.mjs <repoPath>         # is the process tree killed right after cancel (billed, a few cents)

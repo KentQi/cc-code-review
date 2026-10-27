@@ -528,6 +528,127 @@ export function parseResultJson(stdout) {
   return null;
 }
 
+/** tool_result content is a plain string or an array of {type:"text"} blocks. */
+function toolResultText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => (typeof b === "string" ? b : b?.type === "text" && typeof b.text === "string" ? b.text : ""))
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+/**
+ * One parsed stream-json event → the facts the report needs. Pure so the tests
+ * (and the stub claude) can feed it synthetic events.
+ *
+ * claude 2.1+ DOES forward subagent activity to the parent stream: the Agent
+ * (older CLIs: Task) dispatch tool_use carries the reviewer's description, the
+ * matching tool_result carries that subagent's final report, and assistant
+ * events tagged with agent_id carry the model the subagent actually ran on.
+ * The pre-2.1 assumption that "subagent calls never reach the parent's stream"
+ * no longer holds — and that forwarding is what makes both the reviewer
+ * reports and the model provenance recoverable here.
+ */
+export function streamEventFacts(obj) {
+  const facts = {};
+  if (!obj || typeof obj !== "object") return facts;
+  if (obj.type === "result") { facts.result = obj; return facts; }
+  const model = typeof obj?.message?.model === "string" ? obj.message.model : null;
+  if (model) {
+    const subagent = typeof obj.agent_id === "string" || typeof obj.parent_tool_use_id === "string";
+    facts.model = { model, subagent };
+  }
+  const content = obj?.message?.content;
+  if (!Array.isArray(content)) return facts;
+  for (const block of content) {
+    if (block?.type !== "tool_use" && block?.type !== "tool_result") continue;
+    if (block.type === "tool_use" && block.name === "Bash" && typeof block.input?.command === "string") {
+      facts.bashCommand = block.input.command;
+    }
+    if (block.type === "tool_use" && (block.name === "Agent" || block.name === "Task")) {
+      facts.agentDispatch = {
+        id: typeof block.id === "string" ? block.id : "",
+        description: String(block.input?.description ?? ""),
+        subagentType: String(block.input?.subagent_type ?? block.input?.agent_type ?? ""),
+      };
+    }
+    if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+      facts.agentResult = { id: block.tool_use_id, text: toolResultText(block.content) };
+    }
+  }
+  return facts;
+}
+
+/**
+ * claude logs `[claude-code:unrecognized_model] {"model":...,"query_source":...}`
+ * on stderr whenever a request names a model that is not a Claude model — the
+ * reliable trace of a gateway (CC Switch) or settings.json env rewrite. Each
+ * line is one API request that already billed under the substituted model.
+ */
+export function parseUnrecognizedModels(stderr) {
+  const out = [];
+  const re = /\[claude-code:unrecognized_model\]\s*(\{.*?\})/g;
+  let m;
+  while ((m = re.exec(String(stderr || "")))) {
+    try {
+      const j = JSON.parse(m[1]);
+      if (j?.model) out.push({ model: String(j.model), querySource: String(j.query_source ?? "") });
+    } catch { /* malformed line — skip it */ }
+  }
+  return out;
+}
+
+const normModel = (s) => String(s || "").toLowerCase().replace(/\[[^\]]*\]$/, "").trim();
+
+/**
+ * Is `effective` plausibly the model the caller asked for? A real Claude Code
+ * session never reports a non-claude model name unless something rewrote it:
+ * a gateway response tag (step-5-preview), a settings.json env mapping
+ * (MiniMax-M3.1-Flash) or CLAUDE_CODE_SUBAGENT_MODEL. Aliases (opus) and dated
+ * snapshots (claude-opus-5-20260101) still count as the same family.
+ */
+function sameModelFamily(effective, requested) {
+  const e = normModel(effective);
+  if (!e) return true; // unknown → never cry wolf
+  if (e.startsWith("claude-")) return true;
+  const r = normModel(requested);
+  if (!r) return false; // nothing requested, and this is not a Claude model
+  return e === r || e.startsWith(r) || r.startsWith(e) || e.includes(r) || r.includes(e);
+}
+
+/**
+ * Turn the observed model tags into an honest provenance statement. The whole
+ * point: a review that silently ran on a substituted model is not comparable
+ * to the same prompt in a direct Claude Code session, and the caller must be
+ * told rather than left to diff two incomparable reports.
+ */
+export function buildModelProvenance({ requestedModel, mainModels = [], subagentModels = [], unrecognized = [] } = {}) {
+  const main = [...new Set(mainModels.filter(Boolean))];
+  const subagents = [...new Set([...subagentModels, ...unrecognized.map((u) => u.model)].filter(Boolean))];
+  const requested = requestedModel ? String(requestedModel) : null;
+  const foreignMain = main.filter((m) => !sameModelFamily(m, requested));
+  const foreignSub = subagents.filter((m) => !sameModelFamily(m, requested));
+  const substituted = foreignMain.length > 0 || foreignSub.length > 0;
+  let note = "";
+  if (substituted) {
+    const parts = [`requested: ${requested || "claude's default (no --model was passed)"}`];
+    if (foreignMain.length) parts.push(`main session actually ran on: ${foreignMain.join(", ")}`);
+    if (foreignSub.length) parts.push(`reviewer subagents ran on: ${foreignSub.join(", ")}`);
+    note =
+      `⚠ MODEL SUBSTITUTION — this review did NOT run on the requested Claude model (${parts.join(" · ")}). ` +
+      `A local gateway (CC Switch / ANTHROPIC_BASE_URL) or ~/.claude/settings.json env ` +
+      `(CLAUDE_CODE_SUBAGENT_MODEL, ANTHROPIC_DEFAULT_*_MODEL_NAME) rewrites the model, so this output is NOT ` +
+      `comparable to the same prompt run directly in Claude Code, and the "5 parallel expert reviewers" are ` +
+      `instances of the substituted model. claude itself logged ` +
+      `[claude-code:unrecognized_model] for ${unrecognized.length || "the"} substituted request(s). ` +
+      `Switch the provider back (or unset those env keys) and re-run for a Claude-native review.`;
+  }
+  return { substituted, requested, main, subagents, note };
+}
+
 function execTarget(cli) {
   return cli.kind === "node-script"
     ? { cmd: process.execPath, baseArgs: [cli.path] }
@@ -970,23 +1091,26 @@ export function runClaude({
     // stream-json puts the `result` event LAST, so a raw buffer truncated at
     // MAX_STREAM_BYTES would lose exactly the line we need. Parse each line as
     // it arrives instead, and keep the Bash commands for the shell-chaining
-    // report (subagent calls never reach the parent's stream — the PreToolUse
-    // hook is what actually stops those).
+    // report. Subagent activity (Agent/Task dispatches, their results and the
+    // model tags) IS forwarded to the parent stream by claude 2.1+ — collect
+    // it so the reviewer reports and the model provenance reach the caller.
     let resultEvent = null;
     const bashCommands = [];
+    const agentDispatches = [];
+    const agentResults = new Map();
+    const mainModels = new Set();
+    const subagentModels = new Set();
     let soPartial = Buffer.alloc(0);
     const ingest = (line) => {
       if (!line.startsWith("{")) return;
       let obj;
       try { obj = JSON.parse(line); } catch { return; }
-      if (obj?.type === "result") { resultEvent = obj; return; }
-      const content = obj?.message?.content;
-      if (!Array.isArray(content)) return;
-      for (const block of content) {
-        if (block?.type === "tool_use" && block.name === "Bash" && typeof block.input?.command === "string") {
-          bashCommands.push(block.input.command);
-        }
-      }
+      const facts = streamEventFacts(obj);
+      if (facts.result) { resultEvent = facts.result; return; }
+      if (facts.bashCommand) bashCommands.push(facts.bashCommand);
+      if (facts.agentDispatch) agentDispatches.push(facts.agentDispatch);
+      if (facts.agentResult) agentResults.set(facts.agentResult.id, facts.agentResult.text);
+      if (facts.model) (facts.model.subagent ? subagentModels : mainModels).add(facts.model.model);
     };
 
     child.stdout.on("data", (d) => {
@@ -1079,6 +1203,17 @@ export function runClaude({
         stdout,
         stderr,
         bashCommands,
+        // Reviewer subagents as dispatched, paired with the final report each
+        // one handed back (the tool_result whose id matches its dispatch).
+        agentDispatches,
+        agentReports: agentDispatches.map((d) => ({
+          ...d,
+          report: agentResults.get(d.id) ?? "",
+        })),
+        // Model tags the session actually reported, split parent vs subagent.
+        mainModels: [...mainModels],
+        subagentModels: [...subagentModels],
+        unrecognizedModels: parseUnrecognizedModels(stderr),
         timedOut,
         cancelled: wasCancelled,
         exitCode: code,

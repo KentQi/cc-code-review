@@ -38,11 +38,31 @@ try { fs.writeFileSync(pidFile, String(process.pid)); } catch { /* best effort *
 process.stdin.resume();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 await sleep(4000);
+// The result event carries claude's own accounting: modelUsage (per-model
+// totals across main loop + subagents), subagent_stats (spawned/completed/
+// failed/killed/started_in_background/by_type), usage. STUB_RESULT_SUBTYPE
+// lets a test simulate a budget-stopped run (is_error) that still produced
+// subagent reports — the shape that must not lose them.
+const subagentModelEnv = process.env.STUB_SUBAGENT_MODEL || "MiniMax-M3.1-Flash";
+const stop = process.env.STUB_RESULT_SUBTYPE === "error_max_budget_usd";
 const result = {
-  type: "result", subtype: "success", is_error: false,
-  result: "STUB-REPORT: stub review completed (deterministic marker STUB-REPORT-OK)",
-  session_id: "stub-session-0001", num_turns: 3, total_cost_usd: 0.01,
-  duration_ms: 4000, permission_denials: [], subagent_stats: { spawned: 5 },
+  type: "result", subtype: stop ? "error_max_budget_usd" : "success", is_error: stop,
+  result: stop
+    ? "Budget limit reached ($15.00 of $15); stopping background agents."
+    : "STUB-REPORT: stub review completed (deterministic marker STUB-REPORT-OK)",
+  session_id: "stub-session-0001", num_turns: 3, total_cost_usd: 15.01,
+  duration_ms: 4000, permission_denials: [],
+  subagent_stats: {
+    spawned: 5, requested: { background: 0, foreground: 0, unset: 5 },
+    started_in_background: 5, by_type: { "general-purpose": 5 }, max_depth: 1,
+    spawned_by_subagents: 0, completed: 4, failed: 0,
+    killed: { parent: 0, user: 0, system: 1 },
+  },
+  modelUsage: {
+    "stub-main-model": { inputTokens: 1000, outputTokens: 200, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    [subagentModelEnv]: { inputTokens: 5000, outputTokens: 900, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+  },
+  usage: { input_tokens: 6000, output_tokens: 1100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
 };
 if (args.includes("stream-json")) {
   const say = (o) => console.log(JSON.stringify(o));

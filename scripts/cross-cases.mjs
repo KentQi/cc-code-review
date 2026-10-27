@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * cc-loop cross-case suite — 12 MECE cases over the whole MCP surface.
- * C1-C8, C10-C12 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
+ * cc-loop cross-case suite — 13 MECE cases over the whole MCP surface.
+ * C1-C8, C10-C13 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
  * paid end-to-end and only runs with --paid (CC_LOOP_PAID=1).
  * Exit 0 iff every executed case passes.
  */
@@ -400,6 +400,37 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
     sc.modelProvenance?.substituted === true && sc.modelProvenance.subagents.includes("MiniMax-M3.1-Flash"),
     JSON.stringify(sc.modelProvenance || {}));
   check("C11", "effective model appears in the metadata", /effective_model:/.test(text), text.slice(0, 300));
+  // The result event's own accounting (claude 2.1.x): modelUsage is the
+  // authoritative per-model list, subagent_stats the spawn outcome counts.
+  check("C11", "modelUsage is surfaced",
+    !!sc.modelUsage && Object.keys(sc.modelUsage).length >= 2 && Object.keys(sc.modelUsage).includes("MiniMax-M3.1-Flash"),
+    JSON.stringify(sc.modelUsage || {}).slice(0, 200));
+  check("C11", "subagent stats are surfaced",
+    sc.subagentStats?.completed === 4 && sc.subagentStats?.killed?.system === 1 && sc.subagentStats?.started_in_background === 5,
+    JSON.stringify(sc.subagentStats || {}).slice(0, 200));
+  check("C11", "billed models reach the provenance", Array.isArray(sc.modelProvenance?.billed) && sc.modelProvenance.billed.includes("MiniMax-M3.1-Flash"),
+    JSON.stringify(sc.modelProvenance || {}).slice(0, 200));
+  s.kill();
+}
+
+/* ================= C13 a failed run keeps the subagent reports ================= */
+{
+  // A budget cap stops the parent AFTER the subagents finished. The error
+  // result must still carry the reports, the provenance and the accounting —
+  // the audit that found this lost four completed reports to the old error path.
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_RESULT_SUBTYPE: "error_max_budget_usd" });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c13"), scope: "last-commit", waitForResult: true });
+  const text = textOf(r);
+  const sc = r.result?.structuredContent || {};
+  check("C13", "the run is reported as an error", r.result?.isError === true && /REVIEW FAILED/.test(text), text.slice(0, 160));
+  check("C13", "the failure banner names the budget cap", /max-budget-usd|budget/i.test(text), text.slice(0, 300));
+  check("C13", "subagent reports survive the error path", /## Reviewer subagent reports \(5 dispatched\)/.test(text) && [1, 2, 3, 4, 5].every((i) => text.includes(`STUB-SUBAGENT-REPORT-${i}`)), text.slice(0, 300));
+  check("C13", "structuredContent keeps the reports on error",
+    Array.isArray(sc.subagents) && sc.subagents.length === 5 && sc.subagents.every((a) => /STUB-SUBAGENT-REPORT-\d/.test(a.report || "")),
+    JSON.stringify(sc.subagents || []).slice(0, 200));
+  check("C13", "provenance survives the error path", sc.modelProvenance?.substituted === true, JSON.stringify(sc.modelProvenance || {}).slice(0, 200));
+  check("C13", "accounting survives the error path", !!sc.modelUsage && sc.subagentStats?.completed === 4, JSON.stringify({ modelUsage: sc.modelUsage, stats: sc.subagentStats }).slice(0, 300));
   s.kill();
 }
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.10.2 — 2026-10-28
+
+Completeness pass against a full reverse-engineering of the installed claude CLI (2.1.311, Bun single-file executable; the embedded JS bundle extracted module-by-module and analyzed with the REA MCP — application graph: 11k edges, 15k defines, 3.8k calls, evidence exported). The CLI's own protocol docs and schemas, recovered from the bundle, name exactly what a run produces; the MCP was dropping several of those facts:
+
+- **A failed run used to throw the subagent reports away.** `error_max_budget_usd` (five max-effort async subagents can exhaust the cap before the parent synthesizes) returned only the banner — the reports that DID arrive were lost, exactly what happened to this round's own audit. The error path now returns the same `subagents[]`, `modelProvenance`, accounting and a `## Reviewer subagent reports` section as a successful run.
+- **`modelUsage` is surfaced.** The result event carries per-model totals for every call through the query pipeline (main loop, Task subagents, sidechains, internal calls) — the authoritative list of models that actually billed. It now appears in structuredContent and as `models_billed` in the metadata, and feeds the substitution check (a foreign billed model is proof even when stream tags were missing/truncated).
+- **`subagent_stats` is surfaced.** spawned/completed/failed/`killed{parent,user,system}` (system = the budget halt), `started_in_background`, `by_type`, `max_depth`. The metadata gains a `subagents_completed` line, so a budget-killed reviewer is visible instead of inferred.
+- Also surfaced when present: `usage` token totals, `safety_stops`, `terminal_reason`; same on `claude_review_followup` (modelUsage + billed provenance).
+- RE notes that shaped this: the Agent tool answers to both `Agent` and `Task`; the SDK spawn API always sets `run_in_background: true`; async completions arrive as `system/task_notification` (status completed/failed/stopped, summary carries the report); `--setting-sources user` is what loads the model-remapping env (already warned about since 1.10.0). Platform limits recorded honestly: REA's Wakaru-based source recovery needs a Linux x64 binary and its native PE analysis needs Ghidra/IDA, so the bundle was carved directly and read at code level, with REA used for artifact inspection, the application graph and evidence export.
+- Suites: shell-guard 67, audit-fixes 208 (+9: resultFacts, billed provenance), validate 16, cross-cases 73/73 free + paid C9. New C13 locks that a failed run keeps its reports, provenance and accounting.
+
 ## 1.10.1 — 2026-10-28
 
 Fixes from the post-1.10.0 audit round (the MCP reviewing itself with real parallel reviewer subagents — this time they actually ran as async background agents, which is what exposed both headline bugs). The audit run itself was cut by its $15 budget cap after the subagents finished their reports; the findings below are from those reports, each verified against HEAD before fixing:

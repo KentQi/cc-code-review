@@ -644,18 +644,24 @@ function sameModelFamily(effective, requested) {
  * to the same prompt in a direct Claude Code session, and the caller must be
  * told rather than left to diff two incomparable reports.
  */
-export function buildModelProvenance({ requestedModel, mainModels = [], subagentModels = [], unrecognized = [] } = {}) {
+export function buildModelProvenance({ requestedModel, mainModels = [], subagentModels = [], unrecognized = [], billedModels = [] } = {}) {
   const main = [...new Set(mainModels.filter(Boolean))];
+  const billed = [...new Set(billedModels.filter(Boolean))];
   const subagents = [...new Set([...subagentModels, ...unrecognized.map((u) => u.model)].filter(Boolean))];
   const requested = requestedModel ? String(requestedModel) : null;
   const foreignMain = main.filter((m) => !sameModelFamily(m, requested));
   const foreignSub = subagents.filter((m) => !sameModelFamily(m, requested));
-  const substituted = foreignMain.length > 0 || foreignSub.length > 0;
+  // modelUsage keys are the authoritative list of models that actually served
+  // requests (main loop + subagents + sidechains). A foreign name there is proof
+  // of substitution even when the stream tags were missing or truncated.
+  const foreignBilled = billed.filter((m) => !sameModelFamily(m, requested) && !foreignMain.includes(m) && !foreignSub.includes(m));
+  const substituted = foreignMain.length > 0 || foreignSub.length > 0 || foreignBilled.length > 0;
   let note = "";
   if (substituted) {
     const parts = [`requested: ${requested || "claude's default (no --model was passed)"}`];
     if (foreignMain.length) parts.push(`main session actually ran on: ${foreignMain.join(", ")}`);
     if (foreignSub.length) parts.push(`reviewer subagents ran on: ${foreignSub.join(", ")}`);
+    if (foreignBilled.length) parts.push(`billed models: ${foreignBilled.join(", ")}`);
     note =
       `⚠ MODEL SUBSTITUTION — this review did NOT run on the requested Claude model (${parts.join(" · ")}). ` +
       `A local gateway (CC Switch / ANTHROPIC_BASE_URL) or ~/.claude/settings.json env ` +
@@ -665,7 +671,35 @@ export function buildModelProvenance({ requestedModel, mainModels = [], subagent
       `[claude-code:unrecognized_model] for ${unrecognized.length || "the"} substituted request(s). ` +
       `Switch the provider back (or unset those env keys) and re-run for a Claude-native review.`;
   }
-  return { substituted, requested, main, subagents, note };
+  return { substituted, requested, main, subagents, billed, note };
+}
+
+/**
+ * The result event's accounting facts (claude's own field docs):
+ *  - modelUsage: per-model totals for every call through the query pipeline —
+ *    main loop, Task subagents, sidechains, internal calls. The authoritative
+ *    list of models that actually billed.
+ *  - subagent_stats: spawned/completed/failed/killed{parent,user,system},
+ *    started_in_background, by_type, max_depth, and the run_in_background
+ *    request counts. "System" kills include the --max-budget-usd halt.
+ *  - usage: token totals; safety_stops / terminal_reason: why the loop ended.
+ * Pure so the tests can feed it the exact result shapes.
+ */
+export function resultFacts(j) {
+  if (!j || typeof j !== "object") return {};
+  const facts = {};
+  if (j.modelUsage && typeof j.modelUsage === "object" && !Array.isArray(j.modelUsage)) {
+    facts.modelUsage = j.modelUsage;
+  }
+  if (j.subagent_stats && typeof j.subagent_stats === "object" && !Array.isArray(j.subagent_stats)) {
+    facts.subagentStats = j.subagent_stats;
+  }
+  if (j.usage && typeof j.usage === "object" && !Array.isArray(j.usage)) {
+    facts.usage = j.usage;
+  }
+  if (typeof j.safety_stops === "number") facts.safetyStops = j.safety_stops;
+  if (typeof j.terminal_reason === "string") facts.terminalReason = j.terminal_reason;
+  return facts;
 }
 
 function execTarget(cli) {

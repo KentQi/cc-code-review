@@ -15,7 +15,7 @@ import {
   versionAtLeast, PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN,
   GIT_HARDENING_ARGS, repoRunsGitPrograms, guardHookCommand, hookScriptPath,
   guardState, gitWriteFlagReason, gitSpawnOpts, guardSelfTest,
-  streamEventFacts, parseUnrecognizedModels, buildModelProvenance,
+  streamEventFacts, parseUnrecognizedModels, buildModelProvenance, resultFacts,
 } from "../src/claude.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -588,6 +588,33 @@ check("hook allows a plain git diff",
   const noReq = buildModelProvenance({ requestedModel: null, mainModels: ["step-5-preview"] });
   check("no requested model + foreign tag is flagged", noReq.substituted, true);
   check("note explains the default-model case", /no --model/.test(noReq.note), true);
+
+  // modelUsage (the result event's per-model accounting) is authoritative:
+  // a foreign billed model is proof of substitution even with no stream tags.
+  const billed = buildModelProvenance({ requestedModel: "claude-opus-5", billedModels: ["MiniMax-M3.1-Flash"] });
+  check("a foreign billed model alone is flagged", billed.substituted, true);
+  check("billed models are reported separately", billed.billed, ["MiniMax-M3.1-Flash"]);
+  check("claude billed models are not flagged",
+    buildModelProvenance({ requestedModel: "claude-opus-5", billedModels: ["claude-opus-5"] }).substituted, false);
+}
+
+/* ---------------- result event accounting facts ---------------- */
+{
+  const facts = resultFacts({
+    type: "result",
+    modelUsage: { "claude-opus-5": { inputTokens: 1, outputTokens: 2 } },
+    subagent_stats: { spawned: 5, completed: 4, killed: { system: 1 } },
+    usage: { input_tokens: 9 },
+    safety_stops: 2,
+    terminal_reason: "max_budget",
+    somethingElse: "ignored",
+  });
+  check("resultFacts keeps modelUsage", facts.modelUsage, { "claude-opus-5": { inputTokens: 1, outputTokens: 2 } });
+  check("resultFacts keeps subagent_stats", [facts.subagentStats.spawned, facts.subagentStats.completed, facts.subagentStats.killed.system], [5, 4, 1]);
+  check("resultFacts keeps usage", facts.usage.input_tokens, 9);
+  check("resultFacts keeps safety_stops and terminal_reason", [facts.safetyStops, facts.terminalReason], [2, "max_budget"]);
+  check("resultFacts drops unknown keys", Object.keys(facts).sort(), ["modelUsage", "safetyStops", "subagentStats", "terminalReason", "usage"]);
+  check("resultFacts survives garbage", resultFacts(null), {});
 }
 
 /* ---------------- init.mjs exits cleanly on a broken config ---------------- */

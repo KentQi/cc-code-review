@@ -31,7 +31,7 @@ import {
   analyseCommand, gitWriteFlagReason, shellGuardNote, shellChainingNote,
   probeGateway, gatewayTarget, authEnvResidue, modelEnvOverrides, gitPreflight,
   buildClaudeEnv, repoRunsGitPrograms, gitSpawnOpts, GIT_HARDENING_ARGS,
-  buildModelProvenance,
+  buildModelProvenance, resultFacts,
 } from "./claude.js";
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
@@ -290,6 +290,8 @@ function runResultText(report, meta) {
     ...(meta.skillMode ? [`- pipeline: ${meta.skillMode}`] : []),
     ...(meta.subagentsSpawned != null ? [`- reviewer_subagents_spawned: ${meta.subagentsSpawned}${meta.subagentsSpawned === 0 ? " (0 — the reviewer worked inline; normal for small diffs, but check permission_denials if the report looks thin)" : ""}`] : []),
     ...(meta.effectiveModel ? [`- effective_model: ${meta.effectiveModel}`] : []),
+    ...(meta.modelsBilled ? [`- models_billed: ${meta.modelsBilled}`] : []),
+    ...(meta.subagentStats?.completed != null ? [`- subagents_completed: ${meta.subagentStats.completed}/${meta.subagentStats.spawned ?? "?"}${meta.subagentStats.failed ? `, failed: ${meta.subagentStats.failed}` : ""}${meta.subagentStats.killed?.system ? `, stopped by budget/system: ${meta.subagentStats.killed.system}` : ""}`] : []),
     ...(meta.permissionDenials ? [`- permission_denials: ${meta.permissionDenials}`] : []),
     ...(typeof meta.logFile === "string" ? [`- full_log: ${meta.logFile}`] : []),
     ...(meta.logFile?.error ? [`- full_log: ${meta.logFile.error}`] : []),
@@ -426,7 +428,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.10.1";
+const SERVER_VERSION = "1.10.2";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -1011,11 +1013,13 @@ server.tool(
     // [claude-code:unrecognized_model] on stderr when it does. Without this
     // note the caller diffs two reports produced by two different models.
     const requestedModel = modelCheck.model || ENV.model || null;
+    const facts = resultFacts(j);
     const provenance = buildModelProvenance({
       requestedModel,
       mainModels: run.mainModels,
       subagentModels: run.subagentModels,
       unrecognized: run.unrecognizedModels,
+      billedModels: Object.keys(facts.modelUsage || {}),
     });
     const provenanceNote = provenance.note;
 
@@ -1044,7 +1048,9 @@ server.tool(
       logFile,
       warning: warnings || undefined,
       subagentsSpawned: j.subagent_stats?.spawned ?? undefined,
+      subagentStats: facts.subagentStats,
       effectiveModel: provenance.main.length ? provenance.main.join(", ") : undefined,
+      modelsBilled: provenance.billed.length ? provenance.billed.join(", ") : undefined,
       permissionDenials: realDenials.length,
       shellGuardBlocked: guardBlocked.length,
       bashCalls: Array.isArray(run.bashCommands) ? run.bashCommands.length : undefined,
@@ -1055,14 +1061,35 @@ server.tool(
     log(`review done: ${meta.status} cost=${meta.costUsd} turns=${meta.numTurns} subagents=${meta.subagentsSpawned} denials=${meta.permissionDenials} guardBlocked=${meta.shellGuardBlocked} bashCalls=${meta.bashCalls} guard=${guard.state} model=${meta.effectiveModel || "?"}${provenance.substituted ? " SUBSTITUTED" : ""}`);
 
     if (!ok) {
+      // A failed run still produced work worth returning: a budget cap stops
+      // the parent AFTER the subagents finished, and the reports that did
+      // arrive must not be thrown away with the error banner.
+      const errReports = subagentReportsText(run.agentReports);
+      const errNote = [provenanceNote, errReports].filter(Boolean).join("\n\n");
       return {
         isError: true,
-        content: [{ type: "text", text: gitProgramNotes + failureBanner(j, run) + stderrTail(run.stderr) + logNote }],
+        content: [{ type: "text", text: gitProgramNotes + failureBanner(j, run) + stderrTail(run.stderr) + logNote + (errNote ? `\n\n${errNote}` : "") }],
         structuredContent: {
           status: status2, sessionId: j.session_id, costUsd: meta.costUsd,
           numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, effort, fix, logFile,
           hardening,
           error: String(j.result || ""),
+          subagents: run.agentReports.map((r) => ({
+            description: r.description, subagentType: r.subagentType || undefined,
+            async: r.async || undefined, status: r.status || undefined,
+            report: r.report.length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : r.report,
+          })),
+          subagentsSpawned: meta.subagentsSpawned,
+          modelProvenance: {
+            requested: provenance.requested, main: provenance.main,
+            subagents: provenance.subagents, billed: provenance.billed,
+            substituted: provenance.substituted,
+          },
+          modelUsage: facts.modelUsage,
+          subagentStats: facts.subagentStats,
+          usage: facts.usage,
+          safetyStops: facts.safetyStops,
+          terminalReason: facts.terminalReason,
           permissionDenials: meta.permissionDenials,
         },
       };
@@ -1086,8 +1113,14 @@ server.tool(
           requested: provenance.requested,
           main: provenance.main,
           subagents: provenance.subagents,
+          billed: provenance.billed,
           substituted: provenance.substituted,
         },
+        modelUsage: facts.modelUsage,
+        subagentStats: facts.subagentStats,
+        usage: facts.usage,
+        safetyStops: facts.safetyStops,
+        terminalReason: facts.terminalReason,
         permissionDenials: meta.permissionDenials,
       },
     };
@@ -1344,11 +1377,13 @@ server.tool(
     const chainNote = shellChainingNote(run.bashCommands);
     // Same model-provenance check as a full review: a followup that silently
     // answers on a substituted model is not the session the caller thinks it is.
+    const followFacts = resultFacts(j);
     const provenance = buildModelProvenance({
       requestedModel: modelCheck.model || ENV.model || null,
       mainModels: run.mainModels,
       subagentModels: run.subagentModels,
       unrecognized: run.unrecognizedModels,
+      billedModels: Object.keys(followFacts.modelUsage || {}),
     });
     return {
       content: [{ type: "text", text: gitProgramNotes + runResultText(j.result, {
@@ -1366,8 +1401,11 @@ server.tool(
           requested: provenance.requested,
           main: provenance.main,
           subagents: provenance.subagents,
+          billed: provenance.billed,
           substituted: provenance.substituted,
         },
+        modelUsage: followFacts.modelUsage,
+        usage: followFacts.usage,
         bashCalls: Array.isArray(run.bashCommands) ? run.bashCommands.length : undefined,
       },
     };

@@ -36,6 +36,7 @@ import {
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools, postPROnlyTools,
+  deriveReviewLevel,
 } from "./prompt.js";
 import { skillStatus, installBundledSkill, userSkillDir } from "./skill.js";
 
@@ -291,6 +292,9 @@ function runResultText(report, meta) {
     ...(meta.subagentsSpawned != null ? [`- reviewer_subagents_spawned: ${meta.subagentsSpawned}${meta.subagentsSpawned === 0 ? " (0 — the reviewer worked inline; normal for small diffs, but check permission_denials if the report looks thin)" : ""}`] : []),
     ...(meta.effectiveModel ? [`- effective_model: ${meta.effectiveModel}`] : []),
     ...(meta.modelsBilled ? [`- models_billed: ${meta.modelsBilled}`] : []),
+    ...(meta.ultracode ? [`- ultracode: on (standing dynamic-workflow orchestration via the native Workflow tool)`] : []),
+    ...(meta.workflowRuns ? [`- workflow_runs: ${meta.workflowRuns} (native Workflow orchestration dispatches)`] : []),
+    ...(meta.reviewLevel ? [`- review_level: ${meta.reviewLevel} (reviewer-fleet depth: low..max)`] : []),
     ...(meta.subagentStats?.completed != null ? [`- subagents_completed: ${meta.subagentStats.completed}/${meta.subagentStats.spawned ?? "?"}${meta.subagentStats.failed ? `, failed: ${meta.subagentStats.failed}` : ""}${meta.subagentStats.killed?.system ? `, stopped by budget/system: ${meta.subagentStats.killed.system}` : ""}`] : []),
     ...(meta.permissionDenials ? [`- permission_denials: ${meta.permissionDenials}`] : []),
     ...(typeof meta.logFile === "string" ? [`- full_log: ${meta.logFile}`] : []),
@@ -428,7 +432,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.10.2";
+const SERVER_VERSION = "1.11.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -459,7 +463,7 @@ const server = new McpServer(
  * Returns {ok:false, error} to abort, or the resolved flags plus any note that
  * belongs in the report.
  */
-async function prepareRunHardening(cli) {
+async function prepareRunHardening(cli, { ultracode = false } = {}) {
   const allowUnguarded = process.env.CLAUDE_REVIEW_ALLOW_UNGUARDED === "1";
   const guard = guardState();
   const notes = [];
@@ -501,7 +505,11 @@ async function prepareRunHardening(cli) {
       log("guard self-test failed but CLAUDE_REVIEW_ALLOW_UNGUARDED=1 — proceeding:", selfTest.reason);
     }
   }
-  const guardSettings = writeGuardSettings();
+  // ultracode is claude's standing dynamic-workflow orchestration setting (the
+  // `ultracode` settings key). It rides the same --settings file as the guard
+  // hooks; older CLIs strip the unknown key, so requesting it there degrades to
+  // a normal run — workflowRuns in the result shows whether it took effect.
+  const guardSettings = writeGuardSettings(ultracode ? { ultracode: true } : {});
   markGuardSettingsInFlight(guardSettings, true); // held until the claude spawn returns
 
   let semver = null;
@@ -722,6 +730,10 @@ server.tool(
       .describe("Fix mode: after the report, Claude Code edits the repo files to fix the confirmed findings (Edit only, no git commands, no commit; .git and secret paths are deny-listed). Adds a '## Fixes Applied' section."),
     effort: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high")
       .describe("Review effort / reasoning level, same scale as Claude Code (--effort): low..max. max/xhigh = exhaustive deep review, slower and pricier."),
+    reviewLevel: z.enum(["low", "medium", "high", "max"]).optional()
+      .describe("The REVIEW's own depth level — the same argument claude's native /code-review command takes. It sizes the reviewer fleet from the diff (about max(2, min(8, ceil(diff_lines/150))) finder subagents; max legitimately fans out 10-15+ with verification agents). Defaults to a mapping of effort (max→max, xhigh/high→high, medium→medium, low→low). Separate knob from the CLI reasoning effort and from ultracode."),
+    ultracode: z.boolean().default(false)
+      .describe("Enable claude's Ultracode mode for this run (the `ultracode` settings key): standing dynamic-workflow orchestration — every substantive step goes through the native Workflow tool, multi-agent and token-cost-no-object. Orthogonal to effort (any effort level). Requires a claude CLI that supports the key; older builds ignore it (see workflowRuns in the result)."),
     model: z.string().optional().describe("Claude model override (passed as --model)"),
     maxTurns: z.number().int().min(4).max(200).default(80).describe("Agentic turn cap for the review session"),
     timeoutMinutes: z.number().int().min(1).max(60).default(ENV.timeoutMinutes).describe("Hard wall-clock timeout for the run"),
@@ -734,7 +746,7 @@ server.tool(
   },
   async (args, extra) => {
     const {
-      scope, baseRef, focus, postToPR, fix, effort,
+      scope, baseRef, focus, postToPR, fix, effort, ultracode, reviewLevel,
       model, maxTurns, timeoutMinutes, installSkillIfMissing,
     } = args;
     const maxBudgetUsd = args.maxBudgetUsd ?? ENV.maxBudgetUsd;
@@ -766,7 +778,7 @@ server.tool(
     // Checked before anything repo-specific: a disarmed guard is the one failure
     // that must never be discovered three minutes and a few dollars into a run.
     // Shared with claude_review_followup — both runs are agentic in the same repo.
-    const hard = await prepareRunHardening(cli);
+    const hard = await prepareRunHardening(cli, { ultracode });
     if (!hard.ok) return err(hard.error);
     const { guard, guardSettings, permissionMode, permissionPrompts, hardening } = hard;
     const guardSetupNote = hard.note;
@@ -848,8 +860,11 @@ server.tool(
     // --- shell guard + permission-mode version floors (H4, D1) ---------------
     // (already resolved above, before the repo checks)
 
+    // The review's own depth level (third knob): defaults to a mapping of the
+    // CLI effort; it sizes the reviewer fleet from the diff.
+    const effectiveReviewLevel = reviewLevel || deriveReviewLevel(effort);
     const prompt = useSkill
-      ? buildReviewPrompt({ scope, pr, baseRef: baseRefCheck.ref, focus: focusCheck.focus, outputLanguage, postToPR, fix, effort, useEffortFlag: effortFlagSupported, cwd: repoPath })
+      ? buildReviewPrompt({ scope, pr, baseRef: baseRefCheck.ref, focus: focusCheck.focus, outputLanguage, postToPR, fix, effort, reviewLevel: effectiveReviewLevel, useEffortFlag: effortFlagSupported, cwd: repoPath })
       : buildFallbackPrompt({ scope, pr, baseRef: baseRefCheck.ref, focus: focusCheck.focus, outputLanguage, fix, effort, useEffortFlag: effortFlagSupported, cwd: repoPath });
 
     const allowedTools = [...reviewAllowedTools(), ...(fix ? fixAllowedTools() : []), ...(postToPR ? postPROnlyTools() : [])];
@@ -1051,6 +1066,9 @@ server.tool(
       subagentStats: facts.subagentStats,
       effectiveModel: provenance.main.length ? provenance.main.join(", ") : undefined,
       modelsBilled: provenance.billed.length ? provenance.billed.join(", ") : undefined,
+      ultracode: ultracode || undefined,
+      reviewLevel: effectiveReviewLevel,
+      workflowRuns: run.workflowDispatches?.length || undefined,
       permissionDenials: realDenials.length,
       shellGuardBlocked: guardBlocked.length,
       bashCalls: Array.isArray(run.bashCommands) ? run.bashCommands.length : undefined,
@@ -1080,6 +1098,9 @@ server.tool(
             report: r.report.length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : r.report,
           })),
           subagentsSpawned: meta.subagentsSpawned,
+          ultracode: ultracode || undefined,
+          reviewLevel: effectiveReviewLevel,
+          workflowRuns: run.workflowDispatches?.length || undefined,
           modelProvenance: {
             requested: provenance.requested, main: provenance.main,
             subagents: provenance.subagents, billed: provenance.billed,
@@ -1109,6 +1130,9 @@ server.tool(
           report: r.report.length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : r.report,
         })),
         subagentsSpawned: meta.subagentsSpawned,
+          ultracode: ultracode || undefined,
+          reviewLevel: effectiveReviewLevel,
+          workflowRuns: run.workflowDispatches?.length || undefined,
         modelProvenance: {
           requested: provenance.requested,
           main: provenance.main,

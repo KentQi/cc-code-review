@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * cc-loop cross-case suite — 13 MECE cases over the whole MCP surface.
- * C1-C8, C10-C13 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
+ * cc-loop cross-case suite — 14 MECE cases over the whole MCP surface.
+ * C1-C8, C10-C14 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
  * paid end-to-end and only runs with --paid (CC_LOOP_PAID=1).
  * Exit 0 iff every executed case passes.
  */
@@ -431,6 +431,28 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
     JSON.stringify(sc.subagents || []).slice(0, 200));
   check("C13", "provenance survives the error path", sc.modelProvenance?.substituted === true, JSON.stringify(sc.modelProvenance || {}).slice(0, 200));
   check("C13", "accounting survives the error path", !!sc.modelUsage && sc.subagentStats?.completed === 4, JSON.stringify({ modelUsage: sc.modelUsage, stats: sc.subagentStats }).slice(0, 300));
+  s.kill();
+}
+
+/* ================= C14 ultracode reaches the CLI, workflow runs are counted ================= */
+{
+  // Ultracode is claude's native standing dynamic-workflow orchestration,
+  // enabled per session through the `ultracode` settings key. The MCP passes it
+  // in the same --settings file as the guard hooks, and a Workflow dispatch in
+  // the stream is the direct evidence the orchestration actually ran.
+  const echo = path.join(tmp, `stub-settings-c14-${process.pid}.json`);
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_ECHO_SETTINGS: echo, STUB_EMIT_WORKFLOW: "1" });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c14"), scope: "last-commit", ultracode: true, waitForResult: true });
+  const sc = r.result?.structuredContent || {};
+  const text = textOf(r);
+  let settings = null;
+  try { settings = JSON.parse(fs.readFileSync(echo, "utf8")); } catch { /* missing */ }
+  check("C14", "ultracode is passed to the CLI via --settings", settings?.ultracode === true, JSON.stringify(settings || null).slice(0, 200));
+  check("C14", "the guard hooks ride in the same settings file", Array.isArray(settings?.hooks?.PreToolUse), JSON.stringify(settings || null).slice(0, 200));
+  check("C14", "structuredContent reports ultracode", sc.ultracode === true, JSON.stringify(sc).slice(0, 200));
+  check("C14", "workflow dispatches are counted", sc.workflowRuns === 1, `workflowRuns=${sc.workflowRuns}`);
+  check("C14", "the metadata marks ultracode and workflow runs", /ultracode: on/.test(text) && /workflow_runs: 1/.test(text), text.slice(0, 300));
   s.kill();
 }
 

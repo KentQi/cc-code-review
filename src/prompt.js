@@ -34,6 +34,33 @@ const EFFORT_KEYWORDS = {
 
 export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 
+/**
+ * The review's OWN depth level — the third knob next to the CLI reasoning
+ * effort and ultracode. claude's native /code-review command takes exactly
+ * this argument (`/code-review low|medium|high|max`), and its pipeline sizes
+ * the finder fleet from the diff: about max(2, min(8, ceil(lines/150)))
+ * subagents, not a fixed five. Map the CLI effort onto it when the caller
+ * does not pass one explicitly.
+ */
+export const REVIEW_LEVELS = ["low", "medium", "high", "max"];
+export function deriveReviewLevel(effort) {
+  switch (effort) {
+    case "max": return "max";
+    case "xhigh":
+    case "high": return "high";
+    case "medium": return "medium";
+    case "low": return "low";
+    default: return "high";
+  }
+}
+
+/** Finder-fleet sizing rule, mirrored from the native command. */
+export function finderFleetRule(reviewLevel) {
+  const cap = { low: 3, medium: 5, high: 8, max: 8 }[reviewLevel] ?? 8;
+  const floor = { low: 2, medium: 3, high: 4, max: 5 }[reviewLevel] ?? 4;
+  return { floor, cap };
+}
+
 function sanitizeBaseRef(baseRef) {
   if (!baseRef) return { ref: undefined, note: "" };
   // baseRef is interpolated into suggested git commands — keep it a plain ref.
@@ -83,7 +110,7 @@ const REPORT_FORMAT = [
  * `cwd`: the repo root the run executes in — stated explicitly so the reviewer
  * does not waste turns on `cd`/`git -C` prefixes the allowlist cannot match.
  */
-export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, postToPR, fix, effort, useEffortFlag, cwd }) {
+export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, postToPR, fix, effort, reviewLevel, useEffortFlag, cwd }) {
   const { text: scopeText, suffix: scopeSuffix } = scopeDescription(scope, pr, baseRef);
   const lines = [];
   lines.push(`Run a code review of ${scopeText}`);
@@ -106,6 +133,10 @@ export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, p
   }
   if (effort) {
     lines.push(`- Review effort level: ${effort}${effort === "max" || effort === "xhigh" ? " — be exhaustive: re-read surrounding code for every finding, verify each claim against the actual diff, and actively hunt for the harder-to-spot issues (concurrency, error paths, resource leaks), not just the obvious ones." : ""}.`);
+  }
+  if (reviewLevel) {
+    const { floor, cap } = finderFleetRule(reviewLevel);
+    lines.push(`- Reviewer fleet (this run's level: ${reviewLevel}): size it from the diff, not a fixed count — run \`git diff --numstat <range>\`, sum added+deleted, and dispatch about max(${floor}, min(${cap}, ceil(lines/150))) finder subagents in ONE message. The five briefs below are the default set; on a large diff split a brief across finders (per file / per concern) and add verification subagents for scoring — a max-level review legitimately runs 10-15+ subagents in total. Do not shrink below ${floor}.`);
   }
   if (fix) {
     lines.push(`- FIX MODE: after producing the report, apply fixes. Edit the repository files directly to fix every confirmed finding whose fix does not require a business decision. Keep diffs minimal and follow repo conventions. Do NOT run git commit, do NOT touch unrelated code, and never write inside .git/ or into .env / secret / key files. Then append a final "## Fixes Applied" section to your report listing, for each fix: file, what changed, which finding it addresses. If a finding needs a decision you cannot make (e.g. rounding policy), leave it unfixed and say so under Notes.`);
@@ -176,6 +207,12 @@ export function buildFollowupPrompt(message, outputLanguage) {
 export function reviewAllowedTools() {
   return [
     "Read", "Glob", "Grep", "Task", "Agent", "Skill", "TodoWrite",
+    // Workflow is claude's native multi-agent orchestration tool (deterministic
+    // scripts that fan out subagents, run in the background and notify on
+    // completion). Ultracode mode — and any prompt that asks for a workflow —
+    // is dead without it under --permission-mode manual: the dispatch is denied
+    // and the model silently falls back to a single inline pass.
+    "Workflow",
     // Newer CLIs reach for the Task* tools instead of TodoWrite; without these
     // the reviewer burns turns on denied calls before falling back.
     "TaskCreate", "TaskGet", "TaskList", "TaskUpdate",

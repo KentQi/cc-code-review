@@ -579,6 +579,7 @@ export function streamEventFacts(obj) {
   const bashCommands = [];
   const agentDispatches = [];
   const agentResults = [];
+  const workflowDispatches = [];
   for (const block of content) {
     if (block?.type !== "tool_use" && block?.type !== "tool_result") continue;
     if (block.type === "tool_use" && block.name === "Bash" && typeof block.input?.command === "string") {
@@ -591,6 +592,12 @@ export function streamEventFacts(obj) {
         subagentType: String(block.input?.subagent_type ?? block.input?.agent_type ?? ""),
       });
     }
+    // Ultracode's native orchestration lands here: a Workflow dispatch runs a
+    // deterministic multi-agent script in the background. Counting it is the
+    // only direct evidence in the parent stream that the workflow mode began.
+    if (block.type === "tool_use" && block.name === "Workflow") {
+      workflowDispatches.push({ id: typeof block.id === "string" ? block.id : "", name: String(block.input?.name ?? "") });
+    }
     if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
       agentResults.push({ id: block.tool_use_id, text: toolResultText(block.content) });
     }
@@ -598,6 +605,7 @@ export function streamEventFacts(obj) {
   if (bashCommands.length) facts.bashCommands = bashCommands;
   if (agentDispatches.length) facts.agentDispatches = agentDispatches;
   if (agentResults.length) facts.agentResults = agentResults;
+  if (workflowDispatches.length) facts.workflowDispatches = workflowDispatches;
   return facts;
 }
 
@@ -1011,20 +1019,29 @@ async function guardSelfTestProbe() {
  *
  * Returns the settings path, or null when the guard is switched off.
  */
-export function writeGuardSettings() {
-  if (!shellGuardStatus().enabled) return null;
+export function writeGuardSettings(extra = {}) {
+  // `extra` carries claude's own top-level settings keys that this run needs —
+  // currently `ultracode` (standing dynamic-workflow orchestration, applied via
+  // --settings). The guard hooks are the security part; the extras must still
+  // be written when the guard is explicitly disabled, or ultracode would be
+  // silently dropped in unguarded mode.
+  const hasExtra = extra && Object.keys(extra).length > 0;
+  if (!shellGuardStatus().enabled && !hasExtra) return null;
   try {
     const dir = path.join(os.tmpdir(), "cc-code-review");
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     sweepTempArtifacts(dir);
     const file = path.join(dir, `guard-settings-${process.pid}-${Math.random().toString(36).slice(2, 8)}.json`);
     fs.writeFileSync(file, JSON.stringify({
-      hooks: {
-        PreToolUse: [{
-          matcher: "Bash|Write|Edit|MultiEdit|NotebookEdit|Read",
-          hooks: [{ type: "command", command: guardHookCommand(), onFailure: "block" }],
-        }],
-      },
+      ...(extra || {}),
+      ...(shellGuardStatus().enabled ? {
+        hooks: {
+          PreToolUse: [{
+            matcher: "Bash|Write|Edit|MultiEdit|NotebookEdit|Read",
+            hooks: [{ type: "command", command: guardHookCommand(), onFailure: "block" }],
+          }],
+        },
+      } : {}),
     }, null, 2), { mode: 0o600 });
     guardSettingsFiles.add(file);
     return file;
@@ -1157,6 +1174,7 @@ export function runClaude({
     const agentDispatches = [];
     const agentResults = new Map();
     const taskNotifications = new Map();
+    const workflowDispatches = [];
     const mainModels = new Set();
     const subagentModels = new Set();
     let soPartial = Buffer.alloc(0);
@@ -1170,6 +1188,7 @@ export function runClaude({
       if (facts.agentDispatches) agentDispatches.push(...facts.agentDispatches);
       if (facts.agentResults) for (const r of facts.agentResults) agentResults.set(r.id, r.text);
       if (facts.taskNotification) taskNotifications.set(facts.taskNotification.toolUseId, facts.taskNotification);
+      if (facts.workflowDispatches) workflowDispatches.push(...facts.workflowDispatches);
       if (facts.model) (facts.model.subagent ? subagentModels : mainModels).add(facts.model.model);
     };
 
@@ -1286,6 +1305,7 @@ export function runClaude({
         mainModels: [...mainModels],
         subagentModels: [...subagentModels],
         unrecognizedModels: parseUnrecognizedModels(stderr),
+        workflowDispatches: [...workflowDispatches],
         timedOut,
         cancelled: wasCancelled,
         exitCode: code,

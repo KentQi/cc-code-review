@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Comprehensive code review pipeline — 5 parallel reviewer subagents (convention compliance, bug scan, git-blame history, previous PRs, in-code comments), 0-100 confidence scoring, keeps only findings >= 80, outputs a structured markdown report. Use when asked to review code changes, a pull request, a branch, or the working tree. Adapted from Anthropic's official code-review plugin.
+description: Comprehensive code review pipeline — a diff-sized fleet of parallel reviewer subagents (convention compliance, bug scan, git-blame history, previous PRs, in-code comments; about max(2, min(8, ceil(diff_lines/150))) finders, and a max-level review legitimately fans out 10-15+ agents with verification), 0-100 confidence scoring, keeps only findings >= 80, outputs a structured markdown report. Use when asked to review code changes, a pull request, a branch, or the working tree. Adapted from Anthropic's official code-review plugin.
 ---
 
 # Code Review
@@ -32,9 +32,15 @@ branch, (3) the last commit.
 3. **Gather conventions**: find the CLAUDE.md / AGENTS.md files (repo root and
    the directories of changed files) that govern the changed code.
 
-4. **Five parallel reviews** — dispatch five Task subagents in ONE message so
-   they run in parallel. Give each the diff (or the exact commands to obtain
-   it) plus its brief below. Every subagent returns ONLY a JSON list of issues:
+4. **Reviewer fleet — size it from the diff, not a fixed count.** Run
+   `git diff --numstat <range>`, sum added+deleted lines, and dispatch about
+   `max(2, min(8, ceil(lines/150)))` finder subagents in ONE message so they run
+   in parallel. The five briefs below are the default set: on a large diff split
+   a brief across finders (per file / per concern) so every finder gets a
+   focused scope, and add verification subagents for step 5. A max-level review
+   legitimately runs 10-15+ subagents in total. Give each the diff (or the exact
+   commands to obtain it) plus its brief. Every subagent returns ONLY a JSON
+   list of issues:
    `{"file": "...", "line_range": "12-18", "reason": "...", "category": "..."}`.
 
    - **#1 Conventions** — audit the changes against the CLAUDE.md / AGENTS.md

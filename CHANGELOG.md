@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.11.0 — 2026-10-28
+
+Workflow-level pass: the MCP now exposes the same three knobs a native Claude Code review has, and the bundled skill sizes its reviewer fleet the way the native pipeline does. Established by reading claude 2.1.311's own code for `/code-review` (the built-in command, alias `/review`) and the Ultracode/Workflow machinery:
+
+- **Three separate variables, now all reachable through this MCP.**
+  1. `effort` — the CLI's reasoning effort (`--effort low..max`), unchanged.
+  2. `ultracode` (new) — claude's standing dynamic-workflow orchestration. Setting `ultracode: true` makes the MCP write the `ultracode` settings key into the `--settings` file it already passes, so the CLI injects its "use the Workflow tool on every substantive task" mode. Orthogonal to effort (any level), exactly as the CLI's own `applied` schema documents. The allowlist gains the native `Workflow` tool — without it, ultracode (and any request for a workflow) was silently denied under `--permission-mode manual` and collapsed to a single inline pass.
+  3. `reviewLevel` (new) — the review's own depth level, the same argument `/code-review low|medium|high|max` takes. It sizes the finder fleet from the diff instead of a fixed number: about `max(2, min(8, ceil(diff_lines/150)))` reviewers (level floors/caps: low 2-3, medium 3-5, high 4-8, max 5-8), and a max-level review legitimately fans out **10-15+ agents** once verification is included. Defaults to a mapping of `effort` (max→max, xhigh/high→high, medium→medium, low→low). The bundled skill now says this explicitly ("five is the default set, not a cap").
+- Why this matters: the native review is not "5 subagents, one pass". Its finder count is diff-derived, and max/ultracode runs add verification phases and workflow orchestration — which is what the "many rounds / 10-15+ concurrent agents" behaviour actually is.
+- Reporting: `ultracode` / `review_level` / `workflow_runs` in structuredContent and metadata; `workflowRuns` counts native Workflow dispatches from the stream (direct evidence the orchestration began).
+- Suites: shell-guard 67, audit-fixes 226 (+18: fleet rule/level mapping/Workflow allowlist/ultracode settings), validate 16, cross-cases 78/78 free (new C14 proves ultracode reaches the CLI via --settings with the guard hooks intact and that Workflow dispatches are counted).
+
 ## 1.10.2 — 2026-10-28
 
 Completeness pass against a full reverse-engineering of the installed claude CLI (2.1.311, Bun single-file executable; the embedded JS bundle extracted module-by-module and analyzed with the REA MCP — application graph: 11k edges, 15k defines, 3.8k calls, evidence exported). The CLI's own protocol docs and schemas, recovered from the bundle, name exactly what a run produces; the MCP was dropping several of those facts:

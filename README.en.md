@@ -89,7 +89,9 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `outputLanguage` | `中文` | - | report language |
 | `postToPR` | `false` | - | additionally post the summary back to the PR via `gh pr comment` (by default the report is only returned, nothing leaves the machine) |
 | `fix` | `false` | - | **fix mode**: after the report, edit repo files to fix the findings (only Edit/Write unlocked, **zero git write commands**, no commits; `.git/**`, `.env*` and secret files are all in the deny list — blocking verified on a real CLI) |
-| `effort` | `high` | low/medium/high/xhigh/max | **review effort**, same levels as Claude Code's native `--effort`; degrades to think/ultrathink keywords when the CLI lacks the flag (never both at once) |
+| `effort` | `high` | low/medium/high/xhigh/max | **model reasoning effort**, same levels as Claude Code's native `--effort`; degrades to think/ultrathink keywords when the CLI lacks the flag (never both at once) |
+| `reviewLevel` | derived from `effort` | low/medium/high/max | **the review's own depth** — the same argument the native `/code-review low\|high\|max` takes. Sizes the finder fleet from the diff: about `max(2, min(8, ceil(lines/150)))` (low 2-3 / medium 3-5 / high 4-8 / max 5-8; a max run reaches 10-15+ agents with verification). A separate knob from `effort` and `ultracode` |
+| `ultracode` | `false` | - | **Ultracode mode**: writes `ultracode: true` into the `--settings` file, enabling claude's standing dynamic-workflow orchestration (every substantive step via the Workflow tool, multi-agent, token cost no object). Orthogonal to effort; older CLIs ignore the key (`workflow_runs` in the result shows whether it took effect) |
 | `model` | - | - | model override (`--model` passthrough) |
 | `maxTurns` | `80` | 4–200 | agentic turn cap |
 | `timeoutMinutes` | `20` | 1–60 | hard timeout |
@@ -221,10 +223,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (208, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (226, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 13 MECE cases (73 checks; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 14 MECE cases (78 checks; ultracode/workflow + fleet scaling e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)
 node scripts/cancel-test.mjs <repoPath>         # is the process tree killed right after cancel (billed, a few cents)

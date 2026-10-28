@@ -10,11 +10,13 @@
 import {
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools,
   postPROnlyTools, buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
+  deriveReviewLevel, finderFleetRule,
 } from "../src/prompt.js";
 import {
   versionAtLeast, PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN,
   GIT_HARDENING_ARGS, repoRunsGitPrograms, guardHookCommand, hookScriptPath,
   guardState, gitWriteFlagReason, gitSpawnOpts, guardSelfTest,
+  writeGuardSettings, removeGuardSettings,
   streamEventFacts, parseUnrecognizedModels, buildModelProvenance, resultFacts,
 } from "../src/claude.js";
 import fs from "node:fs";
@@ -534,6 +536,59 @@ check("hook allows a plain git diff",
   check("streamEventFacts survives garbage", streamEventFacts(null), {});
   check("streamEventFacts ignores non-tool content",
     streamEventFacts({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] } }), {});
+
+  // Ultracode's native orchestration: the Workflow dispatch is the only direct
+  // evidence in the parent stream that multi-agent workflow mode began.
+  const wf = streamEventFacts({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "tool_use", id: "w1", name: "Workflow", input: { script: "export const meta = { name: 'x' };" } }] },
+  });
+  check("streamEventFacts extracts Workflow dispatches", wf.workflowDispatches, [{ id: "w1", name: "" }]);
+}
+
+/* ---------------- the review's own depth level (third knob) ---------------- */
+{
+  check("effort max maps to review level max", deriveReviewLevel("max"), "max");
+  check("effort xhigh maps to review level high", deriveReviewLevel("xhigh"), "high");
+  check("effort high maps to review level high", deriveReviewLevel("high"), "high");
+  check("effort medium maps to review level medium", deriveReviewLevel("medium"), "medium");
+  check("effort low maps to review level low", deriveReviewLevel("low"), "low");
+  check("unknown effort defaults to high", deriveReviewLevel("bogus"), "high");
+  check("fleet rule is tighter at low", finderFleetRule("low"), { floor: 2, cap: 3 });
+  check("fleet rule at max keeps the native cap of 8", finderFleetRule("max"), { floor: 5, cap: 8 });
+  // The prompt must carry the fleet rule and the level, so the model sizes the
+  // fleet from the diff instead of always dispatching five.
+  const prompt = buildReviewPrompt({
+    scope: "last-commit", pr: undefined, baseRef: undefined, focus: undefined,
+    outputLanguage: "English", postToPR: false, fix: false, effort: "max",
+    reviewLevel: "max", useEffortFlag: true, cwd: "C:/repo",
+  });
+  check("prompt carries the reviewer fleet rule", /Reviewer fleet \(this run's level: max\)/.test(prompt), true);
+  check("prompt carries the diff-sized formula", /max\(5, min\(8, ceil\(lines\/150\)\)\)/.test(prompt), true);
+  check("prompt says five is not a cap", /10-15\+ subagents/.test(prompt), true);
+}
+
+/* ---------------- the review allowlist covers native workflow orchestration ---------------- */
+{
+  const allowed = reviewAllowedTools();
+  check("allowlist grants the native Workflow tool", allowed.includes("Workflow"), true);
+  check("allowlist still grants subagent dispatch", allowed.includes("Task") && allowed.includes("Agent"), true);
+}
+
+/* ---------------- ultracode rides --settings, guard hooks survive ---------------- */
+{
+  const file = writeGuardSettings({ ultracode: true });
+  check("writeGuardSettings with an extra key writes a file", typeof file === "string", true);
+  if (typeof file === "string") {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    check("settings carry ultracode", parsed.ultracode, true);
+    check("settings still carry the guard hooks", Array.isArray(parsed.hooks?.PreToolUse), true);
+    removeGuardSettings(file);
+  }
+  // No extra keys behaves as before (file when guarded, null when not).
+  const plain = writeGuardSettings();
+  check("writeGuardSettings with no extras behaves as before", plain === null || typeof plain === "string", true);
+  if (typeof plain === "string") removeGuardSettings(plain);
 }
 
 /* ---------------- unrecognized_model stderr parsing ---------------- */

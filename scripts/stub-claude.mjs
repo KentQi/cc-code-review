@@ -24,9 +24,20 @@ if (args.includes("--help")) {
     "  --permission-mode <mode>",
     "  --permission-prompts <policy>",
     "  --output-format <fmt>  (json, stream-json)",
+    "  --settings <file>",
     "  --verbose",
   ].join("\n"));
   process.exit(0);
+}
+
+// STUB_ECHO_SETTINGS=<file>: copy the --settings JSON to that path so a test
+// can assert what the MCP actually handed claude (e.g. the ultracode key).
+// STUB_EMIT_WORKFLOW=1: emit one Workflow tool_use, as ultracode runs do.
+if (process.env.STUB_ECHO_SETTINGS) {
+  const i = args.indexOf("--settings");
+  let content = null;
+  if (i >= 0 && args[i + 1]) { try { content = fs.readFileSync(args[i + 1], "utf8"); } catch { /* missing */ } }
+  try { fs.writeFileSync(process.env.STUB_ECHO_SETTINGS, content ?? "null"); } catch { /* best effort */ }
 }
 
 // headless review: drain stdin, sleep, emit result
@@ -67,6 +78,13 @@ const result = {
 if (args.includes("stream-json")) {
   const say = (o) => console.log(JSON.stringify(o));
   say({ type: "system", subtype: "init", session_id: result.session_id });
+  if (process.env.STUB_EMIT_WORKFLOW === "1") {
+    // Ultracode runs open with a Workflow dispatch (native orchestration).
+    say({
+      type: "assistant",
+      message: { role: "assistant", model: "stub-main-model", content: [{ type: "tool_use", id: "stub-workflow-1", name: "Workflow", input: { script: "export const meta = { name: \"stub-review\" };" } }] },
+    });
+  }
   // A claude 2.1.x headless run forwards subagent activity to the parent
   // stream, and the skill dispatches ALL FIVE reviewers in ONE message so they
   // run in parallel — so this emits one assistant event with five Agent

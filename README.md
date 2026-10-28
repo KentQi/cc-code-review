@@ -88,7 +88,9 @@ npm run init
 | `outputLanguage` | `中文` | - | 报告语言 |
 | `postToPR` | `false` | - | 额外用 `gh pr comment` 把摘要贴回 PR（默认只返回报告，不外发） |
 | `fix` | `false` | - | **修复模式**：报告后直接修改仓库文件修复 findings（只放开 Edit/Write，**无任何 git 写命令**，不 commit；`.git/**`、`.env*`、密钥文件均在 deny 列表，实测拦截有效） |
-| `effort` | `high` | low/medium/high/xhigh/max | **评审力度**，与 Claude Code 原生 `--effort` 同档位；CLI 不支持时自动退化为 think/ultrathink 关键词（两者不会叠加） |
+| `effort` | `high` | low/medium/high/xhigh/max | **模型推理力度**，与 Claude Code 原生 `--effort` 同档位；CLI 不支持时自动退化为 think/ultrathink 关键词（两者不会叠加） |
+| `reviewLevel` | 由 `effort` 派生 | low/medium/high/max | **评审自身深度**（同原生 `/code-review low\|high\|max` 的参数）：按 diff 行数决定 finder 子代理数量，约 `max(2, min(8, ceil(行数/150)))`（low 2-3 / medium 3-5 / high 4-8 / max 5-8，max 加验证阶段实际 10-15+ 个）。与 `effort`、`ultracode` 是三个独立旋钮 |
+| `ultracode` | `false` | - | **Ultracode 模式**：通过 `--settings` 写入 `ultracode: true`，启用原生"常驻动态工作流编排"（每个实质任务走 Workflow 工具、多代理、不计 token 成本）；与 effort 正交；旧版 CLI 忽略该键（结果里的 `workflow_runs` 显示是否真正生效） |
 | `model` | - | - | 覆盖模型（`--model` 透传） |
 | `maxTurns` | `80` | 4–200 | agentic 轮数上限 |
 | `timeoutMinutes` | `20` | 1–60 | 硬超时 |
@@ -220,10 +222,10 @@ v1.10.0 起返回 **5 个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（208 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（226 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
-node scripts/cross-cases.mjs                    # 13 个 MECE 用例（73 项检查；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
+node scripts/cross-cases.mjs                    # 14 个 MECE 用例（78 项检查；含 ultracode/workflow + 舰队缩放端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）
 node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立刻杀掉（计费，几美分）

@@ -143,11 +143,13 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 **hook 只能做减法（二进制实证）**：claude 2.1.311 的输出清洗器只透传 `permissionDecision: "deny" | "ask"`，`"allow"` 被显式丢弃（`permissionDecision==="deny"||==="ask"?…:void 0`），`updatedInput` 在这条路径上也没有落地。所以 hook 永远无法绕过权限引擎——这正是 allowlist 里必须有 `Bash(cd:*)` 的原因：让"形状"过引擎的闸，再由 hook 判定 `cd` 到底落在哪。任何 hook 放行、引擎拒绝的组合只会浪费一个 turn，不会削弱安全。
 
+**读取同样被限制在仓库内（v1.15.0）**：`find`/`rg` 的路径参数、管道 sink（cat/head/tail/grep/sed -n/…）的文件参数都做仓库范围校验——`~`、`$VAR`、`..`、绝对路径、以及仓库内软链接/junction 指到外面，全部拒绝（用 realpath 判定，与 Edit/Write 的边界同一套规则）。另外一次性拒绝 `git diff --no-index`、`git blame --contents`、`sed -f`、`wc/sort --files0-from` 和 `uniq` 的第二个位置参数（写文件）。hook 拿不到仓库根时对 Bash 直接 fail-closed。
+
 它同时补上了**前缀规则本身堵不住的写/执行形态**：`find` 与 `rg` 是通过前缀规则放行的只读工具，但 `find -delete / -exec / -execdir / -ok / -okdir / -fprint / -fprintf / -fls` 会写文件或执行程序，`rg --pre / --pre-glob` 会对每个文件跑任意程序；同理 `sed -i`、`sed` 脚本里的 `w`/`W`/`e`、`sort -o` 都会写文件。这些形态在 hook 里按段直接拒绝（allowlist 里也加了对应 deny 规则，但确定性控制是 hook），普通读取不受影响。
 
 > ⚠️ **`--settings` 替换的是整个 `hooks` 键**：注入的临时文件里只有本 MCP 的 hook，用户 `~/.claude/settings.json` 里自己配置的 hooks 在**本次子进程内不会生效**（其它键如 `env`、`model`、`permissions` 不受影响）。这是 CLI 的行为，不是遗漏——如果你依赖自己的 hook 在 review 期间运行，目前需要另想办法。
 
-**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs` 锁定（159 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
+**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs` 锁定（203 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
 
 重定向（含 `2>/dev/null`）仍然整体拒绝：它是绕过 allowlist 的读写原语，改成"允许读重定向"需要先证明每个目标路径都无害，代价大于收益。需要看输出就直接让命令写到 stdout。
 
@@ -232,10 +234,10 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（159 条，免费）+ 审计修复单测（242 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（203 条，免费）+ 审计修复单测（243 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
-node scripts/cross-cases.mjs                    # 20 个 MECE 用例（113 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
+node scripts/cross-cases.mjs                    # 20 个 MECE 用例（118 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
 node scripts/paid-smoke.mjs [--cap=2]           # 真实 CLI 端到端 smoke：带三个已知 bug 的临时仓库，effort/reviewLevel=low，默认不设费用上限（计费，实测约 $0.5）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）

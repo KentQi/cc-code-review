@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.15.0 — 2026-10-28
+
+The last open read channel: the reviewer's Bash readers could reach anywhere on disk. They are now scoped to the reviewed repository.
+
+- **Path scoping for every read the guard allows.** `find`/`rg` path arguments, the file arguments of every pipe sink (cat/head/tail/wc/uniq/cut/tr/grep/sort/sed), and git's own path flags are checked against the repo root. Refused: absolute paths outside, `..`, `~` (the shell expands it), `$VAR` (cannot be resolved statically), and in-repo symlinks or junctions that point elsewhere — the check realpaths the deepest existing ancestor, exactly like the Edit/Write boundary, so a lexical-only check cannot be walked out of.
+- **Reads that were never path arguments are refused outright**: `git diff --no-index` and `git blame --contents` (arbitrary path reads), `sed -f` (a script file can contain `w`/`W`/`e`), `wc`/`sort --files0-from` (a list of paths that may point outside), and `uniq`'s second positional (an output file — a write, not a read).
+- **The hook now fails closed for Bash when it is not given the repo root**, the same rule the write/read tools already followed. `runClaude` always sets it; a broken setup is refused instead of silently running unscoped.
+- **`echo` joined the allowed surface.** It reads nothing and writes nothing, and `git show HEAD && echo "=====" && git log` is the one separator a reviewer reaches for — a real run burned a turn on exactly that. `git show HEAD && echo x; rm -rf /` is still refused (rm is not in the policy).
+- **The guard self-test probes a construct, not a program.** It used `git status; echo PWNED`, which the new policy legitimately allows; it now uses command substitution (`git status $(curl …)`), which is refused structurally no matter what the program list says — a self-test that can be satisfied by policy drift is not a self-test.
+- **Verified end-to-end on the real CLI.** In one probe the allowlisted `rg -n hello .` ran with no denial while `rg -n TOP-SECRET "<a directory outside the repo>"` was denied, and `cd "<repo>" && git show --stat HEAD` still runs. The paid smoke completed with `denials=0` and 2/2 reviewer reports captured.
+- Suites: shell-guard 203 (+36: path scoping in and out, `~`/`$VAR`/`..`, sinks reading outside, the outright-denied forms, echo, the hook's fail-closed root), audit-fixes 243, validate 16, cross-cases 118/118 (C6 also proves an in-repo `rg` passes, an outside `rg`/`find`/sink read is refused, and Bash without a root fails closed).
+
 ## 1.14.0 — 2026-10-28
 
 The shell guard stops conflating "compound command" with "unsafe command". Every Bash call is now judged segment by segment, so the shapes models actually write run while the ones that matter stay blocked.

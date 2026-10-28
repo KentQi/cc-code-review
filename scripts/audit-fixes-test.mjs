@@ -411,11 +411,11 @@ const p4 = buildFollowupPrompt("为什么第 2 条是问题？", "中文");
 truthy("followup prompt states the read-only role", /must not modify it/.test(p4));
 
 /* ---------------- git's file-writing flags (deterministic hook rule) ---------------- */
-const hookVerdict = (payload) => {
+const hookVerdict = (payload, extraEnv = {}) => {
   const r = spawnSync(
     process.execPath,
     [path.join(path.dirname(fileURLToPath(import.meta.url)), "pre-tool-hook.js")],
-    { input: JSON.stringify(payload), encoding: "utf8", timeout: 15000, windowsHide: true, env: { ...process.env } },
+    { input: JSON.stringify(payload), encoding: "utf8", timeout: 15000, windowsHide: true, env: { ...process.env, ...extraEnv } },
   );
   let out = null;
   for (const line of String(r.stdout || "").trim().split("\n").reverse()) {
@@ -450,9 +450,12 @@ for (const cmd of [
 
 // the hook applies the same verdict
 check("hook denies a git --output= call",
-  hookVerdict({ tool_name: "Bash", tool_input: { command: "git diff --output=/tmp/x" } }).decision, "deny");
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "git diff --output=/tmp/x" } }, { CLAUDE_REVIEW_REPO_ROOT: os.tmpdir() }).decision, "deny");
 check("hook allows a plain git diff",
-  hookVerdict({ tool_name: "Bash", tool_input: { command: "git diff" } }).decision, null);
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "git diff" } }, { CLAUDE_REVIEW_REPO_ROOT: os.tmpdir() }).decision, null);
+// The Bash policy is scoped to the repo; without a root it must fail closed.
+check("hook refuses Bash without a repo root",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "git diff" } }).decision, "deny");
 
 /* ---------------- stream facts: subagents + model provenance ---------------- */
 // The reviewer reports and the model tags only exist in the stream-json events

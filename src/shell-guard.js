@@ -65,6 +65,11 @@ export const BASH_POLICY = [
   },
   { prog: "find", prefixes: [{ words: [] }] },
   { prog: "rg", prefixes: [{ words: [] }] },
+  // `echo` reads nothing and writes nothing: it only prints its arguments, so
+  // it is the one harmless separator a reviewer reaches for in a compound call
+  // (`git show HEAD && echo "=====" && git log`). Refusing it burned a turn in a
+  // real run and protected nothing.
+  { prog: "echo", prefixes: [{ words: [] }] },
   {
     prog: "gh",
     prefixes: [
@@ -137,7 +142,18 @@ function parseCommand(cmd) {
       continue;
     }
     if (c === "'" || c === '"') { quote = c; inWord = true; continue; }
-    if (c === "\\") { if (i + 1 < cmd.length) { word += cmd[++i]; inWord = true; } continue; }
+    if (c === "\\") {
+      // A POSIX shell drops the backslash for any escaped character, but on
+      // Windows that turns `C:\Users\x` into `C:Usersx` — a token we could then
+      // no longer recognise as an absolute path, which is exactly what a path
+      // escape looks like. Keep the backslash when it precedes a path-ish
+      // character; treat it as an escape before whitespace and metacharacters,
+      // which is what matters for splitting.
+      const next = cmd[i + 1];
+      if (next !== undefined && /[A-Za-z0-9._\-/@:]/.test(next)) { word += "\\" + next; i++; inWord = true; continue; }
+      if (next !== undefined) { word += next; i++; inWord = true; }
+      continue;
+    }
     if (c === " " || c === "\t" || c === "\r") { endWord(); continue; }
     if (c === "\n" || c === ";") { endSeg(";"); continue; }
     if (c === "&") {
@@ -173,9 +189,236 @@ function matchPolicy(words) {
   return null;
 }
 
-/** Write/execute flags that a permitted program must still not carry. */
-function segmentProblem(words) {
+/**
+ * Flags that consume the next token, per program, and what that token is:
+ *   "pattern" — a regex/script, not a filesystem path
+ *   "path"    — a filesystem path (must stay inside the repo)
+ *   "skip"    — a value that is neither (a glob, a count, an encoding…)
+ * Any flag not listed here is treated as self-contained (`-x`, `--foo=bar`).
+ * This table exists so a pattern like `rg '/api/v1'` is not mistaken for a path
+ * while `rg -f /home/u/patterns` still is one.
+ */
+const FLAG_KINDS = {
+  rg: {
+    "-e": "pattern", "--regexp": "pattern",
+    "-f": "path", "--file": "path", "--ignore-file": "path",
+    "-g": "skip", "--glob": "skip", "-t": "skip", "--type": "skip", "-T": "skip", "--type-not": "skip",
+    "-m": "skip", "--max-count": "skip", "-A": "skip", "-B": "skip", "-C": "skip",
+    "--context": "skip", "--after-context": "skip", "--before-context": "skip",
+    "-j": "skip", "--threads": "skip", "--color": "skip", "--colors": "skip",
+    "--encoding": "skip", "--engine": "skip", "--sort": "skip", "--sortr": "skip",
+    "--type-add": "skip", "--type-clear": "skip", "--max-columns": "skip", "--max-filesize": "skip",
+    "-E": "skip", "--dfa-size-limit": "skip", "--regex-size-limit": "skip",
+    "-r": "skip", "--replace": "skip", "--path-separator": "skip", "--max-depth": "skip",
+    "--pre": "skip", "--pre-glob": "skip",
+  },
+  grep: {
+    "-e": "pattern", "--regexp": "pattern",
+    "-f": "path", "--file": "path",
+    "-m": "skip", "--max-count": "skip", "-A": "skip", "-B": "skip", "-C": "skip",
+    "--context": "skip", "--after-context": "skip", "--before-context": "skip",
+    "-d": "skip", "--directories": "skip", "-D": "skip", "--devices": "skip",
+    "--include": "skip", "--exclude": "skip", "--exclude-dir": "skip",
+    "--label": "skip", "--binary-files": "skip", "--color": "skip", "--colour": "skip",
+    "--group-separator": "skip", "--initial-tab": "skip",
+  },
+  sed: {
+    "-e": "pattern", "--expression": "pattern",
+    "-f": "path", "--file": "path",
+    "-l": "skip", "--line-length": "skip",
+  },
+  cat: {},
+  head: { "-n": "skip", "--lines": "skip", "-c": "skip", "--bytes": "skip" },
+  tail: {
+    "-n": "skip", "--lines": "skip", "-c": "skip", "--bytes": "skip",
+    "-s": "skip", "--sleep-interval": "skip", "--pid": "skip",
+  },
+  sort: {
+    "-k": "skip", "--key": "skip", "-t": "skip", "--field-separator": "skip",
+    "-S": "skip", "--buffer-size": "skip", "-T": "skip", "--temporary-directory": "skip",
+    "--random-source": "skip", "--batch-size": "skip", "--compress-program": "skip",
+    "--files0-from": "skip",
+  },
+  uniq: {
+    "-f": "skip", "--skip-fields": "skip", "-s": "skip", "--skip-chars": "skip",
+    "-w": "skip", "--check-chars": "skip",
+  },
+  cut: {
+    "-d": "skip", "--delimiter": "skip", "-f": "skip", "--fields": "skip",
+    "-b": "skip", "--bytes": "skip", "-c": "skip", "--characters": "skip",
+    "--output-delimiter": "skip",
+  },
+  wc: { "--files0-from": "skip" },
+};
+
+/** Flags whose very existence is a read outside the tree. */
+const OUTRIGHT_DENY = {
+  git: {
+    "--no-index": "`git diff --no-index` reads arbitrary paths outside the repository",
+    "--contents": "`git blame --contents` reads an arbitrary file outside the repository",
+  },
+  wc: {
+    "--files0-from": "`wc --files0-from` follows a list of paths that may point outside the repository",
+  },
+  sort: {
+    "--files0-from": "`sort --files0-from` follows a list of paths that may point outside the repository",
+  },
+  sed: {
+    "-f": "`sed -f` runs a script file, which can write or execute (w/W/e) — use an inline line-range script",
+    "--file": "`sed -f` runs a script file, which can write or execute (w/W/e) — use an inline line-range script",
+  },
+  rg: {
+    "--pre": "`rg --pre` runs an arbitrary program",
+    "--pre-glob": "`rg --pre-glob` runs an arbitrary program",
+  },
+};
+
+/**
+ * The tokens of one segment that name filesystem paths.
+ * Program-specific because `rg FOO`'s first positional is a pattern, `sed -n
+ * '1,5p'`'s is a script, and `find`'s paths come before its expression.
+ */
+function pathArgs(words) {
   const prog = words[0];
+  const rest = words.slice(1);
+  if (prog === "find") {
+    // find [options] [paths...] [expression] — paths are the leading tokens
+    // that are not options and not the start of the expression.
+    const out = [];
+    let i = 0;
+    for (; i < rest.length; i++) {
+      const t = rest[i];
+      if (t === "-H" || t === "-L" || t === "-P") continue;
+      if (t === "-D" || t === "-O") { i++; continue; } // their value
+      if (t.startsWith("-") || t === "(" || t === "!" || t === "\\(") break;
+      out.push({ value: t });
+    }
+    return out;
+  }
+  // Programs whose arguments are never filesystem paths.
+  if (prog === "tr" || prog === "git" || prog === "gh" || prog === "echo") return [];
+  const kinds = FLAG_KINDS[prog];
+  if (!kinds) return [];
+  const out = [];
+  let patternSeen = false;
+  let positional = 0;
+  for (let i = 0; i < rest.length; i++) {
+    const t = rest[i];
+    if (t === "--") {
+      for (let j = i + 1; j < rest.length; j++) out.push({ value: rest[j] });
+      break;
+    }
+    if (t.startsWith("-") && t !== "-") {
+      const eq = t.indexOf("=");
+      const name = eq >= 0 ? t.slice(0, eq) : t;
+      const kind = kinds[name];
+      if (kind === "path") {
+        const v = eq >= 0 ? t.slice(eq + 1) : rest[++i];
+        if (typeof v === "string") out.push({ value: v });
+        if (name === "-f" || name === "--file") patternSeen = true;
+        continue;
+      }
+      if (kind === "pattern") {
+        if (eq < 0) i++;
+        patternSeen = true;
+        continue;
+      }
+      if (kind === "skip") {
+        if (eq < 0) i++;
+        continue;
+      }
+      continue; // self-contained flag
+    }
+    positional++;
+    // The first positional of rg/grep is a pattern; of sed, a script.
+    const takesPattern = (prog === "rg" || prog === "grep" || prog === "sed") && positional === 1 && !patternSeen;
+    if (takesPattern) continue;
+    out.push({ value: t });
+  }
+  return out;
+}
+
+let cachedRoot = null;
+/** Realpath of the reviewed root, cached for the hook process. */
+function repoRealpath(root) {
+  const key = path.resolve(root);
+  if (cachedRoot && cachedRoot.key === key) return cachedRoot.value;
+  let value = null;
+  try { value = fs.realpathSync(key); } catch { value = null; }
+  cachedRoot = { key, value };
+  return value;
+}
+
+/**
+ * Is `token` inside the reviewed repository? Lexical containment is not enough:
+ * a repo may contain `link -> C:\Users\victim\.ssh`, which is "inside" lexically
+ * and elsewhere on disk — so the deepest existing ancestor is realpathed, the
+ * same rule the write/read scoping uses.
+ */
+export function isInsideRepo(root, token) {
+  if (typeof token !== "string" || !token) return true;
+  if (token.startsWith("~")) return false;           // shell expands to $HOME
+  if (token.includes("$")) return false;             // cannot be resolved statically
+  const realRoot = repoRealpath(root);
+  if (!realRoot) return false;
+  const target = path.resolve(realRoot, token);
+  const rel = path.relative(realRoot, target);
+  if (!rel) return true;
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return false;
+  // Resolve links for the part that exists.
+  let probe = target;
+  for (;;) {
+    let real;
+    try {
+      real = fs.realpathSync(probe);
+    } catch {
+      const parent = path.dirname(probe);
+      if (parent === probe) return false;
+      probe = parent;
+      continue;
+    }
+    const tail = path.relative(probe, target);
+    const full = tail ? path.join(real, tail) : real;
+    const r = path.relative(realRoot, full);
+    return !r || (!r.startsWith("..") && !path.isAbsolute(r));
+  }
+}
+
+/** A segment may only read inside the reviewed repository. */
+function pathProblem(words, repoRoot) {
+  if (!repoRoot) return null; // standalone use: the hook always supplies it
+  for (const { value } of pathArgs(words)) {
+    if (isInsideRepo(repoRoot, value)) continue;
+    return `blocked: \`${words[0]}\` may only read inside the reviewed repository — \`${value}\` resolves outside it. ` +
+      "Scope the command to the repo (run it with `.` or a repo-relative path, or use the Grep/Glob tools).";
+  }
+  return null;
+}
+
+/** Flags that are a read outside the tree no matter what they point at. */
+function outrightDeny(words) {
+  const table = OUTRIGHT_DENY[words[0]];
+  if (!table) return null;
+  for (const w of words) {
+    const name = w.includes("=") ? w.slice(0, w.indexOf("=")) : w;
+    const why = table[name];
+    if (why) return `blocked: ${why}. Review mode is read-only and scoped to the repository.`;
+  }
+  return null;
+}
+
+/**
+ * Everything a permitted segment must still not do: write/execute flags, reads
+ * that escape the repository, and the one sink form that writes (uniq's second
+ * positional). Applied to both policy commands and pipe sinks.
+ * @returns {string | null}
+ */
+function segmentProblem(words, repoRoot) {
+  const prog = words[0];
+
+  const outright = outrightDeny(words);
+  if (outright) return outright;
+
   if (prog === "find" && words.some((w) => FIND_WRITE_FLAGS.has(w))) {
     return "blocked: find with a write/execute action (-delete, -exec, -ok, -fprint, ...). Review mode is read-only — use Read/Glob/Grep, or a plain find without those flags.";
   }
@@ -188,12 +431,6 @@ function segmentProblem(words) {
       return `blocked: \`${write}\` makes git write a file, and a read-only review must not write anything (an allowlisted \`git diff\`/\`git show\`/\`git log\` call with --output= would otherwise be a file-write primitive for repo-controlled content). Drop the flag.`;
     }
   }
-  return null;
-}
-
-/** A pipe sink may only ever consume stdin; a few of them can still write. */
-function sinkProblem(words) {
-  const prog = words[0];
   if (prog === "sort" && words.some((w) => w === "-o" || w.startsWith("--output"))) {
     return "blocked: `sort -o` writes a file. Review mode is read-only — drop the flag.";
   }
@@ -208,6 +445,13 @@ function sinkProblem(words) {
       return "blocked: this sed script uses a w/W/e command, which writes a file or runs a program. Use a line-range print (`sed -n '1,120p'`).";
     }
   }
+  if (prog === "uniq" && pathArgs(words).length >= 2) {
+    return "blocked: `uniq` takes an output file as its second argument. Review mode is read-only — pipe it and let the result go to stdout.";
+  }
+
+  const scope = pathProblem(words, repoRoot);
+  if (scope) return scope;
+
   return null;
 }
 
@@ -318,14 +562,14 @@ export function analyseCommand(cmd, opts = {}) {
     }
 
     if (matchPolicy(words)) {
-      const why = segmentProblem(words);
+      const why = segmentProblem(words, opts.repoRoot);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }
 
     // A pipe sink consumes stdin only; it is never a valid first command.
     if (i > 0 && ops[i - 1] === "|" && PIPE_SINKS.has(words[0])) {
-      const why = sinkProblem(words);
+      const why = segmentProblem(words, opts.repoRoot);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }
@@ -350,7 +594,7 @@ export function analyseCommand(cmd, opts = {}) {
  *
  * @returns {{chained: string[], substituted: string[], dangerous: string[], unlisted: string[], clean: number, blocked: string[], ran: string[]}}
  */
-export function detectShellChaining(commands, denied = []) {
+export function detectShellChaining(commands, denied = [], opts = {}) {
   const chained = [];
   const substituted = [];
   const dangerous = [];
@@ -360,7 +604,7 @@ export function detectShellChaining(commands, denied = []) {
   const deniedSet = new Set(Array.isArray(denied) ? denied.filter((c) => typeof c === "string") : []);
   let clean = 0;
   for (const raw of Array.isArray(commands) ? commands : []) {
-    const verdict = analyseCommand(raw);
+    const verdict = analyseCommand(raw, opts);
     if (verdict.ok) { clean++; continue; }
     const cmd = String(raw);
     if (verdict.dangerous) dangerous.push(cmd);
@@ -377,8 +621,8 @@ export function detectShellChaining(commands, denied = []) {
  * actually ran. Returns null when there is nothing to report (the common case —
  * the hook denies them, and a denied call is not an escape).
  */
-export function shellChainingNote(commands, denied = []) {
-  const { ran } = detectShellChaining(commands, denied);
+export function shellChainingNote(commands, denied = [], opts = {}) {
+  const { ran } = detectShellChaining(commands, denied, opts);
   if (ran.length === 0) return null;
   const lines = [
     `⚠ ${ran.length === 1 ? "BASH COMMAND" : "BASH COMMANDS"} RAN WITHOUT BEING BLOCKED (${ran.length})`,
@@ -394,8 +638,8 @@ export function shellChainingNote(commands, denied = []) {
  * Report for commands the guard DID block. Informational, not an alarm: the
  * reviewer asked for something outside the surface and can retry differently.
  */
-export function shellGuardNote(commands, denied = []) {
-  const { blocked, dangerous, unlisted, substituted } = detectShellChaining(commands, denied);
+export function shellGuardNote(commands, denied = [], opts = {}) {
+  const { blocked, dangerous, unlisted, substituted } = detectShellChaining(commands, denied, opts);
   const total = blocked.length;
   if (total === 0) return null;
   const dangerSet = new Set(dangerous);

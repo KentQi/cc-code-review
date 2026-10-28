@@ -52,8 +52,11 @@ branch, (3) the last commit.
    > list|show, find, rg, and gh pr view|diff|list|checks / gh repo view.
    > Commands may be combined with `&&`, `;` or `|` as long as EVERY part is one
    > of those read-only commands (after a pipe: head, tail, cat, wc, uniq, cut,
-   > tr, grep, sort, sed -n). No redirection (`>`, `>>`, `<`), no `$(...)` or
-   > backticks, no `&`. For file contents prefer the Read/Grep/Glob tools.
+   > tr, grep, sort, sed -n; `echo` is allowed anywhere). No redirection (`>`,
+   > `>>`, `<`), no `$(...)` or backticks, no `&`. Reads must stay inside the
+   > repository: `rg`/`find` with an outside path (`~`, `..`, an absolute path
+   > elsewhere) is refused, so search from `.`. For file contents prefer the
+   > Read/Grep/Glob tools.
 
    Every subagent returns ONLY a JSON list of issues:
    `{"file": "...", "line_range": "12-18", "reason": "...", "category": "..."}`.

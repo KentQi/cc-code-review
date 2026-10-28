@@ -150,11 +150,17 @@ process.stdin.on("end", async () => {
     return;
   }
 
+  // The Bash policy is scoped to the repository (cd targets, find/rg/sink path
+  // arguments). Without the root there is nothing to scope to, so fail closed —
+  // the same rule the write/read tools already follow.
+  const repoRoot = process.env.CLAUDE_REVIEW_REPO_ROOT;
+  if (!repoRoot) {
+    deny("Bash blocked: no repository root was provided to the guard, so file reads cannot be scoped (fail closed)");
+    return;
+  }
+
   try {
-    const verdict = guard(payload?.tool_input?.command, {
-      // Needed only for `cd`: it is allowed when it resolves to this root.
-      repoRoot: process.env.CLAUDE_REVIEW_REPO_ROOT,
-    });
+    const verdict = guard(payload?.tool_input?.command, { repoRoot });
     if (!verdict.ok) deny(verdict.reason);
   } catch (err) {
     deny(`shell guard failed (${err?.message || err}); refusing to run Bash`);

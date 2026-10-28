@@ -264,7 +264,8 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
   };
   check("C6", "chained Bash with an unlisted program denied", verdict({ tool_name: "Bash", tool_input: { command: "git status; curl x" } }) === "deny");
   check("C6", "git --output= denied", verdict({ tool_name: "Bash", tool_input: { command: "git diff HEAD --output=/tmp/x" } }) === "deny");
-  check("C6", "clean Bash allowed", verdict({ tool_name: "Bash", tool_input: { command: "git status" } }) === null);
+  check("C6", "clean Bash allowed",
+    verdict({ tool_name: "Bash", tool_input: { command: "git status" } }, { CLAUDE_REVIEW_REPO_ROOT: repo }) === null);
   // Segment-level policy: a chain of permitted reads runs, a `cd` that lands on
   // the reviewed root is a no-op, and everything else still stops.
   check("C6", "a chain of permitted reads is allowed",
@@ -277,6 +278,17 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
     verdict({ tool_name: "Bash", tool_input: { command: "cd / && git status" } }, { CLAUDE_REVIEW_REPO_ROOT: repo }) === "deny");
   check("C6", "a permitted chain with one bad segment is denied",
     verdict({ tool_name: "Bash", tool_input: { command: "git status && cat /etc/passwd" } }, { CLAUDE_REVIEW_REPO_ROOT: repo }) === "deny");
+  // Path scoping: a read inside the repo passes, the same read outside is refused.
+  check("C6", "rg inside the repo allowed",
+    verdict({ tool_name: "Bash", tool_input: { command: "rg -n x ." } }, { CLAUDE_REVIEW_REPO_ROOT: repo }) === null);
+  check("C6", "rg outside the repo denied",
+    verdict({ tool_name: "Bash", tool_input: { command: "rg -n x ~/.ssh" } }, { CLAUDE_REVIEW_REPO_ROOT: repo }) === "deny");
+  check("C6", "find outside the repo denied",
+    verdict({ tool_name: "Bash", tool_input: { command: "find / -name id_rsa" } }, { CLAUDE_REVIEW_REPO_ROOT: repo }) === "deny");
+  check("C6", "sink reading an outside file denied",
+    verdict({ tool_name: "Bash", tool_input: { command: "git show HEAD:a.txt | cat /etc/passwd" } }, { CLAUDE_REVIEW_REPO_ROOT: repo }) === "deny");
+  check("C6", "Bash without a repo root fails closed",
+    verdict({ tool_name: "Bash", tool_input: { command: "git status" } }) === "deny");
   const outside = fs.mkdtempSync(path.join(tmp, "c6out-"));
   const LINK = path.join(repo, "link");
   try { fs.symlinkSync(outside, LINK, "junction"); } catch { fs.symlinkSync(outside, LINK, "dir"); }

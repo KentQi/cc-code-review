@@ -144,11 +144,13 @@ Why not the stricter "never allow a compound command": that rejected the shape m
 
 **A PreToolUse hook can only subtract (verified in the binary).** claude 2.1.311's hook-output sanitizer passes `permissionDecision: "deny" | "ask"` through and drops `"allow"` (`permissionDecision==="deny"||==="ask"?…:void 0`); `updatedInput` does not land on that path either. That is exactly why `Bash(cd:*)` must be in the allowlist: it lets the shape through the engine's gate, and the hook then decides where the `cd` actually lands. A hook-allow + engine-deny combination only costs a turn; it never weakens security.
 
+**Reads are scoped to the repository too (v1.15.0).** The path arguments of `find`/`rg` and of every pipe sink (cat/head/tail/grep/sed -n/…), plus git's own path flags, are checked against the repo root — `~`, `$VAR`, `..`, absolute paths, and in-repo symlinks or junctions pointing outside are all refused (realpath, the same rule the Edit/Write boundary uses). `git diff --no-index`, `git blame --contents`, `sed -f`, `wc/sort --files0-from` and `uniq`'s second positional (an output file) are refused outright. A hook that is not given the repo root fails closed for Bash.
+
 It also closes the **write/execute forms that a prefix rule cannot express**: `find` and `rg` are granted as read-only tools, but `find -delete / -exec / -execdir / -ok / -okdir / -fprint / -fprintf / -fls` write files or run programs, `rg --pre / --pre-glob` runs an arbitrary program per file, and `sed -i`, a `w`/`W`/`e` sed command or `sort -o` writes a file. The hook refuses those per segment (matching deny rules are in the allowlist too, but the hook is the deterministic control); plain reads are unaffected.
 
 > ⚠️ **`--settings` replaces the entire `hooks` key**: the injected temp file contains only this MCP's hook — your own hooks from `~/.claude/settings.json` will **not** run inside this child process (other keys such as `env`, `model`, `permissions` are unaffected). This is CLI behavior, not an omission — if you rely on your own hooks during reviews, you currently need a different approach.
 
-**There is exactly one policy**: `src/shell-guard.js` exports `BASH_POLICY`, `prompt.js` renders the `Bash(...)` rules from it, and the hook judges segments against the same table — so "the hook allowed it" and "the engine allowed it" cannot drift. The contract is locked by `scripts/shell-guard-test.mjs` (159 checks: allowed chains must pass, bad chains must stop, `cd` outside the root must stop, writing sinks must stop, a real review's 17-command replay, and a hook-process denial for every dangerous form) — **run `npm test` before changing the policy**. Turn it off with `CLAUDE_REVIEW_SHELL_GUARD=0` (the whole thing then fails closed and refuses to run — see "Fail closed when a defense layer is missing").
+**There is exactly one policy**: `src/shell-guard.js` exports `BASH_POLICY`, `prompt.js` renders the `Bash(...)` rules from it, and the hook judges segments against the same table — so "the hook allowed it" and "the engine allowed it" cannot drift. The contract is locked by `scripts/shell-guard-test.mjs` (203 checks: allowed chains must pass, bad chains must stop, `cd` outside the root must stop, writing sinks must stop, a real review's 17-command replay, and a hook-process denial for every dangerous form) — **run `npm test` before changing the policy**. Turn it off with `CLAUDE_REVIEW_SHELL_GUARD=0` (the whole thing then fails closed and refuses to run — see "Fail closed when a defense layer is missing").
 
 Redirection (including `2>/dev/null`) stays fully refused: it is the read/write primitive that bypasses the allowlist, and allowing it would require proving every destination harmless. Let the command write to stdout instead.
 
@@ -233,10 +235,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (159, free) + audit-fix unit tests (242, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (203, free) + audit-fix unit tests (243, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 20 MECE cases (113 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 20 MECE cases (118 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
 node scripts/paid-smoke.mjs [--cap=2]           # REAL CLI end-to-end smoke: throwaway repo with three planted bugs, effort/reviewLevel=low, no spend cap by default (billed, ~$0.5 observed)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)

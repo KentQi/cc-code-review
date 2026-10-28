@@ -496,7 +496,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.14.0";
+const SERVER_VERSION = "1.15.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -1078,7 +1078,7 @@ server.tool(
       ? `⚠ ${realDenials.length} tool call(s) were denied by the permission allowlist (this MCP runs claude with --permission-mode manual) — the review may be incomplete: ` +
         [...new Set(realDenials.map((d) => d?.tool_name || d?.tool || JSON.stringify(d)))].slice(0, 10).join(", ")
       : "";
-    const guardNote = shellGuardNote(deniedCommands, deniedCommands) || "";
+    const guardNote = shellGuardNote(deniedCommands, deniedCommands, { repoRoot: repoPath }) || "";
 
     // Fix mode: verify the fixes actually reached disk. A reviewer can describe
     // perfect edits and still write nothing (its Edit/Write calls denied, or it
@@ -1099,7 +1099,7 @@ server.tool(
     // Backstop reporting: chained commands that actually RAN. The hook is what
     // blocks them, so this should stay empty; when it is not, the run escaped
     // the guard and the repo has to be treated as hostile.
-    const chainNote = shellChainingNote(run.bashCommands, deniedCommands) || "";
+    const chainNote = shellChainingNote(run.bashCommands, deniedCommands, { repoRoot: repoPath }) || "";
 
     // Model provenance: the report is only comparable to a direct Claude Code
     // session if it actually ran on the requested Claude model. A gateway
@@ -1508,7 +1508,7 @@ server.tool(
         structuredContent: { status: status2, sessionId: j.session_id ?? sessionId, reply: String(j.result || "") },
       };
     }
-    const chainNote = shellChainingNote(run.bashCommands);
+    const chainNote = shellChainingNote(run.bashCommands, [], { repoRoot: repoPath });
     // Same model-provenance check as a full review: a followup that silently
     // answers on a substituted model is not the session the caller thinks it is.
     const followFacts = resultFacts(j);

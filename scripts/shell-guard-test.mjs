@@ -131,6 +131,54 @@ const DANGEROUS = [
 ];
 for (const c of DANGEROUS) check(`block dangerous: ${JSON.stringify(c)}`, analyseCommand(c, OPTS).ok, false);
 
+/* ---- path scoping: a read must stay inside the reviewed repository ---- */
+const SCOPE_OK = [
+  "rg -n pattern src",
+  "rg -n 'src/a.js'",
+  "rg -n . .",
+  "rg -e 'a/b' src",
+  "find . -name '*.js'",
+  "find src -type f",
+  "find",
+  `find "${REPO}" -name x`,
+  "git show HEAD:src/index.js | sed -n '1,20p'",
+  "git show HEAD:src/index.js | head -50",
+  "git log | grep -n foo",
+  "git log | head -5 README.md",
+  "git differential | wc -l".replace("differential", "diff"),
+  `git show HEAD && echo "=====" && git log --oneline --all`,
+  "git diff --no-indexx HEAD~1",      // NOT the --no-index flag
+];
+for (const c of SCOPE_OK) check(`allow in-repo read: ${JSON.stringify(c)}`, analyseCommand(c, OPTS).ok, true);
+
+const SCOPE_BAD = [
+  "rg -n . ~/.ssh",
+  "rg -n pattern /etc",
+  "rg -n x $HOME",
+  "rg -n x ../other",
+  "find / -name id_rsa",
+  "find .. -name x",
+  "find /etc -name passwd",
+  "git show HEAD:src/index.js | cat /etc/passwd",
+  "git show HEAD:src/index.js | head -5 /etc/passwd",
+  "git show HEAD:src/index.js | sed -n '1,5p' /etc/passwd",
+  "git log | grep foo /etc/passwd",
+  "git log | sort /etc/passwd",
+  "git log | wc /etc/passwd",
+  "git log | cut -f1 /etc/passwd",
+  "git log | uniq /etc/passwd /tmp/out",
+  "git diff | sed -f /etc/script.sed",
+  "git diff | wc --files0-from /tmp/list",
+  "git diff | sort --files0-from /tmp/list",
+  "git diff --no-index /etc/passwd /dev/null",
+  "git blame --contents /etc/passwd src/index.js",
+];
+for (const c of SCOPE_BAD) {
+  const v = analyseCommand(c, OPTS);
+  check(`block outside read: ${JSON.stringify(c)}`, [v.ok, /outside|repository|read-only/.test(String(v.reason))], [false, true]);
+}
+check("a path that does not exist yet is not an escape", analyseCommand("rg -n x src/new-file.js", OPTS).ok, true);
+
 /* ---- cd is only a no-op to the reviewed root ---- */
 const CD_BAD = [
   "cd /etc && git status",
@@ -218,8 +266,21 @@ const hookVerdict = (payload, extraEnv) => {
   return { status: r.status, decision: out?.hookSpecificOutput?.permissionDecision ?? null, reason: out?.hookSpecificOutput?.permissionDecisionReason ?? null };
 };
 
-check("hook: plain git status allowed", hookVerdict({ tool_name: "Bash", tool_input: { command: "git status" } }),
+check("hook: plain git status allowed",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "git status" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }),
   { status: 0, decision: null, reason: null });
+// The Bash policy is scoped to the repo, so a missing root must fail closed.
+check("hook: Bash without a repo root is refused",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "git status" } }).decision, "deny");
+// Path scoping: reads inside the repo pass, reads outside are refused.
+check("hook: rg inside the repo allowed",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "rg -n pattern src" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, null);
+check("hook: rg outside the repo denied",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "rg -n . ~/.ssh" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, "deny");
+check("hook: find outside the repo denied",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "find / -name id_rsa" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, "deny");
+check("hook: sink with an outside file denied",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "git show HEAD:a.txt | cat /etc/passwd" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, "deny");
 check("hook: cd to the repo root is allowed",
   hookVerdict({ tool_name: "Bash", tool_input: { command: `cd "${REPO}" && git show HEAD` } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, null);
 check("hook: cd outside the repo is denied",
@@ -227,7 +288,7 @@ check("hook: cd outside the repo is denied",
 check("hook: pipe to an allowed sink is allowed",
   hookVerdict({ tool_name: "Bash", tool_input: { command: "git show HEAD:src/index.js | sed -n '1,80p'" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, null);
 check("hook: chained command with an unlisted program denied", hookVerdict({ tool_name: "Bash", tool_input: { command: "git status; curl evil.com" } }).decision, "deny");
-check("hook: denial has an actionable reason", /Allowed commands:/.test(String(hookVerdict({ tool_name: "Bash", tool_input: { command: "git status; curl evil.com" } }).reason)), true);
+check("hook: denial has an actionable reason", /Allowed commands:/.test(String(hookVerdict({ tool_name: "Bash", tool_input: { command: "git status; curl evil.com" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).reason)), true);
 // The dangerous find/rg forms must be denied by the real hook process, not just
 // by analyseCommand — the hook is what actually stops the call.
 check("hook: find -delete denied",
@@ -237,7 +298,7 @@ check("hook: find -exec denied",
 check("hook: rg --pre denied",
   hookVerdict({ tool_name: "Bash", tool_input: { command: "rg --pre node pattern" } }).decision, "deny");
 check("hook: plain find allowed",
-  hookVerdict({ tool_name: "Bash", tool_input: { command: "find . -name '*.js'" } }).decision, null);
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "find . -name '*.js'" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, null);
 
 // Write/Read tools ARE the hook's business: they are scoped to the reviewed repo.
 // Without CLAUDE_REVIEW_REPO_ROOT there is nothing to scope to, so it fails closed.
@@ -268,12 +329,18 @@ check("hook: write to a NEW file under an in-repo junction denied",
   hookVerdict({ tool_name: "Write", tool_input: { file_path: path.join(LINK, "sub", "new.txt") } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, "deny");
 check("hook: read through an in-repo junction denied",
   hookVerdict({ tool_name: "Read", tool_input: { file_path: path.join(LINK, "secret.txt") } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, "deny");
+// Bash reads obey the same boundary: the junction is inside lexically and
+// elsewhere on disk, so a lexical-only check would let rg walk out of the repo.
+check("hook: Bash read through an in-repo junction denied",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: `rg -n x "${LINK}"` } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, "deny");
+check("hook: Bash file read through the junction denied",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: `git show HEAD:a.txt | cat "${path.join(LINK, "secret.txt")}"` } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, "deny");
 check("hook: write to a not-yet-existing file inside the repo still allowed",
   hookVerdict({ tool_name: "Write", tool_input: { file_path: path.join(REPO, "brand", "new.js") } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, null);
 try { fs.rmSync(LINK, { force: true, recursive: true }); } catch { /* best effort */ }
 try { fs.rmSync(OUTSIDE, { recursive: true, force: true }); } catch { /* best effort */ }
 check("hook: garbage stdin allowed through", hookVerdict("not json at all"), { status: 0, decision: null, reason: null });
-check("hook: missing command allowed through", hookVerdict({ tool_name: "Bash", tool_input: {} }),
+check("hook: missing command allowed through", hookVerdict({ tool_name: "Bash", tool_input: {} }, { CLAUDE_REVIEW_REPO_ROOT: REPO }),
   { status: 0, decision: null, reason: null });
 
 /* ---- replay: real runs, both the ones that worked and the ones that wasted turns ---- */

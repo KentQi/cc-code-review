@@ -6,8 +6,8 @@ description: Comprehensive code review pipeline — a diff-sized fleet of parall
 # Code Review
 
 Run the Anthropic official code-review pipeline: establish the diff → gather
-conventions → 5 parallel reviewer subagents → confidence scoring → filter →
-final report.
+conventions → a diff-sized fleet of parallel reviewer subagents → confidence
+scoring → filter → final report.
 
 ## Review target
 

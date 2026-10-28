@@ -110,6 +110,10 @@ if (args.includes("stream-json")) {
   const subagentModel = process.env.STUB_SUBAGENT_MODEL || "MiniMax-M3.1-Flash";
   const lostOutputFile = process.env.STUB_LOST_AGENT_OUTPUT_FILE || null;
   const delayMs = Number(process.env.STUB_SUBAGENT_DELAY_MS || 0);
+  const NL = String.fromCharCode(10);
+  // Agents whose launch ack is shaped so NEITHER detector recognises it: it must
+  // not become the final report — the later task_notification is authoritative.
+  const misreadAckIds = new Set((process.env.STUB_ACK_MISREAD_IDS || "").split(",").filter(Boolean).map(Number));
   const wait = (ms) => ms > 0 ? new Promise((r) => setTimeout(r, ms)) : null;
   const ids = [1, 2, 3, 4, 5].map((i) => "stub-tool-agent-" + i);
   say({
@@ -125,7 +129,6 @@ if (args.includes("stream-json")) {
   if (lostOutputFile) {
     // The lost agent's transcript: a subagent JSONL whose last assistant text
     // is the work a 429 would otherwise have thrown away.
-    const NL = String.fromCharCode(10);
     const transcript = [
       JSON.stringify({ type: "assistant", message: { role: "assistant", model: subagentModel, content: [{ type: "text", text: "STUB-SUBAGENT-1: starting" }] } }),
       JSON.stringify({ type: "assistant", message: { role: "assistant", model: subagentModel, content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "src/index.js" } }] } }),
@@ -142,8 +145,18 @@ if (args.includes("stream-json")) {
         role: "user",
         content: [{
           type: "tool_result", tool_use_id: ids[i - 1],
+          // The real ack is a multi-line CLI block; the MCP's detector is
+          // anchored on that shape (a one-line paraphrase must not count).
           content: i <= 3
-            ? "Async agent launched successfully. The agent is working in the background." + (lost ? " output_file: " + lostOutputFile + " Do NOT Read or tail this file." : "")
+            ? misreadAckIds.has(i)
+              ? "Background agent " + i + " dispatched; the report will follow."
+              : [
+                "Async agent launched successfully. (This tool result is internal metadata - never quote or paste any part of it...)",
+                "agentId: stub-agent-" + i + " (internal ID - do not mention to user.)",
+                "The agent is working in the background. You will be notified automatically when it completes.",
+                ...(lost ? ["output_file: " + lostOutputFile] : []),
+                "Do NOT Read or tail this file via the shell tool.",
+              ].join(NL)
             : "STUB-SUBAGENT-REPORT-" + i + ": findings from reviewer " + i,
         }],
       },

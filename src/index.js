@@ -100,7 +100,8 @@ function writeLogFile(stdout, stderr) {
     fs.writeFileSync(file, `# claude stdout\n${stdout}\n\n# claude stderr\n${stderrPart}\n`, { mode: 0o600 });
     // retention: keep the newest LOG_KEEP logs
     try {
-      const olds = fs.readdirSync(dir).filter((f) => f.startsWith("run-")).map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
+      const all = fs.readdirSync(dir).filter((f) => f.startsWith("run-") || (f.startsWith("subagents-") && f.endsWith(".jsonl")));
+      const olds = all.map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
       for (const { f } of olds.slice(LOG_KEEP)) fs.rmSync(path.join(dir, f), { force: true });
     } catch { /* best effort */ }
     return file;
@@ -398,6 +399,51 @@ function err(text) {
   return { isError: true, content: [{ type: "text", text }] };
 }
 
+/** The reviewer-fleet view shared by every result shape (success/error/interrupted). */
+function subagentsView(agentReports) {
+  return (agentReports || []).map((r) => ({
+    description: r.description, subagentType: r.subagentType || undefined,
+    async: r.async || undefined, status: r.status || undefined,
+    partial: r.partial || undefined, recovery: r.recovery || undefined,
+    report: (r.report || "").length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : (r.report || ""),
+  }));
+}
+
+/**
+ * An interrupted run (client cancel / timeout / no result event) still produced
+ * paid work: runClaude always returns the incremental subagent records and the
+ * durable JSONL path. err() used to drop both, so cancelling a 12-agent audit
+ * made every finished report unreachable through the API.
+ */
+function interruptedResult(text, run, requestedModel) {
+  const reportsSection = subagentReportsText(run.agentReports);
+  const provenance = buildModelProvenance({
+    requestedModel,
+    mainModels: run.mainModels,
+    subagentModels: run.subagentModels,
+    unrecognized: run.unrecognizedModels,
+  });
+  const fileNote = typeof run.subagentsFile === "string"
+    ? `_partial reports file: ${run.subagentsFile} (one JSONL line per finished subagent)_`
+    : "";
+  const note = [provenance.note, reportsSection, fileNote].filter(Boolean).join("\n\n");
+  return {
+    isError: true,
+    content: [{ type: "text", text: text + (note ? `\n\n${note}` : "") }],
+    structuredContent: {
+      status: run.cancelled ? "cancelled" : run.timedOut ? "timed_out" : "no_result",
+      subagents: subagentsView(run.agentReports),
+      subagentsSpawned: run.agentReports?.length || undefined,
+      subagentsFile: run.subagentsFile,
+      modelProvenance: {
+        requested: provenance.requested, main: provenance.main,
+        subagents: provenance.subagents, billed: provenance.billed,
+        substituted: provenance.substituted,
+      },
+    },
+  };
+}
+
 /**
  * claude headless reports auth/network/permission failures as
  * `subtype:"success"` + `is_error:true` (or a specific `subtype`), with the
@@ -425,7 +471,7 @@ function failureBanner(j, run) {
   // the subagents that already finished are captured incrementally and are
   // returned with this error, and any agent still in flight is recovered from
   // its output_file transcript — so say so, and say what survived.
-  if (/429|rate.?limit|overloaded|too many requests|insufficient|quota|credit balance/i.test(blob)) {
+  if (/\b429\b|rate.?limit|overloaded|too many requests|insufficient|quota|credit balance/i.test(blob)) {
     hints.push("The API returned a rate limit / quota exhaustion (429) — the account ran out of tokens or hit a limit mid-run. Nothing already paid for is lost: every reviewer subagent that finished is included with this error (see the subagent reports below), and an agent killed mid-flight is recovered from its output_file transcript. Wait for the quota/limit to reset (or switch providers) and re-run; the diff-sized fleet means the re-run repeats only the unfinished work.");
   }
   if (/ECONNREFUSED|connection refused|fetch failed|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket hang up|api_error/i.test(blob)) {
@@ -450,7 +496,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.13.0";
+const SERVER_VERSION = "1.13.1";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -757,7 +803,7 @@ server.tool(
     maxTurns: z.number().int().min(4).max(200).default(80).describe("Agentic turn cap for the review session"),
     timeoutMinutes: z.number().int().min(1).max(60).default(ENV.timeoutMinutes).describe("Hard wall-clock timeout for the run — with no spend cap by default this is the guard; every finished subagent report is kept even when it fires"),
     maxBudgetUsd: z.number().min(0).max(50).optional()
-      .describe(`API spend cap via --max-budget-usd. DEFAULT 0 = NO CAP at any effort level: a cap stops the parent before it synthesizes, and every finished subagent report is already captured incrementally (and recovered from output_file), so a 429/token exhaustion no longer wastes it. The wall-clock timeout (timeoutMinutes) is the guard. Set a number only if you want a hard spend stop; env CLAUDE_REVIEW_MAX_BUDGET_USD overrides. On third-party gateways this depends on usage data the gateway returns.`),
+      .describe(`API spend cap via --max-budget-usd. DEFAULT 0 = NO CAP at any effort level: a cap stops the parent before it synthesizes, and every finished subagent report is already captured incrementally (and recovered from output_file), so a 429/token exhaustion no longer wastes it. The wall-clock timeout (timeoutMinutes) is the guard. Set a number only if you want a hard spend stop; env CLAUDE_REVIEW_MAX_BUDGET_USD sets the DEFAULT for this argument (an explicit value here always wins). On third-party gateways this depends on usage data the gateway returns.`),
     installSkillIfMissing: z.boolean().default(ENV.autoInstallSkill)
       .describe("Auto-install the bundled code-review skill into ~/.claude/skills when missing (default true)"),
     waitForResult: z.boolean().default(false)
@@ -970,13 +1016,16 @@ server.tool(
         streamJson: streamJsonSupported,
       },
       guardSettings,
+      subagentsDir: logsDir(),
       timeoutMs: timeoutMinutes * 60_000,
       signal,
       // One subagent finished -> one record, right now: appended to the job so a
       // polling client sees the fleet fill up (and keeps it after a 429/halt),
       // and appended to the run's JSONL file by runClaude itself.
-      onSubagentReport: (rec) => {
-        if (liveJob) liveJob.subagents = [...(liveJob.subagents ?? []), rec];
+      onSubagentReport: (rec, file) => {
+        if (!liveJob) return;
+        liveJob.subagents = [...(liveJob.subagents ?? []), rec];
+        if (typeof file === "string") liveJob.subagentsFile = file;
       },
     });
     if (progressTimer) clearInterval(progressTimer);
@@ -986,18 +1035,20 @@ server.tool(
     const logNote = logNoteOf(logFile);
 
     if (run.cancelled) {
-      return err(`review cancelled by the client after ${Math.round(run.durationMs / 1000)}s${logNote}${stderrTail(run.stderr)}`);
+      return interruptedResult(`review cancelled by the client after ${Math.round(run.durationMs / 1000)}s${logNote}${stderrTail(run.stderr)}`, run, modelCheck.model || ENV.model || null);
     }
     if (run.timedOut) {
-      return err(
+      return interruptedResult(
         `review timed out after ${timeoutMinutes} minutes. Retry with a larger timeoutMinutes, a narrower scope, or higher maxTurns.` +
-        ` If you use CC Switch / a local gateway, also check it is still healthy (claude retries a dead endpoint silently).${logNote}${stderrTail(run.stderr)}`
+        ` If you use CC Switch / a local gateway, also check it is still healthy (claude retries a dead endpoint silently).${logNote}${stderrTail(run.stderr)}`,
+        run, modelCheck.model || ENV.model || null
       );
     }
     if (!j) {
-      return err(
+      return interruptedResult(
         `claude exited (code ${run.exitCode}) without a parseable result JSON. ` +
-        `Check 'claude' works in a terminal from that repo (login, gateway, proxy).${logNote}${stderrTail(run.stderr)}`
+        `Check 'claude' works in a terminal from that repo (login, gateway, proxy).${logNote}${stderrTail(run.stderr)}`,
+        run, modelCheck.model || ENV.model || null
       );
     }
 
@@ -1079,7 +1130,12 @@ server.tool(
         ? `⚠ the gateway endpoint changed during the run (${gwBefore.url} → ${gwAfter.url}) — CC Switch likely switched providers mid-review, so the report may mix two models.`
         : "");
 
-    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote, provenanceNote].filter(Boolean).join("\n\n");
+    // An explicit spend cap the installed CLI cannot honour is silently dropped
+    // otherwise: the user would believe spend is capped when it is not.
+    const budgetUnsupportedNote = typeof maxBudgetUsd === "number" && maxBudgetUsd > 0 && !budgetFlagSupported
+      ? `⚠ maxBudgetUsd=${maxBudgetUsd} was requested but this claude CLI does not advertise --max-budget-usd, so NO spend cap is enforced for this run. Upgrade claude or rely on timeoutMinutes/maxTurns.`
+      : "";
+    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote, provenanceNote, budgetUnsupportedNote].filter(Boolean).join("\n\n");
 
     const meta = {
       status: status2,
@@ -1125,12 +1181,7 @@ server.tool(
           numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, effort, fix, logFile,
           hardening,
           error: String(j.result || ""),
-          subagents: run.agentReports.map((r) => ({
-            description: r.description, subagentType: r.subagentType || undefined,
-            async: r.async || undefined, status: r.status || undefined,
-            partial: r.partial || undefined, recovery: r.recovery || undefined,
-            report: r.report.length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : r.report,
-          })),
+          subagents: subagentsView(run.agentReports),
           subagentsSpawned: meta.subagentsSpawned,
           ultracode: ultracode || undefined,
           reviewLevel: effectiveReviewLevel,
@@ -1159,12 +1210,7 @@ server.tool(
         numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, effort, fix, logFile,
         hardening,
         report: j.result,
-        subagents: run.agentReports.map((r) => ({
-          description: r.description, subagentType: r.subagentType || undefined,
-          async: r.async || undefined, status: r.status || undefined,
-          partial: r.partial || undefined, recovery: r.recovery || undefined,
-          report: r.report.length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : r.report,
-        })),
+        subagents: subagentsView(run.agentReports),
         subagentsSpawned: meta.subagentsSpawned,
           ultracode: ultracode || undefined,
           reviewLevel: effectiveReviewLevel,
@@ -1275,9 +1321,12 @@ server.tool(
           lines.push(`- ${r.description || r.subagentType || "subagent"}${r.status ? ` [${r.status}${r.partial ? ", partial (recovered from output_file)" : ""}]` : ""}: ${(r.report || "").replace(/\s+/g, " ").slice(0, 300)}`);
         }
       }
+      if (typeof job.subagentsFile === "string") {
+        lines.push(`partial reports file (one JSONL line per finished subagent, written as each lands): ${job.subagentsFile}`);
+      }
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        structuredContent: { jobId, status: "running", elapsedSec: secs, subagentsSoFar: sofar },
+        structuredContent: { jobId, status: "running", elapsedSec: secs, subagentsSoFar: sofar, subagentsFile: job.subagentsFile },
       };
     }
     if (cancel) return { content: [{ type: "text", text: `job ${jobId} already finished — nothing to cancel.` }] };
@@ -1300,8 +1349,10 @@ server.tool(
     repoPath: z.string().describe("Absolute path of the repo the original review ran in (~/ prefix allowed)"),
     outputLanguage: z.string().default("中文"),
     model: z.string().optional(),
-    timeoutMinutes: z.number().int().min(1).max(60).default(Math.min(10, ENV.timeoutMinutes)),
-    maxBudgetUsd: z.number().min(0).max(50).optional(),
+    timeoutMinutes: z.number().int().min(1).max(60).default(Math.min(10, ENV.timeoutMinutes))
+      .describe("Hard wall-clock timeout for this followup turn, in minutes (default 10 — a followup is a Q&A turn, not a full review)."),
+    maxBudgetUsd: z.number().min(0).max(50).optional()
+      .describe("API spend cap via --max-budget-usd. Default 0 = NO CAP (same policy as claude_code_review); the timeoutMinutes guard applies. A followup has no subagent fleet, so its typical spend is small."),
     waitForResult: z.boolean().default(false)
       .describe("Block synchronously for the reply. Default false: returns a jobId at once (poll claude_review_status) — use that with clients that cut tool calls at ~30s."),
   },
@@ -1431,6 +1482,7 @@ server.tool(
         streamJson: streamJsonSupported,
       },
       guardSettings,
+      subagentsDir: logsDir(),
       timeoutMs: timeoutMinutes * 60_000,
       signal,
     });

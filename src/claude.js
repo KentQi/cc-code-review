@@ -545,9 +545,9 @@ function toolResultText(content) {
  * (and the stub claude) can feed it synthetic events.
  *
  * claude 2.1+ forwards subagent activity to the parent stream, and the skill
- * dispatches all five reviewers in ONE message (so they run in parallel) —
- * so every fact here is a LIST: one event can carry five Agent tool_use
- * blocks, five tool_results, or several Bash calls. Single-valued fields
+ * dispatches the whole finder fleet in ONE message (so they run in parallel) —
+ * so every fact here is a LIST: one event can carry several Agent tool_use
+ * blocks, several tool_results, or several Bash calls. Single-valued fields
  * silently kept only the last block and dropped the rest of the reviewers.
  *
  * Two report paths exist depending on how the CLI runs the dispatch:
@@ -637,11 +637,61 @@ export function parseUnrecognizedModels(stderr) {
  * (killed by a 429 / budget halt / timeout), that file is the only place its
  * partial work still exists.
  */
+/**
+ * An async Agent dispatch's tool_result is only a launch acknowledgement
+ * ("Async agent launched successfully. … output_file: <path> …"). Detect that
+ * shape and pull the transcript path out of it: when the agent never reports
+ * (killed by a 429 / budget halt / timeout), that file is the only place its
+ * partial work still exists.
+ */
+/**
+ * A path the CLI itself could have written an agent transcript to: under the
+ * OS temp dir, inside a claude* directory, under a tasks/ segment, ending in
+ * .output. This is a whitelist, not a heuristic: the launch-ack text can be
+ * model-authored (a synchronous Agent tool_result IS the reviewer's report), so
+ * without a path boundary the server would read whatever file that text names.
+ */
+export function isAllowedTranscriptPath(filePath) {
+  try {
+    const p = path.resolve(String(filePath));
+    const tmp = path.resolve(os.tmpdir());
+    const rel = path.relative(tmp, p);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return false;
+    if (!/\.output$/i.test(p)) return false;
+    const segs = rel.split(/[\\/]+/);
+    return segs.some((seg) => /^claude/i.test(seg)) && segs.some((seg) => seg === "tasks");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * "This tool_result is a launch acknowledgement, not a report" — deliberately
+ * weaker than parseAgentLaunchAck: it needs the anchored ack line plus one of
+ * the two identifying lines, but NOT the transcript path (older CLI shapes omit
+ * it). Used only to avoid filing an ack as a report; it never authorises a file
+ * read, so the weaker check cannot widen the read surface.
+ */
+export function looksLikeLaunchAck(text) {
+  const s = String(text ?? "");
+  if (!/^\s*Async agent launched successfully/.test(s)) return false;
+  return /agentId:\s*\S+/.test(s) || /working in the background/i.test(s);
+}
+
 export function parseAgentLaunchAck(text) {
   const s = String(text ?? "");
-  if (!/Async agent launched successfully/.test(s)) return null;
-  const m = /output_file:\s*(\S+)/.exec(s);
-  return { outputFile: m ? m[1] : undefined };
+  // The ack is a CLI-SHAPED block, not a phrase: it starts with the ack line,
+  // names the agent, says the agent is running, and carries the transcript path
+  // on a line of its own. A reviewer report that merely quotes the phrase (a
+  // repo file can plant it) must not be mistaken for an ack — that would skip
+  // the real report AND make the text choose a file for the server to read.
+  if (!/^\s*Async agent launched successfully/.test(s)) return null;
+  if (!/agentId:\s*\S+/.test(s)) return null;
+  if (!/working in the background/i.test(s)) return null;
+  const m = /^output_file:\s*(\S+)\s*$/m.exec(s);
+  if (!m) return null;
+  if (!isAllowedTranscriptPath(m[1])) return null;
+  return { outputFile: m[1] };
 }
 
 /**
@@ -652,6 +702,8 @@ export function parseAgentLaunchAck(text) {
  */
 export function recoverReportFromTranscript(filePath, maxBytes = 256 * 1024) {
   if (!filePath) return null;
+  // Hard gate: never read outside the CLI's own transcript area, whoever asked.
+  if (!isAllowedTranscriptPath(filePath)) return null;
   let fd;
   try {
     const size = fs.statSync(filePath).size;
@@ -913,6 +965,7 @@ function sweepTempArtifacts(dir) {
       const st = fs.statSync(p);
       if (st.mtimeMs >= cutoff) continue;
       if (/^guard-settings-.*\.json$/.test(name) && st.isFile()) fs.rmSync(p, { force: true });
+      else if (/^subagents-.*\.jsonl$/.test(name) && st.isFile()) fs.rmSync(p, { force: true });
       else if (/^cc-code-review-git-/.test(name) && st.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
     } catch { /* best effort */ }
   }
@@ -1139,6 +1192,9 @@ export function runClaude({
   effort,
   flags = { effort: false, budget: false },
   guardSettings,
+  // Where the incremental subagent JSONL lands. index.js passes logsDir() so the
+  // artifact honours CLAUDE_REVIEW_LOG_DIR like the run logs do.
+  subagentsDir,
   timeoutMs = 20 * 60 * 1000,
   signal,
   // Called the moment a reviewer subagent's report completes in the stream —
@@ -1240,7 +1296,7 @@ export function runClaude({
     const agentResults = new Map();
     const taskNotifications = new Map();
     const workflowDispatches = [];
-    const notifiedReports = new Set();
+    const notifiedReports = new Map(); // tool_use id -> the record emitted for it
     const mainModels = new Set();
     const subagentModels = new Set();
     // Every finished subagent is persisted the moment it lands — one JSONL line
@@ -1251,20 +1307,43 @@ export function runClaude({
     let subagentSeq = 0;
     const subagentRecords = [];
     const dispatchOutputFiles = new Map();
-    const emitSubagent = (rec) => {
-      if (notifiedReports.has(rec.id)) return;
-      notifiedReports.add(rec.id);
-      const record = { seq: ++subagentSeq, ts: new Date().toISOString(), ...rec };
-      subagentRecords.push(record);
+    const openSubagentsFile = () => {
+      if (subagentsFile) return subagentsFile;
+      const dir = subagentsDir || path.join(os.tmpdir(), "cc-code-review");
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      subagentsFile = path.join(dir, `subagents-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}.jsonl`);
+      return subagentsFile;
+    };
+    const appendRecord = (record) => {
       try {
-        if (!subagentsFile) {
-          const dir = path.join(os.tmpdir(), "cc-code-review");
-          fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-          subagentsFile = path.join(dir, `subagents-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}.jsonl`);
-        }
-        fs.appendFileSync(subagentsFile, JSON.stringify(record) + "\n");
+        // 0600 like the run logs: the reports quote the reviewed code.
+        fs.appendFileSync(openSubagentsFile(), JSON.stringify(record) + "\n", { mode: 0o600 });
       } catch { /* persistence is best-effort; the in-memory record still stands */ }
-      try { onSubagentReport?.(record); } catch { /* a throwing listener must not kill the run */ }
+    };
+    const emitSubagent = (rec) => {
+      const prev = notifiedReports.get(rec.id);
+      if (prev) {
+        // A task_notification is authoritative for its dispatch: a launch ack
+        // misread as a sync report (an older CLI shape) must not suppress the
+        // real report that arrives later. Any other duplicate is ignored.
+        if (!(rec.authoritative && !prev.authoritative)) return;
+        Object.assign(prev, {
+          report: rec.report, status: rec.status, async: rec.async,
+          partial: rec.partial, recovery: rec.recovery,
+          outputFile: rec.outputFile || prev.outputFile,
+        });
+        // The JSONL is an append-only journal, so the correction is appended
+        // as its own line (same seq) rather than rewriting the file.
+        appendRecord({ ...prev, supersedes: true });
+        return;
+      }
+      const record = { seq: ++subagentSeq, ts: new Date().toISOString(), ...rec };
+      delete record.authoritative;
+      subagentRecords.push(record);
+      notifiedReports.set(rec.id, record);
+      appendRecord(record);
+      // Second argument: the JSONL path, so a polling client can tail it.
+      try { onSubagentReport?.(record, subagentsFile); } catch { /* a throwing listener must not kill the run */ }
     };
     let soPartial = Buffer.alloc(0);
     const ingest = (line) => {
@@ -1292,13 +1371,25 @@ export function runClaude({
       if (facts.taskNotification) {
         const n = facts.taskNotification;
         const d = agentDispatches.find((x) => x.id === n.toolUseId);
+        // A stopped/failed notification can carry an EMPTY summary (the agent
+        // was killed before it wrote one). Its transcript still exists — fall
+        // back to the tail of output_file instead of recording an empty report.
+        let report = n.report;
+        let partial, recovery;
+        if (!report && n.outputFile) {
+          const rec = recoverReportFromTranscript(n.outputFile);
+          if (rec) { report = rec.report; partial = true; recovery = "output_file"; }
+        }
         emitSubagent({
           id: n.toolUseId, description: d?.description ?? "", subagentType: d?.subagentType ?? "",
-          async: true, status: n.status, report: n.report, outputFile: n.outputFile,
+          async: true, status: n.status, report, outputFile: n.outputFile, partial, recovery,
+          authoritative: true,
         });
       } else if (facts.agentResults) {
         for (const r of facts.agentResults) {
-          if (r.ack) continue; // launch ack: the report comes later (or is recovered)
+          // Launch ack (strict or loose shape): the report comes later, via a
+          // task_notification or the transcript recovery pass.
+          if (r.ack || looksLikeLaunchAck(r.text)) continue;
           const d = agentDispatches.find((x) => x.id === r.id);
           if (!d) continue; // not a subagent dispatch (some other tool result)
           emitSubagent({
@@ -1376,7 +1467,9 @@ export function runClaude({
         emitSubagent({
           id: d.id, description: d.description, subagentType: d.subagentType,
           async: !!dispatchOutputFiles.get(d.id), status: recovered ? "stopped" : "unknown",
-          report: recovered?.report ?? "", partial: true,
+          report: recovered?.report ?? "",
+          // partial means "recovered from a transcript", not "no data at all".
+          partial: !!recovered,
           outputFile: dispatchOutputFiles.get(d.id),
           recovery: recovered ? "output_file" : "none",
         });

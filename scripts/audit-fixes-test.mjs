@@ -18,7 +18,7 @@ import {
   guardState, gitWriteFlagReason, gitSpawnOpts, guardSelfTest,
   writeGuardSettings, removeGuardSettings,
   streamEventFacts, parseUnrecognizedModels, buildModelProvenance, resultFacts,
-  parseAgentLaunchAck, recoverReportFromTranscript,
+  parseAgentLaunchAck, looksLikeLaunchAck, recoverReportFromTranscript,
 } from "../src/claude.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -598,27 +598,48 @@ check("hook allows a plain git diff",
   // transcript; a 429 can kill the agent before its task_notification, and that
   // file is the only place its paid-for work still exists.
   const NL = String.fromCharCode(10);
+  // The gate only accepts the CLI's own transcript area (<tmp>/claude*/…/tasks/*.output),
+  // so the fixture lives there too — a plain temp file is refused on purpose.
+  const transcriptDir = path.join(os.tmpdir(), "claude", "x", "tasks");
+  fs.mkdirSync(transcriptDir, { recursive: true });
+  const transcriptPath = path.join(transcriptDir, `a4d4ec40-${process.pid}.output`);
   const ack = [
     "Async agent launched successfully. (This tool result is internal metadata - never quote or paste any part of it...)",
     "agentId: a4d4ec40c37758649 (internal ID - do not mention to user.)",
     "The agent is working in the background. You will be notified automatically when it completes.",
-    "output_file: C:/Users/admin/AppData/Local/Temp/claude/x/tasks/a4d4ec40.output",
+    `output_file: ${transcriptPath}`,
     "Do NOT Read or tail this file via the shell tool.",
   ].join(NL);
-  check("parseAgentLaunchAck extracts the output_file",
-    parseAgentLaunchAck(ack)?.outputFile, "C:/Users/admin/AppData/Local/Temp/claude/x/tasks/a4d4ec40.output");
+  check("parseAgentLaunchAck extracts the output_file", parseAgentLaunchAck(ack)?.outputFile, transcriptPath);
   check("parseAgentLaunchAck ignores a plain report", parseAgentLaunchAck("STUB-SUBAGENT-REPORT-1: findings"), null);
-  const tf = path.join(os.tmpdir(), `cc-recover-test-${process.pid}.jsonl`);
-  fs.writeFileSync(tf, [
+  // The loose detector decides "not a report" only; it must still be anchored,
+  // otherwise a report that quotes the phrase would be dropped entirely.
+  check("looksLikeLaunchAck accepts an ack without output_file",
+    looksLikeLaunchAck(["Async agent launched successfully.", "agentId: abc (internal ID)"].join(NL)), true);
+  check("looksLikeLaunchAck accepts the background-only shape",
+    looksLikeLaunchAck(["Async agent launched successfully.", "The agent is working in the background."].join(NL)), true);
+  check("looksLikeLaunchAck rejects a real report",
+    looksLikeLaunchAck("STUB-SUBAGENT-REPORT-1: findings"), false);
+  check("looksLikeLaunchAck rejects the phrase inside prose",
+    looksLikeLaunchAck("The report says Async agent launched successfully"), false);
+  // A repo-planted "ack" would make the server read a file of the repo's
+  // choosing; the path gate is the deterministic control.
+  check("parseAgentLaunchAck refuses a transcript outside tmp",
+    parseAgentLaunchAck(ack.replace(transcriptPath, path.join(os.tmpdir(), "..", "tasks", "x.output"))), null);
+  check("parseAgentLaunchAck refuses a path with no claude segment",
+    parseAgentLaunchAck(ack.replace(transcriptPath, path.join(os.tmpdir(), "elsewhere", "tasks", `x-${process.pid}.output`))), null);
+  fs.writeFileSync(transcriptPath, [
     JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "early thinking" }] } }),
     JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "t", name: "Read", input: {} }] } }),
     JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "FINAL PARTIAL FINDINGS" }] } }),
   ].join(NL) + NL);
-  const rec = recoverReportFromTranscript(tf);
+  const rec = recoverReportFromTranscript(transcriptPath);
   check("recoverReportFromTranscript returns the last assistant text", rec?.report, "FINAL PARTIAL FINDINGS");
   check("recoverReportFromTranscript marks the recovery partial", [rec?.partial, rec?.source], [true, "output_file"]);
-  check("recoverReportFromTranscript tolerates a missing file", recoverReportFromTranscript(path.join(os.tmpdir(), "nope-does-not-exist.jsonl")), null);
-  fs.rmSync(tf, { force: true });
+  check("recoverReportFromTranscript tolerates a missing file", recoverReportFromTranscript(path.join(transcriptDir, "nope-does-not-exist.output")), null);
+  check("recoverReportFromTranscript refuses a non-transcript path",
+    recoverReportFromTranscript(path.join(os.tmpdir(), `cc-recover-test-${process.pid}.jsonl`)), null);
+  fs.rmSync(transcriptPath, { force: true });
 }
 
 /* ---------------- unrecognized_model stderr parsing ---------------- */

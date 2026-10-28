@@ -283,6 +283,11 @@ export function reviewDisallowedTools({ fix = false, postToPR = false } = {}) {
   const rules = [
     // network egress: the review must not fetch or exfiltrate
     "WebFetch", "WebSearch",
+    // find/rg are granted for reads; these forms write files or run programs.
+    "Bash(find * -delete:*)", "Bash(find * -exec:*)", "Bash(find * -execdir:*)",
+    "Bash(find * -ok:*)", "Bash(find * -okdir:*)",
+    "Bash(find * -fprint:*)", "Bash(find * -fprintf:*)", "Bash(find * -fls:*)",
+    "Bash(rg --pre:*)", "Bash(rg * --pre:*)", "Bash(rg --pre-glob:*)", "Bash(rg * --pre-glob:*)",
     // git write / history-rewrite / config surface
     "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push:*)", "Bash(git reset:*)",
     "Bash(git checkout:*)", "Bash(git switch:*)", "Bash(git restore:*)", "Bash(git clean:*)",

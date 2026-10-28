@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * cc-loop cross-case suite — 17 MECE cases over the whole MCP surface.
- * C1-C8, C10-C17 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
+ * cc-loop cross-case suite — 19 MECE cases over the whole MCP surface.
+ * C1-C8, C10-C19 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
  * paid end-to-end and only runs with --paid (CC_LOOP_PAID=1).
  * Exit 0 iff every executed case passes.
  */
@@ -17,6 +17,12 @@ const results = [];
 const check = (caseId, label, cond, detail = "") => {
   results.push({ caseId, label, ok: !!cond });
   console.log(`${cond ? "PASS" : "FAIL"}  [${caseId}] ${label}${cond ? "" : ` — ${String(detail).slice(0, 200)}`}`);
+};
+// A skipped check is not a pass: it is reported and counted separately, so a
+// fixture that stops working can never look green.
+const skip = (caseId, label) => {
+  results.push({ caseId, label, ok: true, skipped: true });
+  console.log(`SKIP  [${caseId}] ${label}`);
 };
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ccloop-"));
@@ -237,7 +243,9 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
     fs.writeFileSync(path.join(wt, ".gitattributes"), "*.pwn diff=pwn\n");
     check("C5", "worktree common-config driver refused", repoRunsGitPrograms(wt).refusals.length >= 1, JSON.stringify(repoRunsGitPrograms(wt)));
   } catch (e) {
-    check("C5", "worktree fixture runnable", true, `skipped: ${e?.message}`);
+    // Honest skip: a green check that asserted nothing is worse than a visible
+    // skip, because it hides a fixture that silently stopped exercising the path.
+    skip("C5", `worktree fixture unavailable (${String(e?.message).slice(0, 120)})`);
   }
 }
 
@@ -528,8 +536,20 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   await new Promise((res) => setTimeout(res, 6000));
   const p2 = await s.call("claude_review_status", { jobId });
   const mid = p2.result?.structuredContent?.subagentsSoFar ?? [];
+  const midRunning = p2.result?.structuredContent?.status === "running";
   check("C16", "finished subagents are visible while the run continues", mid.length > early.length && mid.length >= 1, `early=${early.length} mid=${mid.length}`);
   check("C16", "the running-poll text lists them", textOf(p2).includes("reviewer subagent report(s) already finished"), textOf(p2).slice(0, 200));
+  // Durability, not just visibility: the JSONL must already hold exactly the
+  // reports the poll shows while the run is still going. The old check only
+  // counted lines at the end, which a single write at shutdown would also pass.
+  const midFile = p2.result?.structuredContent?.subagentsFile;
+  let midLines = -1;
+  try { midLines = fs.readFileSync(midFile, "utf8").trim().split(String.fromCharCode(10)).length; } catch { /* missing */ }
+  check("C16", "the JSONL file already holds the finished reports mid-run",
+    midRunning && typeof midFile === "string" && midLines === mid.length && midLines >= 1,
+    `running=${midRunning} file=${midFile} lines=${midLines} visible=${mid.length}`);
+  check("C16", "the running poll names the JSONL path in its text",
+    textOf(p2).includes("partial reports file"), textOf(p2).slice(0, 300));
   await new Promise((res) => setTimeout(res, 5000));
   const p3 = await s.call("claude_review_status", { jobId });
   const late = p3.result?.structuredContent?.subagentsSoFar ?? [];
@@ -553,7 +573,10 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   // A 429 can kill a subagent after it did its work but before its
   // task_notification: only the launch ack's output_file survives. The report
   // must be recovered from that transcript instead of the tokens being wasted.
-  const transcript = path.join(tmp, `lost-agent-c17-${process.pid}.jsonl`);
+  // The recovery path is gated to the CLI's own transcript area
+  // (<tmp>/claude*/…/tasks/*.output) — the fixture has to live there too.
+  fs.mkdirSync(path.join(tmp, "claude", "c17", "tasks"), { recursive: true });
+  const transcript = path.join(tmp, "claude", "c17", "tasks", `lost-agent-c17-${process.pid}.output`);
   const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_LOST_AGENT_OUTPUT_FILE: transcript });
   await s.ready;
   const r = await s.call("claude_code_review", { repoPath: gitRepo("c17"), scope: "last-commit", waitForResult: true });
@@ -567,8 +590,66 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   s.kill();
 }
 
+/* ================= C18 a misread launch ack never outranks the notification ================= */
+{
+  // Older CLI shapes can return an async launch ack that neither detector
+  // recognises. Filing that text as the report would suppress the real report
+  // that arrives moments later in the task_notification — the notification is
+  // authoritative for its dispatch, so the record must be corrected.
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_ACK_MISREAD_IDS: "2" });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c18"), scope: "last-commit", waitForResult: true });
+  const sc = r.result?.structuredContent || {};
+  const subs = sc.subagents || [];
+  const second = subs.find((a) => /#2\b/.test(a.description || "")) || {};
+  check("C18", "the ack text is not the final report", !/dispatched; the report will follow/.test(String(second.report || "")), JSON.stringify(second).slice(0, 200));
+  check("C18", "the task_notification's report wins", /STUB-SUBAGENT-REPORT-2/.test(String(second.report || "")), JSON.stringify(second).slice(0, 200));
+  check("C18", "the fleet size is unchanged by the correction", subs.length === 5, JSON.stringify(subs.length));
+  let lines = 0;
+  try { lines = fs.readFileSync(sc.subagentsFile, "utf8").trim().split(String.fromCharCode(10)).length; } catch { /* missing */ }
+  check("C18", "the correction is appended to the JSONL journal", lines === 6, `lines=${lines} file=${sc.subagentsFile}`);
+  s.kill();
+}
+
+/* ================= C19 a cancelled run keeps the finished reports ================= */
+{
+  // Cancelling used to return a bare error: every report the fleet had already
+  // produced became unreachable, although the tokens were paid for. The
+  // interrupted path must carry the incremental records and the JSONL path.
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_SUBAGENT_DELAY_MS: "1500" });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c19"), scope: "last-commit" });
+  const jobId = r.result?.structuredContent?.jobId;
+  let seen = 0;
+  for (let i = 0; i < 25 && seen === 0; i++) {
+    await new Promise((res) => setTimeout(res, 400));
+    const p = await s.call("claude_review_status", { jobId });
+    seen = (p.result?.structuredContent?.subagentsSoFar || []).length;
+  }
+  const c = await s.call("claude_review_status", { jobId, cancel: true });
+  check("C19", "cancel accepted after the fleet started", /cancel/i.test(textOf(c)));
+  let final = null;
+  for (let i = 0; i < 25 && !final; i++) {
+    await new Promise((res) => setTimeout(res, 400));
+    const p = await s.call("claude_review_status", { jobId });
+    if (p.result?.structuredContent?.status !== "running") final = p.result;
+  }
+  const sc = final?.structuredContent || {};
+  check("C19", "at least one subagent finished before the cancel", seen >= 1, `seen=${seen}`);
+  check("C19", "the cancelled result is an error flagged cancelled", final?.isError === true && sc.status === "cancelled", JSON.stringify(sc.status));
+  check("C19", "the finished reports survive the cancel", (sc.subagents || []).length >= 1, JSON.stringify((sc.subagents || []).length));
+  check("C19", "the result names the partial-reports JSONL", typeof sc.subagentsFile === "string", JSON.stringify(sc.subagentsFile));
+  // `final` is already the tool result (p.result), so read its content directly.
+  const finalText = final?.content?.[0]?.text || "";
+  check("C19", "the text still shows the reports", /## Reviewer subagent reports/.test(finalText), finalText.slice(0, 200));
+  s.kill();
+}
+
 /* ---------- summary ---------- */
 const failed = results.filter((r) => !r.ok);
+const skipped = results.filter((r) => r.skipped);
+const passed = results.filter((r) => r.ok && !r.skipped);
 const caseIds = [...new Set(results.map((r) => r.caseId))];
-console.log(`\n${failed.length === 0 ? "ALL CASES PASS" : "FAILURES"}: ${results.length - failed.length}/${results.length} checks, cases executed: ${caseIds.join(" ")}`);
+const skipNote = skipped.length ? `, ${skipped.length} SKIPPED` : "";
+console.log(`\n${failed.length === 0 ? "ALL CASES PASS" : "FAILURES"}: ${passed.length}/${results.length - skipped.length} checks${skipNote}, cases executed: ${caseIds.join(" ")}`);
 process.exit(failed.length === 0 ? 0 : 1);

@@ -56,6 +56,27 @@ function stripQuoted(cmd) {
  * Decide whether one Bash command may run.
  * @returns {{ok: true} | {ok: false, reason: string, chained: boolean, substituted: boolean}}
  */
+/**
+ * `find` and `rg` are granted through prefix rules (Bash(find:*), Bash(rg:*))
+ * because the review needs them for reads. Both can WRITE and EXECUTE:
+ * find -delete / -exec / -execdir / -ok / -okdir / -fprint / -fprintf / -fls,
+ * and rg --pre / --pre-glob run an arbitrary program. A prefix rule cannot
+ * express "these flags are forbidden", so the hook refuses those forms outright.
+ * (Pre-existing hole from 1.6.0, closed here.)
+ */
+const FIND_WRITE_FLAGS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"]);
+function dangerousToolForm(bare) {
+  const words = bare.trim().split(/\s+/);
+  const cmd = words[0];
+  if (cmd === "find" && words.some((w) => FIND_WRITE_FLAGS.has(w))) {
+    return "blocked: find with a write/execute action (-delete, -exec, -ok, -fprint, ...). Review mode is read-only — use Read/Glob/Grep, or a plain find without those flags.";
+  }
+  if ((cmd === "rg" || cmd === "ripgrep") && words.some((w) => w === "--pre" || w.startsWith("--pre=") || w === "--pre-glob" || w.startsWith("--pre-glob="))) {
+    return "blocked: rg --pre / --pre-glob runs an arbitrary program for every file. Review mode is read-only — use a plain rg.";
+  }
+  return null;
+}
+
 export function analyseCommand(cmd) {
   if (typeof cmd !== "string" || !cmd.trim()) return { ok: true };
   const q = stripQuoted(cmd);
@@ -79,6 +100,8 @@ export function analyseCommand(cmd) {
       substituted,
     };
   }
+  const danger = dangerousToolForm(bare);
+  if (danger) return { ok: false, reason: danger, chained: false, substituted: false, dangerous: true };
   return { ok: true };
 }
 
@@ -90,11 +113,12 @@ export function analyseCommand(cmd) {
  * working — listing it as an escape would be a false alarm, and a guard that
  * cries wolf gets switched off. Only commands that ran are reported.
  *
- * @returns {{chained: string[], substituted: string[], clean: number, blocked: string[], ran: string[]}}
+ * @returns {{chained: string[], substituted: string[], dangerous: string[], clean: number, blocked: string[], ran: string[]}}
  */
 export function detectShellChaining(commands, denied = []) {
   const chained = [];
   const substituted = [];
+  const dangerous = [];
   const blocked = [];
   const ran = [];
   const deniedSet = new Set(Array.isArray(denied) ? denied.filter((c) => typeof c === "string") : []);
@@ -103,10 +127,12 @@ export function detectShellChaining(commands, denied = []) {
     const verdict = analyseCommand(raw);
     if (verdict.ok) { clean++; continue; }
     const cmd = String(raw);
-    if (verdict.substituted) substituted.push(cmd); else chained.push(cmd);
+    if (verdict.dangerous) dangerous.push(cmd);
+    else if (verdict.substituted) substituted.push(cmd);
+    else chained.push(cmd);
     if (deniedSet.has(cmd)) blocked.push(cmd); else ran.push(cmd);
   }
-  return { chained, substituted, clean, blocked, ran };
+  return { chained, substituted, dangerous, clean, blocked, ran };
 }
 
 /**
@@ -115,14 +141,23 @@ export function detectShellChaining(commands, denied = []) {
  * denies them, and a denied call is not an escape).
  */
 export function shellChainingNote(commands, denied = []) {
-  const { ran } = detectShellChaining(commands, denied);
+  const { ran, dangerous } = detectShellChaining(commands, denied);
   if (ran.length === 0) return null;
-  const lines = [
-    `⚠ SHELL-CHAINED COMMAND${ran.length === 1 ? "" : "S"} RAN WITHOUT BEING BLOCKED (${ran.length})`,
-    "Claude Code permission rules prefix-match the whole command, so a compound",
-    "command satisfies an allowlist rule meant for its first token. The PreToolUse",
-    "hook is supposed to deny these before they execute — these did run:",
-  ];
+  const dangerSet = new Set(dangerous);
+  const onlyChaining = ran.every((c) => !dangerSet.has(c));
+  const lines = onlyChaining
+    ? [
+      `⚠ SHELL-CHAINED COMMAND${ran.length === 1 ? "" : "S"} RAN WITHOUT BEING BLOCKED (${ran.length})`,
+      "Claude Code permission rules prefix-match the whole command, so a compound",
+      "command satisfies an allowlist rule meant for its first token. The PreToolUse",
+      "hook is supposed to deny these before they execute — these did run:",
+    ]
+    : [
+      `⚠ BASH COMMAND${ran.length === 1 ? "" : "S"} RAN WITHOUT BEING BLOCKED (${ran.length})`,
+      "The PreToolUse hook is supposed to deny compound commands and unsafe",
+      "write/execute forms (find -delete/-exec/…, rg --pre) before they execute —",
+      "these did run:",
+    ];
   for (const c of ran) lines.push(`  • ${c.slice(0, 200)}`);
   lines.push("Review the run log and treat this repository as hostile until inspected.");
   return lines.join("\n");
@@ -134,16 +169,20 @@ export function shellChainingNote(commands, denied = []) {
  * retry differently.
  */
 export function shellGuardNote(commands, denied = []) {
-  const { blocked } = detectShellChaining(commands, denied);
+  const { blocked, dangerous } = detectShellChaining(commands, denied);
+  const dangerSet = new Set(dangerous);
+  const blockedChain = blocked.filter((c) => !dangerSet.has(c));
+  const blockedDanger = blocked.filter((c) => dangerSet.has(c));
   const writeFlags = (Array.isArray(denied) ? denied : []).filter((c) => typeof c === "string" && gitWriteFlagReason(c));
-  const total = blocked.length + writeFlags.length;
+  const total = blockedChain.length + blockedDanger.length + writeFlags.length;
   if (total === 0) return null;
   const kinds = [];
-  if (blocked.length) kinds.push(`${blocked.length} shell-chained (the reviewer combined steps into one call; it can retry them as separate calls)`);
+  if (blockedChain.length) kinds.push(`${blockedChain.length} shell-chained (the reviewer combined steps into one call; it can retry them as separate calls)`);
+  if (blockedDanger.length) kinds.push(`${blockedDanger.length} unsafe write/execute form (find -delete/-exec/…, rg --pre — read-only review mode forbids these)`);
   if (writeFlags.length) kinds.push(`${writeFlags.length} git call(s) that would have written a file via --output=/--output-directory=`);
   return `${total} Bash command(s) were blocked before running by the PreToolUse guard — ` +
     `${kinds.join("; ")}: ` +
-    [...blocked, ...writeFlags].slice(0, 5).map((c) => c.slice(0, 120)).join(" | ");
+    [...blockedChain, ...blockedDanger, ...writeFlags].slice(0, 5).map((c) => c.slice(0, 120)).join(" | ");
 }
 
 /**

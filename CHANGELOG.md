@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.15.1 — 2026-10-29
+
+A real report after upgrading without restarting: `Refusing to run unguarded: the shell guard is installed but did not behave as expected (the hook did not deny a chained command)`. The guard was right; the message was not.
+
+- **What happened.** A stdio MCP server keeps the modules it loaded at startup, but the guard hook is spawned **fresh from disk on every Bash call**. After 1.14.0/1.15.0 were written to disk, a server still running 1.13.2 was probing the hook with `git status; echo PWNED` — a chain 1.14.0 now *allows* (`echo` reads and writes nothing) — so the self-test saw "no deny" and, correctly, refused the run. The enforcement was never broken; the two halves were simply different versions.
+- **The refusal now says so.** It adds: if cc-code-review was just updated, restart the MCP host — the server still runs the previous version while the hook on disk is the new one. It also notes that `CLAUDE_REVIEW_ALLOW_UNGUARDED=1` in this situation skips only the self-check, not the guard (the hook is still installed).
+- **`claude_review_env` can answer "am I on the latest?" itself.** Its first line is now `cc-code-review server: vX.Y.Z`, and when the source on disk is newer than the running process it appends `⚠ STALE PROCESS` with both timestamps and the restart instruction; structuredContent carries `server: { version, stale, newestSourceAt }`. New `src/version.js` holds the version and that check, so it is testable without starting a server.
+- Both READMEs gained the upgrade rule ("updating the code requires restarting the MCP host") next to the install steps.
+- Suites: shell-guard 203, audit-fixes 246 (+3: drift detection), validate 16, cross-cases 118/118.
+
 ## 1.15.0 — 2026-10-28
 
 The last open read channel: the reviewer's Bash readers could reach anywhere on disk. They are now scoped to the reviewed repository.

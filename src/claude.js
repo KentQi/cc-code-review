@@ -1103,7 +1103,8 @@ async function guardSelfTestProbe() {
   if (decisionOf(bad) !== "deny") {
     return {
       ok: false,
-      reason: `the hook did not deny a command-substitution probe (exit ${bad.code ?? "?"}${bad.error ? `, spawn error ${bad.error}` : ""})`,
+      reason: `the hook did not deny a command-substitution probe (exit ${bad.code ?? "?"}${bad.error ? `, spawn error ${bad.error}` : ""})` +
+        ` — if cc-code-review was just updated, this process is still running the previous version while the hook on disk is the new one; restart the MCP host`,
     };
   }
   const good = await probe({ tool_name: "Bash", tool_input: { command: "git status" } });

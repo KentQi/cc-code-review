@@ -20,6 +20,7 @@ import {
   streamEventFacts, parseUnrecognizedModels, buildModelProvenance, resultFacts,
   parseAgentLaunchAck, looksLikeLaunchAck, recoverReportFromTranscript,
 } from "../src/claude.js";
+import { codeDrift } from "../src/version.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -366,6 +367,17 @@ check("guard state is one of on/off/failed", ["on", "off", "failed"].includes(gu
   check("guardSelfTest refresh re-probes and agrees with the cached verdict",
     { aOk: a.ok, bOk: b.ok, agree: a.ok === b.ok, distinctProbes: a !== b },
     { aOk: true, bOk: true, agree: true, distinctProbes: true });
+}
+
+/* ---------------- code drift: is this process older than the code? ----------------
+ * The one upgrade hazard a stdio server has: it keeps the modules it loaded,
+ * while the guard hook is spawned fresh from disk. `claude_review_env` must be
+ * able to answer "am I running the latest?" without the user guessing. */
+{
+  const now = Date.now();
+  check("codeDrift is quiet when the process is newer than the sources", codeDrift(now + 86_400_000).stale, false);
+  check("codeDrift flags sources newer than the process", codeDrift(now - 86_400_000).stale, true);
+  check("codeDrift reports when the newest source changed", typeof codeDrift(now).newestSourceAt, "string");
 }
 
 /* ---------------- allowlist replay of a real run's Bash calls ---------------- */

@@ -56,6 +56,8 @@ npm run init
 
 `init` runs a **free self-check** (claude CLI resolution and version, hardening-flag floors, a live shell-guard test, skill status, git/gh, gateway reachability) and then writes the registration into `~/.zcode/cli/config.json` **derived from this machine** — node gets the currently running absolute path, the entry file gets this checkout's absolute path, and gateway credentials (when a CC Switch / settings.json / environment configuration is detected) are carried over automatically. No Windows/macOS/Linux paths to edit by hand. Restart ZCode (or reconnect the MCP) afterwards; tool names: `mcp__cc-code-review__claude_code_review` and friends.
 
+> ⚠️ **Updating the code requires restarting the MCP host.** A stdio MCP server keeps the modules it loaded at startup, while the shell guard's hook is spawned fresh from disk on every Bash call. Updating the files without a restart therefore leaves an old server next to a new hook: the two disagree about the policy, and the guard self-test (correctly) refuses to run with `the shell guard is installed but did not behave as expected`. That is fail-closed, not a bug. `claude_review_env` answers it directly: its first line is `cc-code-review server: vX.Y.Z`, and if the source on disk is newer than this process it appends `⚠ STALE PROCESS` with a restart hint (`server.stale` in structuredContent).
+
 Manual config (equivalent, for those who prefer not to run a script) — note `command` must be YOUR machine's node absolute path and `args` the absolute path of this checkout's `src/index.js`:
 
 ```json
@@ -235,7 +237,7 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (203, free) + audit-fix unit tests (243, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (203, free) + audit-fix unit tests (246, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
 node scripts/cross-cases.mjs                    # 20 MECE cases (118 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)

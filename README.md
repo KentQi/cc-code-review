@@ -57,6 +57,8 @@ npm run init
 
 `init` 会做一轮**免费自检**（claude CLI 解析与版本、加固 flag 地板、shell guard 实测、skill 状态、git/gh、网关连通性），然后**按本机环境**把注册写进 `~/.zcode/cli/config.json`——node 用的是当前运行的绝对路径、入口文件用本仓库的绝对路径、网关凭据（如果检测到 CC Switch / settings.json / 环境变量配置）自动带上。Windows/macOS/Linux 无需手改任何路径。写完重启 ZCode（或重连 MCP）即可，工具名：`mcp__cc-code-review__claude_code_review` 等。
 
+> ⚠️ **升级代码后必须重启 MCP 宿主。** stdio MCP 是常驻进程，模块在启动那一刻就载入了内存；而 shell guard 的 hook 脚本是**每次 Bash 调用时从磁盘新起的**。所以只更新文件不重启，会得到"旧服务器 + 新 hook"的错配：两者对策略的判断不一致，guard 自检会（正确地）拒绝运行，报 `the shell guard is installed but did not behave as expected`。这不是 bug，是 fail-closed。`claude_review_env` 会直接告诉你答案：首行 `cc-code-review server: vX.Y.Z`，若磁盘源码比本进程新，会追加 `⚠ STALE PROCESS` 并给出重启提示（structuredContent 里是 `server.stale`）。
+
 手动配置（等效，适合不想跑脚本的人）——注意 `command` 必须是本机 node 的**绝对路径**，`args` 必须是本仓库 `src/index.js` 的**绝对路径**：
 
 ```json
@@ -234,7 +236,7 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（203 条，免费）+ 审计修复单测（243 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（203 条，免费）+ 审计修复单测（246 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
 node scripts/cross-cases.mjs                    # 20 个 MECE 用例（118 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）

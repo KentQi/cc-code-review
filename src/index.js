@@ -39,6 +39,7 @@ import {
   deriveReviewLevel,
 } from "./prompt.js";
 import { skillStatus, installBundledSkill, userSkillDir } from "./skill.js";
+import { SERVER_VERSION, codeDrift } from "./version.js";
 
 const execFileAsync = promisify(execFile);
 const log = (...a) => console.error("[cc-code-review]", ...a);
@@ -496,7 +497,6 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.15.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -560,8 +560,13 @@ async function prepareRunHardening(cli, { ultracode = false } = {}) {
         ok: false,
         error:
           `Refusing to run unguarded: the shell guard is installed but did not behave as expected (${selfTest.reason}). ` +
-          `A guard that does not fire is worse than none, because it looks like protection. Set ` +
-          `CLAUDE_REVIEW_ALLOW_UNGUARDED=1 to run anyway at your own risk.`,
+          `A guard that does not fire is worse than none, because it looks like protection. ` +
+          // The most common cause, and the least obvious one: this process keeps
+          // the code it loaded at startup while the hook script is spawned fresh
+          // from disk on every call — so an upgrade makes the two disagree.
+          `If cc-code-review was just updated, restart the MCP host (or ZCode): the running server still executes the previous version while the hook file on disk is the new one. ` +
+          `Otherwise check ${hookScriptPath()} is intact and that node can spawn it, or set ` +
+          `CLAUDE_REVIEW_ALLOW_UNGUARDED=1 to run anyway at your own risk (the hook is still installed in that case — enforcement stays on; only this self-check is skipped).`,
       };
     }
     if (!selfTest.ok) {
@@ -658,7 +663,16 @@ server.tool(
   "(never overwrites a user-managed skill there).",
   { installSkill: z.boolean().default(false) },
   async ({ installSkill }) => {
-    const lines = ["claude cli:"];
+    const drift = codeDrift();
+    const lines = [`cc-code-review server: v${SERVER_VERSION}${drift.stale ? " — ⚠ STALE PROCESS" : ""}`];
+    if (drift.stale) {
+      lines.push(
+        `  ⚠ the source on disk is newer than this process (${path.basename(String(drift.file))} changed ${drift.newestSourceAt}; ` +
+        `this process started ${drift.startedAt}) — it is still running the previous version. Restart the MCP host (or ZCode) to apply it. ` +
+        `The guard hook is spawned from disk on every call, so until then the server and the hook disagree (the guard self-test refuses to run).`,
+      );
+    }
+    lines.push("claude cli:");
     const cli = resolveClaudeCli();
     let cliState = "NOT_FOUND";
     if (!cli) {
@@ -684,9 +698,9 @@ server.tool(
         // cache is for the hot path (prepareRunHardening), and refresh:true
         // forces a fresh probe here — the contract 1.9.2's CHANGELOG promised.
         const self = await guardSelfTest({ refresh: true });
-        lines.push(`  shell guard (PreToolUse hook blocking chained/substituted Bash commands): installed — ${self.ok ? "verified working (denies a chained command, allows a clean one)" : `NOT WORKING — ${self.reason}`}`);
+        lines.push(`  shell guard (PreToolUse hook: read-only Bash policy, in-repo paths): installed — ${self.ok ? "verified working (denies an unsafe command, allows a clean one)" : `NOT WORKING — ${self.reason}`}`);
       } else {
-        lines.push(`  shell guard (PreToolUse hook blocking chained/substituted Bash commands): ${guard.state === "off" ? "OFF" : "FAILED"} — ${guard.reason}`);
+        lines.push(`  shell guard (PreToolUse hook: read-only Bash policy, in-repo paths): ${guard.state === "off" ? "OFF" : "FAILED"} — ${guard.reason}`);
       }
       // guardState()/guardSelfTest() wrote a guard settings file just to probe;
       // nothing else will remove it in this code path, so clean up now.
@@ -762,7 +776,14 @@ server.tool(
       lines.push(r.installed ? `installSkill: installed -> ${r.dir}` : `installSkill: skipped — ${r.reason}`);
     }
     lines.unshift(`verdict: ${cliState}`);
-    return { content: [{ type: "text", text: lines.join("\n") }], structuredContent: { verdict: cliState, cli: cli && !cli.error ? { path: cli.path, source: cli.source } : null } };
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+      structuredContent: {
+        verdict: cliState,
+        server: { version: SERVER_VERSION, stale: !!drift.stale, newestSourceAt: drift.newestSourceAt ?? null },
+        cli: cli && !cli.error ? { path: cli.path, source: cli.source } : null,
+      },
+    };
   }
 );
 

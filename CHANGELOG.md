@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.11.1 — 2026-10-28
+
+Fixes from the atomic audit of the 1.11.0 requirement set (the MCP auditing itself at effort=max / reviewLevel=max; the diff-sized fleet worked as designed — 12 reviewer subagents dispatched and all 12 reports captured before the run's own $30 budget cap; 4 of 12 reviewers reported before the cap, every finding verified against HEAD before fixing):
+
+- **[M] A failed review's TEXT now carries the run metadata.** `ultracode` / `review_level` / `workflow_runs` (plus status, cost, turns, subagent counts) lived only in `runResultText`, which the error path never called — a budget-capped or max-turns run showed none of the knobs it used to a text-only caller, even though structuredContent had them. The error path now renders the same metadata block (new shared `runMetaLines`).
+- **[M] guardState's probe settings file no longer leaks.** `guardState()` writes a settings file to prove the temp dir is writable; that probe survived until the 2h sweep — one ~600B file per agentic run for the life of the server, plus two dead paths per run in the in-memory Set. The probe is now removed before returning, and `removeGuardSettings` prunes the Set (previously only `cleanupGuardSettings` did).
+- **[M] The e2e suite now runs in CI.** `scripts/cross-cases.mjs` (80 checks: async job lifecycle, reviewer reports incl. async task_notification, model provenance, error path, ultracode/Workflow, guard-file leaks) was in neither `npm test` nor `.github/workflows/ci.yml` — all of it was local-only. Added `npm run test:e2e` and a hermetic CI step (stub claude, no network, no spend; the paid C9 stays opt-in).
+- **[L] READMEs no longer advertise a fixed five.** The top blurbs still said "5 parallel reviewer subagents" 80 lines above the parameter table documenting the diff-sized fleet; both now describe the fleet (2–8+ by diff size).
+- Suites: shell-guard 67, audit-fixes 229 (+3: guardState probe), validate 16, cross-cases 80/80 (C13 now asserts the error-path metadata lines). Local atomic checklist of R1–R14: 25/25.
+
 ## 1.11.0 — 2026-10-28
 
 Workflow-level pass: the MCP now exposes the same three knobs a native Claude Code review has, and the bundled skill sizes its reviewer fleet the way the native pipeline does. Established by reading claude 2.1.311's own code for `/code-review` (the built-in command, alias `/review`) and the Ultracode/Workflow machinery:

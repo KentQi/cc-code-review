@@ -7,7 +7,7 @@
 English | [简体中文](README.md)
 
 An MCP server that wraps **Claude Code's code-review capability** so ZCode (or any MCP client) can call it directly:
-ZCode → MCP → `claude -p` (headless) → code-review skill (5 parallel reviewer subagents + 0–100 confidence scoring + ≥80 filter) → the report comes back to ZCode as-is → ZCode fixes the code based on the findings → call again to re-verify.
+ZCode → MCP → `claude -p` (headless) → code-review skill (a diff-sized fleet of parallel reviewer subagents + 0–100 confidence scoring + ≥80 filter) → the report comes back to ZCode as-is → ZCode fixes the code based on the findings → call again to re-verify.
 
 ```
 ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --output-format stream-json
@@ -223,10 +223,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (226, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (229, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 14 MECE cases (78 checks; ultracode/workflow + fleet scaling e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 14 MECE cases (80 checks; ultracode/workflow + fleet scaling e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)
 node scripts/cancel-test.mjs <repoPath>         # is the process tree killed right after cancel (billed, a few cents)

@@ -812,6 +812,7 @@ export { analyseCommand, detectShellChaining, gitWriteFlagReason, guardVerdict, 
 /** Remove the temporary guard settings file once the run is over. */
 export function removeGuardSettings(file) {
   if (!file) return;
+  guardSettingsFiles.delete(file); // the Set tracks live files; drop dead paths
   try { fs.rmSync(file, { force: true }); } catch { /* temp dir cleanup is best effort */ }
 }
 
@@ -895,7 +896,14 @@ export function guardState() {
   const st = shellGuardStatus();
   if (!st.enabled) return { state: "off", reason: st.reason };
   try {
-    return writeGuardSettings() ? { state: "on", reason: st.reason } : { state: "failed", reason: "could not write the guard settings file" };
+    const probe = writeGuardSettings();
+    if (!probe) return { state: "failed", reason: "could not write the guard settings file" };
+    // The probe only proves the directory is writable; the run writes its own
+    // file (prepareRunHardening) and finish() removes that one. Deleting the
+    // probe here stops the ~600B-per-agentic-run leak that used to survive
+    // until the 2h sweep.
+    removeGuardSettings(probe);
+    return { state: "on", reason: st.reason };
   } catch (err) {
     return { state: "failed", reason: String(err?.message || err) };
   }

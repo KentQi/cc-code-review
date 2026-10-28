@@ -7,6 +7,7 @@
 ```bash
 npm install
 npm test                # 两个免费单测套件 + stdio 冒烟（需要本机装有 claude CLI）
+npm run test:e2e        # 桩 claude 端到端套件（免费，无需 claude CLI/网络；CI 也会跑）
 node scripts/validation-test.mjs   # 输入校验路径（免费，不发 API 请求）
 ```
 

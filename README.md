@@ -6,10 +6,10 @@
 
 [English](README.en.md) | 简体中文
 
-**EN**: An MCP server that wraps Claude Code's code-review skill (5 parallel reviewer subagents, 0–100 confidence scoring, keeps findings ≥ 80). Run reviews — PR / branch / working dir / last commit, effort `low→max`, optional fix mode — from ZCode or any MCP client and get the full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI.
+**EN**: An MCP server that wraps Claude Code's code-review skill (a diff-sized fleet of parallel reviewer subagents — 2–8+ by diff size — 0–100 confidence scoring, keeps findings ≥ 80). Run reviews — PR / branch / working dir / last commit, effort `low→max`, optional fix mode — from ZCode or any MCP client and get the full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI.
 
 把 **Claude Code 的 code review 能力**封装成 MCP server，让 ZCode（或任何 MCP 客户端）直接调用：
-ZCode → MCP → `claude -p`（headless）→ code-review skill（5 并行评审 subagent + 0-100 置信度打分 + ≥80 过滤）→ 审查报告原样返回给 ZCode → ZCode 根据报告改代码 → 再次调用复核。
+ZCode → MCP → `claude -p`（headless）→ code-review skill（按 diff 规模派出的并行评审 subagent 舰队 + 0-100 置信度打分 + ≥80 过滤）→ 审查报告原样返回给 ZCode → ZCode 根据报告改代码 → 再次调用复核。
 
 ```
 ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --output-format stream-json
@@ -222,10 +222,10 @@ v1.10.0 起返回 **5 个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（226 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（229 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
-node scripts/cross-cases.mjs                    # 14 个 MECE 用例（78 项检查；含 ultracode/workflow + 舰队缩放端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
+node scripts/cross-cases.mjs                    # 14 个 MECE 用例（80 项检查；含 ultracode/workflow + 舰队缩放端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）
 node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立刻杀掉（计费，几美分）

@@ -431,6 +431,7 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
     JSON.stringify(sc.subagents || []).slice(0, 200));
   check("C13", "provenance survives the error path", sc.modelProvenance?.substituted === true, JSON.stringify(sc.modelProvenance || {}).slice(0, 200));
   check("C13", "accounting survives the error path", !!sc.modelUsage && sc.subagentStats?.completed === 4, JSON.stringify({ modelUsage: sc.modelUsage, stats: sc.subagentStats }).slice(0, 300));
+  check("C13", "the error-path TEXT carries the run metadata lines", /- review_level: high/.test(text) && /- ultracode:/.test(text) === false && /_run metadata_/.test(text), text.slice(0, 400));
   s.kill();
 }
 
@@ -453,6 +454,8 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   check("C14", "structuredContent reports ultracode", sc.ultracode === true, JSON.stringify(sc).slice(0, 200));
   check("C14", "workflow dispatches are counted", sc.workflowRuns === 1, `workflowRuns=${sc.workflowRuns}`);
   check("C14", "the metadata marks ultracode and workflow runs", /ultracode: on/.test(text) && /workflow_runs: 1/.test(text), text.slice(0, 300));
+  // review_level defaults from effort (high here) and reaches the metadata.
+  check("C14", "review_level defaults from effort and is reported", sc.reviewLevel === "high" && /- review_level: high/.test(text), text.slice(0, 400));
   s.kill();
 }
 

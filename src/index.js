@@ -276,12 +276,8 @@ function validateFocus(focus) {
 }
 
 /** Shape shared by the text result of review / followup runs. */
-function runResultText(report, meta) {
+function runMetaLines(meta) {
   const lines = [
-    report || "(claude returned an empty report)",
-    "",
-    "---",
-    `_run metadata_`,
     `- status: ${meta.status}`,
     ...(meta.warning ? [`- warning: ${meta.warning}`] : []),
     ...(meta.sessionId ? [`- session_id: ${meta.sessionId} (use claude_review_followup to continue this review)`] : []),
@@ -299,6 +295,17 @@ function runResultText(report, meta) {
     ...(meta.permissionDenials ? [`- permission_denials: ${meta.permissionDenials}`] : []),
     ...(typeof meta.logFile === "string" ? [`- full_log: ${meta.logFile}`] : []),
     ...(meta.logFile?.error ? [`- full_log: ${meta.logFile.error}`] : []),
+  ];
+  return lines;
+}
+
+function runResultText(report, meta) {
+  const lines = [
+    report || "(claude returned an empty report)",
+    "",
+    "---",
+    `_run metadata_`,
+    ...runMetaLines(meta),
   ];
   return lines.join("\n");
 }
@@ -432,7 +439,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.11.0";
+const SERVER_VERSION = "1.11.1";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -1083,7 +1090,11 @@ server.tool(
       // the parent AFTER the subagents finished, and the reports that did
       // arrive must not be thrown away with the error banner.
       const errReports = subagentReportsText(run.agentReports);
-      const errNote = [provenanceNote, errReports].filter(Boolean).join("\n\n");
+      // Same metadata block as a successful run (status/level/ultracode/
+      // workflow_runs/cost/...), so a caller that only reads the text of a
+      // failed review still sees the knobs this run used.
+      const errMeta = ["_run metadata_", ...runMetaLines(meta)].join("\n");
+      const errNote = [provenanceNote, errReports, errMeta].filter(Boolean).join("\n\n");
       return {
         isError: true,
         content: [{ type: "text", text: gitProgramNotes + failureBanner(j, run) + stderrTail(run.stderr) + logNote + (errNote ? `\n\n${errNote}` : "") }],

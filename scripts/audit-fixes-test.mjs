@@ -672,6 +672,22 @@ check("hook allows a plain git diff",
   check("resultFacts survives garbage", resultFacts(null), {});
 }
 
+/* ---------------- guardState's probe file is removed immediately ---------------- */
+{
+  // guardState() writes a settings file only to prove the directory is writable.
+  // That probe used to survive until the 2h sweep — one ~600B leak per agentic
+  // run. It must be deleted before guardState returns.
+  const dir = path.join(os.tmpdir(), "cc-code-review");
+  const ours = () => { try { return fs.readdirSync(dir).filter((f) => f.startsWith(`guard-settings-${process.pid}-`)); } catch { return []; } };
+  const before = ours().length;
+  const a = guardState();
+  const b = guardState();
+  const after = ours().length;
+  check("guardState still reports the guard state", a.state, "on");
+  check("guardState is stable across calls", b.state, "on");
+  check("guardState leaves no probe settings file behind", after, before);
+}
+
 /* ---------------- init.mjs exits cleanly on a broken config ---------------- */
 // CHANGELOG 1.8.3 claimed EISDIR / unreadable config.json exit cleanly; both
 // actually crashed with an uncaught stack trace. This locks the clean exit:

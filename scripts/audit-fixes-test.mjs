@@ -10,7 +10,7 @@
 import {
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools,
   postPROnlyTools, buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
-  deriveReviewLevel, finderFleetRule, budgetDefaultForEffort,
+  deriveReviewLevel, finderFleetRule,
 } from "../src/prompt.js";
 import {
   versionAtLeast, PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN,
@@ -18,6 +18,7 @@ import {
   guardState, gitWriteFlagReason, gitSpawnOpts, guardSelfTest,
   writeGuardSettings, removeGuardSettings,
   streamEventFacts, parseUnrecognizedModels, buildModelProvenance, resultFacts,
+  parseAgentLaunchAck, recoverReportFromTranscript,
 } from "../src/claude.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -568,20 +569,6 @@ check("hook allows a plain git diff",
   check("prompt says five is not a cap", /10-15\+ subagents/.test(prompt), true);
 }
 
-/* ---------------- the spend cap follows the effort ---------------- */
-{
-  // effort defaults to max; a flat $5 cap used to stop those runs before the
-  // parent synthesized. The derived default must scale with the effort.
-  check("budget default: low", budgetDefaultForEffort("low"), 3);
-  check("budget default: medium", budgetDefaultForEffort("medium"), 5);
-  check("budget default: high", budgetDefaultForEffort("high"), 10);
-  check("budget default: xhigh", budgetDefaultForEffort("xhigh"), 20);
-  check("budget default: max", budgetDefaultForEffort("max"), 25);
-  check("budget default: unknown effort falls back to high's", budgetDefaultForEffort("nope"), 10);
-  check("every derived default stays within the schema cap of 50",
-    ["low", "medium", "high", "xhigh", "max"].every((e) => budgetDefaultForEffort(e) <= 50), true);
-}
-
 /* ---------------- the review allowlist covers native workflow orchestration ---------------- */
 {
   const allowed = reviewAllowedTools();
@@ -603,6 +590,35 @@ check("hook allows a plain git diff",
   const plain = writeGuardSettings();
   check("writeGuardSettings with no extras behaves as before", plain === null || typeof plain === "string", true);
   if (typeof plain === "string") removeGuardSettings(plain);
+}
+
+/* ---------------- async launch ack + transcript recovery ---------------- */
+{
+  // An async Agent dispatch's tool_result is a launch ack naming the agent's
+  // transcript; a 429 can kill the agent before its task_notification, and that
+  // file is the only place its paid-for work still exists.
+  const NL = String.fromCharCode(10);
+  const ack = [
+    "Async agent launched successfully. (This tool result is internal metadata - never quote or paste any part of it...)",
+    "agentId: a4d4ec40c37758649 (internal ID - do not mention to user.)",
+    "The agent is working in the background. You will be notified automatically when it completes.",
+    "output_file: C:/Users/admin/AppData/Local/Temp/claude/x/tasks/a4d4ec40.output",
+    "Do NOT Read or tail this file via the shell tool.",
+  ].join(NL);
+  check("parseAgentLaunchAck extracts the output_file",
+    parseAgentLaunchAck(ack)?.outputFile, "C:/Users/admin/AppData/Local/Temp/claude/x/tasks/a4d4ec40.output");
+  check("parseAgentLaunchAck ignores a plain report", parseAgentLaunchAck("STUB-SUBAGENT-REPORT-1: findings"), null);
+  const tf = path.join(os.tmpdir(), `cc-recover-test-${process.pid}.jsonl`);
+  fs.writeFileSync(tf, [
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "early thinking" }] } }),
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "t", name: "Read", input: {} }] } }),
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "FINAL PARTIAL FINDINGS" }] } }),
+  ].join(NL) + NL);
+  const rec = recoverReportFromTranscript(tf);
+  check("recoverReportFromTranscript returns the last assistant text", rec?.report, "FINAL PARTIAL FINDINGS");
+  check("recoverReportFromTranscript marks the recovery partial", [rec?.partial, rec?.source], [true, "output_file"]);
+  check("recoverReportFromTranscript tolerates a missing file", recoverReportFromTranscript(path.join(os.tmpdir(), "nope-does-not-exist.jsonl")), null);
+  fs.rmSync(tf, { force: true });
 }
 
 /* ---------------- unrecognized_model stderr parsing ---------------- */

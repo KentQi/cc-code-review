@@ -93,8 +93,8 @@ npm run init
 | `ultracode` | `false` | - | **Ultracode 模式**：通过 `--settings` 写入 `ultracode: true`，启用原生"常驻动态工作流编排"（每个实质任务走 Workflow 工具、多代理、不计 token 成本）；与 effort 正交；旧版 CLI 忽略该键（结果里的 `workflow_runs` 显示是否真正生效） |
 | `model` | - | - | 覆盖模型（`--model` 透传） |
 | `maxTurns` | `80` | 4–200 | agentic 轮数上限 |
-| `timeoutMinutes` | `20` | 1–60 | 硬超时 |
-| `maxBudgetUsd` | 按 effort 派生 | 0–50 | API 花费上限（`--max-budget-usd`）。省略时随 effort：low $3 / medium $5 / high $10 / xhigh $20 / max $25；0 = 关闭；第三方网关下依赖网关返回 usage，按 Anthropic 官方单价估算，可能不准或提前中止 |
+| `timeoutMinutes` | `30` | 1–60 | 硬超时——不设费用上限时它是唯一的总闸；触发时已完成的子代理报告照样返回 |
+| `maxBudgetUsd` | `0`（不设上限） | 0–50 | API 花费上限（`--max-budget-usd`）。**默认 0 = 任何 effort 级别都不设费用上限**：上限会在父代理综合前截停运行，而每个完成的子代理报告都已增量落盘、429 打断的子代理会从 output_file 转录抢救，设上限只会白扔已付费的工作；兜底 guards 是 `timeoutMinutes` 与 `maxTurns`。仍可显式设值；env `CLAUDE_REVIEW_MAX_BUDGET_USD` 覆盖 |
 | `installSkillIfMissing` | `true` | - | skill 缺失时自动安装 |
 
 返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（Review Summary / Findings / Notes）+ 5 个评审子代理各自的报告（`## Reviewer subagent reports`）+ 元数据（`session_id`、花费、轮数、日志路径、模型溯源）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
@@ -209,7 +209,9 @@ v1.10.0 起返回 **5 个评审子代理各自的报告**（`## Reviewer subagen
 
 ## 成本与时长
 
-- 每次真实 review 消耗 Claude 额度（走你的订阅/网关）。默认 effort=max：按 diff 规模派 2–8+ 个评审代理（max 含验证阶段可达 10–15+），典型 $3–25、2–15 分钟；显式 `effort: "low"` 可降到约 $0.3–3。`maxBudgetUsd` 兜底——省略时按 effort 派生（low $3 / medium $5 / high $10 / xhigh $20 / max $25，env `CLAUDE_REVIEW_MAX_BUDGET_USD` 可覆盖）。
+- 每次真实 review 消耗 Claude 额度（走你的订阅/网关）。默认 effort=max：按 diff 规模派 2–8+ 个评审代理（max 含验证阶段可达 10–15+），典型 $3–25、2–15 分钟；显式 `effort: "low"` 可降到约 $0.3–3。默认**不设费用上限**（`maxBudgetUsd: 0`），由 `timeoutMinutes` 兜底。
+- **增量捕获**：每个评审子代理一完成就立刻追加进 `%TEMP%/cc-code-review/subagents-*.jsonl`（一行一个），并可通过 `claude_review_status` 在运行中轮询拿到——原生 skill 要等全部子代理跑完才出报告，而 429/超时/取消随时可能打断；被打断时已完成的报告随错误一起返回。
+- **429 抢救**：被限流/额度耗尽打死的子代理，其工作会从启动确认里的 `output_file` 转录尾部恢复（标记 `partial (output_file)`），已花的 token 不白扔。
 - `claude_review_env` 与版本/flag 探测免费（结果有缓存）。
 
 ## 在 ZCode 里怎么用
@@ -222,10 +224,10 @@ v1.10.0 起返回 **5 个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（236 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（67 条，免费）+ 审计修复单测（234 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
-node scripts/cross-cases.mjs                    # 15 个 MECE 用例（83 项检查；含 ultracode/workflow + 舰队缩放端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
+node scripts/cross-cases.mjs                    # 17 个 MECE 用例（93 项检查；含 ultracode/workflow + 舰队缩放端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）
 node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立刻杀掉（计费，几美分）

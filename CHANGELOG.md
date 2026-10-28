@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.13.0 — 2026-10-28
+
+No spend cap at any level, and no work lost to a 429. The native skill only reports after the WHOLE reviewer fleet finishes, and a rate limit / token exhaustion (429) can stop it first — which used to throw away every token already spent on the subagents that did finish.
+
+- **No cost cap by default.** `maxBudgetUsd` now defaults to `0` — `--max-budget-usd` is not passed at any effort level. The old derived defaults (and the flat $5 before them) stopped the parent before it synthesized; with incremental capture a cap only discards paid work. `timeoutMinutes` (default 30) and `maxTurns` are the guards. An explicit `maxBudgetUsd` is still honoured, and `CLAUDE_REVIEW_MAX_BUDGET_USD` still overrides.
+- **Incremental capture — one subagent done, one durable record.** Every finished reviewer subagent is appended, the moment it lands, to `%TEMP%/cc-code-review/subagents-*.jsonl` (one JSON line per subagent, in completion order) and pushed into the job, so `claude_review_status(jobId)` reports `subagentsSoFar` (and lists them in its text) while the run continues. The final result (success OR error) carries the same set, plus the file path (`subagentsFile` / `partial_reports_file`).
+- **429 recovery from the agent's own transcript.** An async agent killed mid-flight never sends its `task_notification`; only the launch acknowledgement's `output_file` survives. On settle, the MCP reads the TAIL of that JSONL transcript and recovers the last assistant text as a partial report (`partial: true`, `recovery: "output_file"`, rendered as `partial (output_file)`). Pure helpers: `parseAgentLaunchAck`, `recoverReportFromTranscript`.
+- **429-aware failure banner.** A rate-limit/quota failure now says explicitly that nothing paid for is lost: the finished reports come with the error and the killed one is recovered from its transcript.
+- Suites: shell-guard 67, audit-fixes 234 (+5: ack parsing + transcript recovery), validate 16, cross-cases 93/93 — C15 now locks "no spend cap by default / explicit cap honoured", C16 locks the incremental path (poll-visible growth + one JSONL line per finished subagent), C17 locks the 429 recovery (an agent with a launch-ack transcript and no notification is reported as `partial (output_file)`).
+
 ## 1.12.0 — 2026-10-28
 
 - **`effort` now defaults to `max`** — the deepest review is the default experience (the previous `high` default under-delivered for a tool whose whole point is thoroughness). Pass `low`/`medium` explicitly when you want a fast, cheap pass.

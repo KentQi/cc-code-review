@@ -566,6 +566,7 @@ export function streamEventFacts(obj) {
       toolUseId: obj.tool_use_id,
       status: String(obj.status ?? ""),
       report: typeof obj.summary === "string" ? obj.summary : "",
+      outputFile: typeof obj.output_file === "string" ? obj.output_file : undefined,
     };
     return facts;
   }
@@ -599,7 +600,8 @@ export function streamEventFacts(obj) {
       workflowDispatches.push({ id: typeof block.id === "string" ? block.id : "", name: String(block.input?.name ?? "") });
     }
     if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
-      agentResults.push({ id: block.tool_use_id, text: toolResultText(block.content) });
+      const text = toolResultText(block.content);
+      agentResults.push({ id: block.tool_use_id, text, ack: parseAgentLaunchAck(text) || undefined });
     }
   }
   if (bashCommands.length) facts.bashCommands = bashCommands;
@@ -626,6 +628,56 @@ export function parseUnrecognizedModels(stderr) {
     } catch { /* malformed line — skip it */ }
   }
   return out;
+}
+
+/**
+ * An async Agent dispatch's tool_result is only a launch acknowledgement
+ * ("Async agent launched successfully. … output_file: <path> …"). Detect that
+ * shape and pull the transcript path out of it: when the agent never reports
+ * (killed by a 429 / budget halt / timeout), that file is the only place its
+ * partial work still exists.
+ */
+export function parseAgentLaunchAck(text) {
+  const s = String(text ?? "");
+  if (!/Async agent launched successfully/.test(s)) return null;
+  const m = /output_file:\s*(\S+)/.exec(s);
+  return { outputFile: m ? m[1] : undefined };
+}
+
+/**
+ * Best-effort recovery of a subagent's work from its JSONL transcript
+ * (`output_file`): read the TAIL only (these files grow large), walk the
+ * events backwards, and return the last assistant text as the partial report.
+ * A killed mid-flight agent still leaves its analysis in there.
+ */
+export function recoverReportFromTranscript(filePath, maxBytes = 256 * 1024) {
+  if (!filePath) return null;
+  let fd;
+  try {
+    const size = fs.statSync(filePath).size;
+    fd = fs.openSync(filePath, "r");
+    const len = Math.min(size, maxBytes);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString("utf8").split(/\r?\n/).filter((l) => l.trim().startsWith("{"));
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let ev;
+      try { ev = JSON.parse(lines[i]); } catch { continue; }
+      const content = ev?.message?.content;
+      if (!Array.isArray(content)) continue;
+      const texts = content
+        .filter((b) => b?.type === "text" && typeof b.text === "string" && b.text.trim())
+        .map((b) => b.text.trim());
+      if (texts.length) {
+        return { report: texts.join("\n\n"), partial: true, source: "output_file", transcriptBytes: size };
+      }
+    }
+    return null;
+  } catch {
+    return null; // gone / unreadable — nothing to recover
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* already closed */ } }
+  }
 }
 
 const normModel = (s) => String(s || "").toLowerCase().replace(/\[[^\]]*\]$/, "").trim();
@@ -1089,6 +1141,11 @@ export function runClaude({
   guardSettings,
   timeoutMs = 20 * 60 * 1000,
   signal,
+  // Called the moment a reviewer subagent's report completes in the stream —
+  // one call per subagent, in completion order, long before the parent's
+  // synthesis. Lets the caller deliver reports incrementally instead of
+  // waiting for the whole fleet.
+  onSubagentReport,
 }) {
   return new Promise((resolve) => {
     // A signal already aborted before we even spawn: never start a paid run.
@@ -1183,8 +1240,32 @@ export function runClaude({
     const agentResults = new Map();
     const taskNotifications = new Map();
     const workflowDispatches = [];
+    const notifiedReports = new Set();
     const mainModels = new Set();
     const subagentModels = new Set();
+    // Every finished subagent is persisted the moment it lands — one JSONL line
+    // per subagent — so a 429 / budget halt / kill / server death cannot lose
+    // work the tokens already paid for. The same record goes to onSubagentReport
+    // so a caller polling the job sees the fleet fill up live.
+    let subagentsFile = null;
+    let subagentSeq = 0;
+    const subagentRecords = [];
+    const dispatchOutputFiles = new Map();
+    const emitSubagent = (rec) => {
+      if (notifiedReports.has(rec.id)) return;
+      notifiedReports.add(rec.id);
+      const record = { seq: ++subagentSeq, ts: new Date().toISOString(), ...rec };
+      subagentRecords.push(record);
+      try {
+        if (!subagentsFile) {
+          const dir = path.join(os.tmpdir(), "cc-code-review");
+          fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+          subagentsFile = path.join(dir, `subagents-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}.jsonl`);
+        }
+        fs.appendFileSync(subagentsFile, JSON.stringify(record) + "\n");
+      } catch { /* persistence is best-effort; the in-memory record still stands */ }
+      try { onSubagentReport?.(record); } catch { /* a throwing listener must not kill the run */ }
+    };
     let soPartial = Buffer.alloc(0);
     const ingest = (line) => {
       if (!line.startsWith("{")) return;
@@ -1194,10 +1275,38 @@ export function runClaude({
       if (facts.result) { resultEvent = facts.result; return; }
       if (facts.bashCommands) bashCommands.push(...facts.bashCommands);
       if (facts.agentDispatches) agentDispatches.push(...facts.agentDispatches);
-      if (facts.agentResults) for (const r of facts.agentResults) agentResults.set(r.id, r.text);
-      if (facts.taskNotification) taskNotifications.set(facts.taskNotification.toolUseId, facts.taskNotification);
+      if (facts.agentResults) for (const r of facts.agentResults) {
+        agentResults.set(r.id, r.text);
+        // An async launch ack carries the agent's transcript path — remember it
+        // for the recovery pass if this agent never reports.
+        if (r.ack?.outputFile) dispatchOutputFiles.set(r.id, r.ack.outputFile);
+      }
+      if (facts.taskNotification) {
+        const n = facts.taskNotification;
+        taskNotifications.set(n.toolUseId, n);
+        if (n.outputFile) dispatchOutputFiles.set(n.toolUseId, n.outputFile);
+      }
       if (facts.workflowDispatches) workflowDispatches.push(...facts.workflowDispatches);
       if (facts.model) (facts.model.subagent ? subagentModels : mainModels).add(facts.model.model);
+      // One sub finished -> one durable record, right now, not at the end.
+      if (facts.taskNotification) {
+        const n = facts.taskNotification;
+        const d = agentDispatches.find((x) => x.id === n.toolUseId);
+        emitSubagent({
+          id: n.toolUseId, description: d?.description ?? "", subagentType: d?.subagentType ?? "",
+          async: true, status: n.status, report: n.report, outputFile: n.outputFile,
+        });
+      } else if (facts.agentResults) {
+        for (const r of facts.agentResults) {
+          if (r.ack) continue; // launch ack: the report comes later (or is recovered)
+          const d = agentDispatches.find((x) => x.id === r.id);
+          if (!d) continue; // not a subagent dispatch (some other tool result)
+          emitSubagent({
+            id: r.id, description: d.description, subagentType: d.subagentType,
+            async: false, status: "completed", report: r.text,
+          });
+        }
+      }
     };
 
     child.stdout.on("data", (d) => {
@@ -1257,6 +1366,21 @@ export function runClaude({
       liveChildren.delete(child);
       guardSettingsInFlight.delete(guardSettings); // final unmark point (see the mark site)
       removeGuardSettings(guardSettings);
+      // Recovery pass: a subagent the parent never heard from (killed by a 429 /
+      // budget halt / timeout, or its notification lost to stream truncation)
+      // still left its work in the transcript file named by its launch ack or
+      // notification. Salvage the tail so the tokens it spent are not wasted.
+      for (const d of agentDispatches) {
+        if (notifiedReports.has(d.id)) continue;
+        const recovered = recoverReportFromTranscript(dispatchOutputFiles.get(d.id));
+        emitSubagent({
+          id: d.id, description: d.description, subagentType: d.subagentType,
+          async: !!dispatchOutputFiles.get(d.id), status: recovered ? "stopped" : "unknown",
+          report: recovered?.report ?? "", partial: true,
+          outputFile: dispatchOutputFiles.get(d.id),
+          recovery: recovered ? "output_file" : "none",
+        });
+      }
       let stdout = Buffer.concat(soChunks).toString("utf8");
       let stderr = Buffer.concat(seChunks).toString("utf8");
       if (stdoutTruncated) stderr += `\n[cc-code-review] stdout exceeded ${MAX_STREAM_BYTES} bytes and was truncated`;
@@ -1294,21 +1418,21 @@ export function runClaude({
         // Reviewer subagents as dispatched, paired with the final report each
         // one handed back (the tool_result whose id matches its dispatch).
         agentDispatches,
-        agentReports: agentDispatches.map((d) => {
-          const note = taskNotifications.get(d.id);
-          const sync = agentResults.get(d.id) ?? "";
-          // Async background agents (2.1.x default for general-purpose): the
-          // tool_result is just "Async agent launched successfully...", and the
-          // completion notification carries the report. Prefer the notification;
-          // report its status so a budget-stopped agent is visibly stopped
-          // rather than an empty report.
-          return {
-            ...d,
-            report: note?.report || sync,
-            status: note?.status || undefined,
-            async: !!note,
-          };
-        }),
+        // The incremental records (one per finished subagent, in completion
+        // order, including partials recovered from output_file). The old
+        // pairing map is kept only for CLIs that emit neither shape.
+        agentReports: subagentRecords.map((r) => ({
+          id: r.id,
+          description: r.description,
+          subagentType: r.subagentType,
+          report: r.report,
+          status: r.status,
+          async: r.async || undefined,
+          partial: r.partial || undefined,
+          recovery: r.recovery || undefined,
+          outputFile: r.outputFile || undefined,
+        })),
+        subagentsFile,
         // Model tags the session actually reported, split parent vs subagent.
         mainModels: [...mainModels],
         subagentModels: [...subagentModels],

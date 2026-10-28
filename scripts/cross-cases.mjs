@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * cc-loop cross-case suite — 15 MECE cases over the whole MCP surface.
- * C1-C8, C10-C15 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
+ * cc-loop cross-case suite — 17 MECE cases over the whole MCP surface.
+ * C1-C8, C10-C17 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
  * paid end-to-end and only runs with --paid (CC_LOOP_PAID=1).
  * Exit 0 iff every executed case passes.
  */
@@ -482,12 +482,14 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   s.kill();
 }
 
-/* ================= C15 defaults: effort=max and its derived budget reach the CLI ================= */
+/* ================= C15 defaults: effort=max, NO spend cap ================= */
 {
-  // effort defaults to max (deepest review), and an omitted maxBudgetUsd follows
-  // the effort instead of the old flat $5 — which used to stop max-effort runs
-  // before the parent synthesized. The stub echoes its argv so this is exact.
+  // effort defaults to max (deepest review) and no spend cap is set at any
+  // level: a cap stopped the parent before it synthesized, and with incremental
+  // capture a 429 no longer wastes the finished work. The wall-clock timeout is
+  // the guard. The stub echoes its argv so this is exact.
   const echoArgs = path.join(tmp, `stub-argv-c15-${process.pid}.json`);
+  const echoArgs2 = path.join(tmp, `stub-argv-c15b-${process.pid}.json`);
   const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_ECHO_ARGS: echoArgs });
   await s.ready;
   const r = await s.call("claude_code_review", { repoPath: gitRepo("c15"), scope: "last-commit", waitForResult: true });
@@ -495,9 +497,73 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   try { argv = JSON.parse(fs.readFileSync(echoArgs, "utf8")); } catch { /* missing */ }
   const flag = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
   check("C15", "effort defaults to max and is passed as --effort", flag("--effort"), "max");
-  check("C15", "an omitted budget follows the effort (max -> 25)", flag("--max-budget-usd"), "25");
+  check("C15", "no spend cap is passed by default (--max-budget-usd absent)", !argv.includes("--max-budget-usd"), JSON.stringify(argv.slice(0, 12)));
+  check("C15", "an explicit cap is still honoured", await (async () => {
+    const s2 = startServer({ CLAUDE_CODE_PATH: STUB, STUB_ECHO_ARGS: echoArgs2 });
+    await s2.ready;
+    await s2.call("claude_code_review", { repoPath: gitRepo("c15b"), scope: "last-commit", maxBudgetUsd: 12, waitForResult: true });
+    let a2 = [];
+    try { a2 = JSON.parse(fs.readFileSync(echoArgs2, "utf8")); } catch { /* missing */ }
+    const i = a2.indexOf("--max-budget-usd");
+    s2.kill();
+    return i >= 0 ? a2[i + 1] : undefined;
+  })(), "12");
   const sc = r.result?.structuredContent || {};
   check("C15", "the result reports the max review level", sc.reviewLevel === "max", JSON.stringify(sc.reviewLevel));
+  s.kill();
+}
+
+/* ================= C16 subagent reports land incrementally ================= */
+{
+  // The native skill does not report until the WHOLE fleet finishes; a 429 /
+  // halt / cancel can stop it before then. Each finished subagent must be
+  // visible while the run continues (job polling) and durable on disk (JSONL).
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_SUBAGENT_DELAY_MS: "2500" });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c16"), scope: "last-commit" });
+  const jobId = r.result?.structuredContent?.jobId;
+  const p1 = await s.call("claude_review_status", { jobId });
+  const early = p1.result?.structuredContent?.subagentsSoFar ?? [];
+  check("C16", "a running job still reports elapsed time", p1.result?.structuredContent?.status === "running" && typeof p1.result.structuredContent.elapsedSec === "number", textOf(p1).slice(0, 120));
+  await new Promise((res) => setTimeout(res, 6000));
+  const p2 = await s.call("claude_review_status", { jobId });
+  const mid = p2.result?.structuredContent?.subagentsSoFar ?? [];
+  check("C16", "finished subagents are visible while the run continues", mid.length > early.length && mid.length >= 1, `early=${early.length} mid=${mid.length}`);
+  check("C16", "the running-poll text lists them", textOf(p2).includes("reviewer subagent report(s) already finished"), textOf(p2).slice(0, 200));
+  await new Promise((res) => setTimeout(res, 5000));
+  const p3 = await s.call("claude_review_status", { jobId });
+  const late = p3.result?.structuredContent?.subagentsSoFar ?? [];
+  check("C16", "the visible set only grows", late.length >= mid.length, `mid=${mid.length} late=${late.length}`);
+  let final = null;
+  for (let i = 0; i < 25 && !final; i++) {
+    await new Promise((res) => setTimeout(res, 2000));
+    const p = await s.call("claude_review_status", { jobId });
+    if (p.result?.structuredContent?.status !== "running") final = p.result;
+  }
+  check("C16", "the final result carries all five reports", (final?.structuredContent?.subagents || []).length === 5, JSON.stringify((final?.structuredContent?.subagents || []).length));
+  const file = final?.structuredContent?.subagentsFile;
+  let lines = 0;
+  try { lines = fs.readFileSync(file, "utf8").trim().split(String.fromCharCode(10)).length; } catch { /* missing */ }
+  check("C16", "each finished subagent was appended to the JSONL file as it landed", typeof file === "string" && lines === 5, `file=${file} lines=${lines}`);
+  s.kill();
+}
+
+/* ================= C17 an agent killed mid-flight is recovered from its transcript ================= */
+{
+  // A 429 can kill a subagent after it did its work but before its
+  // task_notification: only the launch ack's output_file survives. The report
+  // must be recovered from that transcript instead of the tokens being wasted.
+  const transcript = path.join(tmp, `lost-agent-c17-${process.pid}.jsonl`);
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_LOST_AGENT_OUTPUT_FILE: transcript });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c17"), scope: "last-commit", waitForResult: true });
+  const sc = r.result?.structuredContent || {};
+  const first = (sc.subagents || []).find((a) => a.recovery === "output_file") || {};
+  check("C17", "the killed agent is still reported", (sc.subagents || []).length === 5, JSON.stringify((sc.subagents || []).length));
+  check("C17", "its work is recovered from the output_file transcript",
+    first.partial === true && first.recovery === "output_file" && /partial findings recovered from the transcript/.test(first.report || ""),
+    JSON.stringify(first).slice(0, 200));
+  check("C17", "the text marks it as recovered", textOf(r).includes("partial (output_file)"), textOf(r).slice(0, 300));
   s.kill();
 }
 

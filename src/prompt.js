@@ -54,22 +54,6 @@ export function deriveReviewLevel(effort) {
   }
 }
 
-/**
- * Spend cap default per effort level. With effort defaulting to max, a flat $5
- * cap stopped most real runs before the parent synthesized (the failure mode
- * the 1.11.0 audit round hit). Low-effort reviews stay cheap; a max-effort
- * diff-sized fleet gets room to finish. The caller can always override.
- */
-export function budgetDefaultForEffort(effort) {
-  switch (effort) {
-    case "low": return 3;
-    case "medium": return 5;
-    case "xhigh": return 20;
-    case "max": return 25;
-    default: return 10;
-  }
-}
-
 /** Finder-fleet sizing rule, mirrored from the native command. */
 export function finderFleetRule(reviewLevel) {
   const cap = { low: 3, medium: 5, high: 8, max: 8 }[reviewLevel] ?? 8;

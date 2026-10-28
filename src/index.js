@@ -36,7 +36,7 @@ import {
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools, postPROnlyTools,
-  deriveReviewLevel, budgetDefaultForEffort,
+  deriveReviewLevel,
 } from "./prompt.js";
 import { skillStatus, installBundledSkill, userSkillDir } from "./skill.js";
 
@@ -47,8 +47,11 @@ const ENV = {
   // clamp to the same ranges the zod schema enforces, otherwise an out-of-range
   // env default makes every call that omits the param fail with '-32602 ... at
   // timeoutMinutes' naming no env var
-  timeoutMinutes: Math.min(60, Math.max(1, Math.round(positive(process.env.CLAUDE_REVIEW_TIMEOUT_MIN, 20)))),
-  maxBudgetUsd: Math.min(50, nonNegative(process.env.CLAUDE_REVIEW_MAX_BUDGET_USD, 5)),
+  timeoutMinutes: Math.min(60, Math.max(1, Math.round(positive(process.env.CLAUDE_REVIEW_TIMEOUT_MIN, 30)))),
+  // 0 = no spend cap (the default): a cap stops the parent before it synthesizes,
+  // and with incremental subagent capture a 429/token exhaustion no longer wastes
+  // the finished work. Set CLAUDE_REVIEW_MAX_BUDGET_USD to re-arm a cap.
+  maxBudgetUsd: Math.min(50, nonNegative(process.env.CLAUDE_REVIEW_MAX_BUDGET_USD, 0)),
   model: process.env.CLAUDE_REVIEW_MODEL || undefined,
   autoInstallSkill: process.env.CLAUDE_REVIEW_AUTO_INSTALL_SKILL !== "0",
 };
@@ -291,6 +294,7 @@ function runMetaLines(meta) {
     ...(meta.ultracode ? [`- ultracode: on (standing dynamic-workflow orchestration via the native Workflow tool)`] : []),
     ...(meta.workflowRuns ? [`- workflow_runs: ${meta.workflowRuns} (native Workflow orchestration dispatches)`] : []),
     ...(meta.reviewLevel ? [`- review_level: ${meta.reviewLevel} (reviewer-fleet depth: low..max)`] : []),
+    ...(typeof meta.subagentsFile === "string" ? [`- partial_reports_file: ${meta.subagentsFile} (one JSONL line per finished subagent, written as each lands)`] : []),
     ...(meta.subagentStats?.completed != null ? [`- subagents_completed: ${meta.subagentStats.completed}/${meta.subagentStats.spawned ?? "?"}${meta.subagentStats.failed ? `, failed: ${meta.subagentStats.failed}` : ""}${meta.subagentStats.killed?.system ? `, stopped by budget/system: ${meta.subagentStats.killed.system}` : ""}`] : []),
     ...(meta.permissionDenials ? [`- permission_denials: ${meta.permissionDenials}`] : []),
     ...(typeof meta.logFile === "string" ? [`- full_log: ${meta.logFile}`] : []),
@@ -320,7 +324,7 @@ function runResultText(report, meta) {
 function subagentReportsText(reports, cap = 4000) {
   if (!Array.isArray(reports) || !reports.length) return "";
   const blocks = reports.map((r, i) => {
-    const kind = [r.subagentType || null, r.async ? "async" : null, r.status || null].filter(Boolean).join(", ");
+    const kind = [r.subagentType || null, r.async ? "async" : null, r.status || null, r.partial ? `partial (${r.recovery || "recovered"})` : null].filter(Boolean).join(", ");
     const head = `### ${i + 1}. ${r.description || r.subagentType || "reviewer subagent"}${kind ? ` (${kind})` : ""}`;
     const body = (r.report || "").trim() ||
       (r.status && r.status !== "completed"
@@ -330,11 +334,6 @@ function subagentReportsText(reports, cap = 4000) {
     return `${head}\n\n${shown}`;
   });
   return `## Reviewer subagent reports (${reports.length} dispatched)\n\n${blocks.join("\n\n")}`;
-}
-
-/** CLAUDE_REVIEW_MAX_BUDGET_USD set? Then it wins over the effort-derived default. */
-function envBudgetOverride() {
-  return process.env.CLAUDE_REVIEW_MAX_BUDGET_USD != null && String(process.env.CLAUDE_REVIEW_MAX_BUDGET_USD).trim() !== "";
 }
 
 function logNoteOf(logFile) {
@@ -422,6 +421,13 @@ function failureBanner(j, run) {
   if (/keychain|user interaction is not allowed|errsec|securityd/i.test(blob)) {
     hints.push("The host process cannot read the OS credential store (macOS Keychain / Windows Credential Manager) — common when the MCP host runs as a launchd agent or Windows service, which has no user session to unlock it. Run claude interactively once, host ZCode from a normal user session, or switch to ANTHROPIC_API_KEY / a gateway so no keychain access is needed.");
   }
+  // A rate limit / token exhaustion (429) is the one failure that can waste real spend:
+  // the subagents that already finished are captured incrementally and are
+  // returned with this error, and any agent still in flight is recovered from
+  // its output_file transcript — so say so, and say what survived.
+  if (/429|rate.?limit|overloaded|too many requests|insufficient|quota|credit balance/i.test(blob)) {
+    hints.push("The API returned a rate limit / quota exhaustion (429) — the account ran out of tokens or hit a limit mid-run. Nothing already paid for is lost: every reviewer subagent that finished is included with this error (see the subagent reports below), and an agent killed mid-flight is recovered from its output_file transcript. Wait for the quota/limit to reset (or switch providers) and re-run; the diff-sized fleet means the re-run repeats only the unfinished work.");
+  }
   if (/ECONNREFUSED|connection refused|fetch failed|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket hang up|api_error/i.test(blob)) {
     const t = gatewayTarget();
     hints.push(`The API endpoint is unreachable${t ? ` (ANTHROPIC_BASE_URL=${t.url})` : ""} — if you use CC Switch / claude-code-router / a local gateway, make sure it is running and healthy.`);
@@ -444,7 +450,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.12.0";
+const SERVER_VERSION = "1.13.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -726,7 +732,8 @@ function describeSkill(status) {
 
 server.tool(
   "claude_code_review",
-  "Run Claude Code's code-review skill (a diff-sized fleet of parallel reviewer subagents, 0-100 confidence scoring, keeps findings >=80) " +
+  "Run Claude Code's code-review skill (a diff-sized fleet of parallel reviewer subagents, 0-100 confidence scoring, keeps findings >=80). " +
+  "Every finished reviewer subagent's report is captured the moment it lands — appended to a durable JSONL file and visible via claude_review_status while the run continues — and an agent killed mid-flight (e.g. a 429) is recovered from its output_file transcript, so a rate limit never wastes the work already paid for. " +
   "on a repository and return the markdown report. Costs Claude API credits; a run typically takes 2-15 minutes. " +
   "Afterwards, fix the code and re-run to verify, or use claude_review_followup with the returned session_id.",
   {
@@ -748,9 +755,9 @@ server.tool(
       .describe("Enable claude's Ultracode mode for this run (the `ultracode` settings key): standing dynamic-workflow orchestration — every substantive step goes through the native Workflow tool, multi-agent and token-cost-no-object. Orthogonal to effort (any effort level). Requires a claude CLI that supports the key; older builds ignore it (see workflowRuns in the result)."),
     model: z.string().optional().describe("Claude model override (passed as --model)"),
     maxTurns: z.number().int().min(4).max(200).default(80).describe("Agentic turn cap for the review session"),
-    timeoutMinutes: z.number().int().min(1).max(60).default(ENV.timeoutMinutes).describe("Hard wall-clock timeout for the run"),
+    timeoutMinutes: z.number().int().min(1).max(60).default(ENV.timeoutMinutes).describe("Hard wall-clock timeout for the run — with no spend cap by default this is the guard; every finished subagent report is kept even when it fires"),
     maxBudgetUsd: z.number().min(0).max(50).optional()
-      .describe(`API spend cap for this run via --max-budget-usd. Omit and it follows the effort: low $3 / medium $5 / high $10 / xhigh $20 / max $25 (env CLAUDE_REVIEW_MAX_BUDGET_USD overrides). 0 disables. On third-party gateways this depends on usage data the gateway returns.`),
+      .describe(`API spend cap via --max-budget-usd. DEFAULT 0 = NO CAP at any effort level: a cap stops the parent before it synthesizes, and every finished subagent report is already captured incrementally (and recovered from output_file), so a 429/token exhaustion no longer wastes it. The wall-clock timeout (timeoutMinutes) is the guard. Set a number only if you want a hard spend stop; env CLAUDE_REVIEW_MAX_BUDGET_USD overrides. On third-party gateways this depends on usage data the gateway returns.`),
     installSkillIfMissing: z.boolean().default(ENV.autoInstallSkill)
       .describe("Auto-install the bundled code-review skill into ~/.claude/skills when missing (default true)"),
     waitForResult: z.boolean().default(false)
@@ -761,7 +768,7 @@ server.tool(
       scope, baseRef, focus, postToPR, fix, effort, ultracode, reviewLevel,
       model, maxTurns, timeoutMinutes, installSkillIfMissing,
     } = args;
-    const maxBudgetUsd = args.maxBudgetUsd ?? (envBudgetOverride() ? ENV.maxBudgetUsd : budgetDefaultForEffort(effort));
+    const maxBudgetUsd = args.maxBudgetUsd ?? ENV.maxBudgetUsd;
 
     const prCheck = validatePr(args.pr);
     if (!prCheck.ok) return err(prCheck.error);
@@ -930,6 +937,9 @@ server.tool(
     // restores the synchronous contract for clients with long (or no) timeouts.
     const startedAt = Date.now();
     const jobAbort = new AbortController();
+    // Filled in async mode only; the incremental onSubagentReport callback
+    // feeds it so a polling client sees the fleet complete live.
+    let liveJob = null;
     const executeRun = async (signal, progressToken) => {
     // Best-effort progress notifications while the review runs.
     const token = progressToken ?? null;
@@ -962,6 +972,12 @@ server.tool(
       guardSettings,
       timeoutMs: timeoutMinutes * 60_000,
       signal,
+      // One subagent finished -> one record, right now: appended to the job so a
+      // polling client sees the fleet fill up (and keeps it after a 429/halt),
+      // and appended to the run's JSONL file by runClaude itself.
+      onSubagentReport: (rec) => {
+        if (liveJob) liveJob.subagents = [...(liveJob.subagents ?? []), rec];
+      },
     });
     if (progressTimer) clearInterval(progressTimer);
 
@@ -1081,6 +1097,7 @@ server.tool(
       ultracode: ultracode || undefined,
       reviewLevel: effectiveReviewLevel,
       workflowRuns: run.workflowDispatches?.length || undefined,
+      subagentsFile: run.subagentsFile,
       permissionDenials: realDenials.length,
       shellGuardBlocked: guardBlocked.length,
       bashCalls: Array.isArray(run.bashCommands) ? run.bashCommands.length : undefined,
@@ -1111,6 +1128,7 @@ server.tool(
           subagents: run.agentReports.map((r) => ({
             description: r.description, subagentType: r.subagentType || undefined,
             async: r.async || undefined, status: r.status || undefined,
+            partial: r.partial || undefined, recovery: r.recovery || undefined,
             report: r.report.length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : r.report,
           })),
           subagentsSpawned: meta.subagentsSpawned,
@@ -1122,7 +1140,8 @@ server.tool(
             subagents: provenance.subagents, billed: provenance.billed,
             substituted: provenance.substituted,
           },
-          modelUsage: facts.modelUsage,
+          subagentsFile: run.subagentsFile,
+        modelUsage: facts.modelUsage,
           subagentStats: facts.subagentStats,
           usage: facts.usage,
           safetyStops: facts.safetyStops,
@@ -1143,6 +1162,7 @@ server.tool(
         subagents: run.agentReports.map((r) => ({
           description: r.description, subagentType: r.subagentType || undefined,
           async: r.async || undefined, status: r.status || undefined,
+          partial: r.partial || undefined, recovery: r.recovery || undefined,
           report: r.report.length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : r.report,
         })),
         subagentsSpawned: meta.subagentsSpawned,
@@ -1156,6 +1176,7 @@ server.tool(
           billed: provenance.billed,
           substituted: provenance.substituted,
         },
+        subagentsFile: run.subagentsFile,
         modelUsage: facts.modelUsage,
         subagentStats: facts.subagentStats,
         usage: facts.usage,
@@ -1173,8 +1194,9 @@ server.tool(
     const jobId = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const job = {
       id: jobId, repoPath, scope: scope + (pr ? ` pr=${pr}` : ""), fix, effort,
-      startedAt, state: "running", result: null, abort: jobAbort,
+      startedAt, state: "running", result: null, abort: jobAbort, subagents: [],
     };
+    liveJob = job;
     reviewJobs.set(jobId, job);
     // The client cancelling THIS initial call must not orphan the background
     // run: tie its signal to the job's abort as well.
@@ -1235,9 +1257,27 @@ server.tool(
         return { content: [{ type: "text", text: `cancellation requested for ${jobId} — the claude process tree is being killed; poll again in a few seconds for the final state (billing stops within ~2s of the kill).` }] };
       }
       const secs = Math.round((Date.now() - job.startedAt) / 1000);
+      // Reviewer subagents that already finished: the native skill does not
+      // report until the whole fleet is done, but a 429 / halt / cancel can
+      // stop it before then — so the finished work is visible (and durable)
+      // while the run continues.
+      const sofar = (job.subagents ?? []).map((r) => ({
+        description: r.description, subagentType: r.subagentType || undefined,
+        status: r.status, async: r.async || undefined, partial: r.partial || undefined,
+        report: r.report,
+      }));
+      const lines = [
+        `still running: ${secs}s elapsed (${job.scope}, ${job.repoPath}). Reviews typically take 2-15 minutes — poll again in a minute or two. Cancel with {"jobId": "${jobId}", "cancel": true}.`,
+      ];
+      if (sofar.length) {
+        lines.push(`${sofar.length} reviewer subagent report(s) already finished (the run continues):`);
+        for (const r of sofar) {
+          lines.push(`- ${r.description || r.subagentType || "subagent"}${r.status ? ` [${r.status}${r.partial ? ", partial (recovered from output_file)" : ""}]` : ""}: ${(r.report || "").replace(/\s+/g, " ").slice(0, 300)}`);
+        }
+      }
       return {
-        content: [{ type: "text", text: `still running: ${secs}s elapsed (${job.scope}, ${job.repoPath}). Reviews typically take 2-15 minutes — poll again in a minute or two. Cancel with {"jobId": "${jobId}", "cancel": true}.` }],
-        structuredContent: { jobId, status: "running", elapsedSec: secs },
+        content: [{ type: "text", text: lines.join("\n") }],
+        structuredContent: { jobId, status: "running", elapsedSec: secs, subagentsSoFar: sofar },
       };
     }
     if (cancel) return { content: [{ type: "text", text: `job ${jobId} already finished — nothing to cancel.` }] };
@@ -1267,7 +1307,7 @@ server.tool(
   },
   async (args, extra) => {
     const { sessionId, message, model, timeoutMinutes } = args;
-    const maxBudgetUsd = args.maxBudgetUsd ?? (envBudgetOverride() ? ENV.maxBudgetUsd : budgetDefaultForEffort("medium"));
+    const maxBudgetUsd = args.maxBudgetUsd ?? ENV.maxBudgetUsd;
 
     const langCheck = validateLanguage(args.outputLanguage);
     if (!langCheck.ok) return err(langCheck.error);

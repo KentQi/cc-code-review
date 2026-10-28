@@ -94,8 +94,8 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `ultracode` | `false` | - | **Ultracode mode**: writes `ultracode: true` into the `--settings` file, enabling claude's standing dynamic-workflow orchestration (every substantive step via the Workflow tool, multi-agent, token cost no object). Orthogonal to effort; older CLIs ignore the key (`workflow_runs` in the result shows whether it took effect) |
 | `model` | - | - | model override (`--model` passthrough) |
 | `maxTurns` | `80` | 4–200 | agentic turn cap |
-| `timeoutMinutes` | `20` | 1–60 | hard timeout |
-| `maxBudgetUsd` | derived from effort | 0–50 | API spend cap (`--max-budget-usd`). Omitted, it follows the effort: low $3 / medium $5 / high $10 / xhigh $20 / max $25; 0 = disabled; behind third-party gateways this depends on the gateway reporting usage and is estimated at Anthropic list prices — may be inaccurate or trip early |
+| `timeoutMinutes` | `30` | 1–60 | hard timeout — with no spend cap this is the master guard; when it fires, the finished subagent reports are still returned |
+| `maxBudgetUsd` | `0` (no cap) | 0–50 | API spend cap (`--max-budget-usd`). **The default 0 sets NO cap at any effort level**: a cap stops the parent before it synthesizes, while every finished subagent report is already captured incrementally and a 429-killed agent is recovered from its output_file transcript — a cap only throws away paid work. `timeoutMinutes` and `maxTurns` are the guards. Set a number to opt into a hard stop; env `CLAUDE_REVIEW_MAX_BUDGET_USD` overrides |
 | `installSkillIfMissing` | `true` | - | auto-install the skill when missing |
 
 Returns (async by default: a jobId (<1s) plus the preflight verdict, with the report fetched via claude_review_status(jobId); with waitForResult: true the synchronous form below applies): a markdown report (Review Summary / Findings / Notes) + each of the 5 reviewer subagents' own reports (`## Reviewer subagent reports`) + metadata (`session_id`, spend, turns, log path, model provenance). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
@@ -210,7 +210,9 @@ Tip: if the host environment has leftover `ANTHROPIC_API_KEY` and friends that `
 
 ## Cost & duration
 
-- Every real review consumes Claude credits (through your subscription/gateway). With the default effort=max the diff-sized fleet is 2–8+ reviewers (a max run reaches 10-15+ with verification): typically $3–25 and 2–15 minutes; explicit `effort: "low"` drops it to roughly $0.3–3. `maxBudgetUsd` is the backstop — omitted, it follows the effort (low $3 / medium $5 / high $10 / xhigh $20 / max $25; env `CLAUDE_REVIEW_MAX_BUDGET_USD` overrides).
+- Every real review consumes Claude credits (through your subscription/gateway). With the default effort=max the diff-sized fleet is 2–8+ reviewers (a max run reaches 10-15+ with verification): typically $3–25 and 2–15 minutes; explicit `effort: "low"` drops it to roughly $0.3–3. The default is **no spend cap** (`maxBudgetUsd: 0`); `timeoutMinutes` is the guard.
+- **Incremental capture**: each reviewer subagent's report is appended to `%TEMP%/cc-code-review/subagents-*.jsonl` (one line per subagent) the moment it lands, and is visible via `claude_review_status` while the run continues — the native skill only reports after the whole fleet finishes, but a 429 / timeout / cancel can interrupt it; finished reports come back with the error.
+- **429 recovery**: an agent killed by a rate limit / quota exhaustion is salvaged from the `output_file` transcript named in its launch acknowledgement (marked `partial (output_file)`), so tokens already spent are not wasted.
 - `claude_review_env` and version/flag probes are free (results are cached).
 
 ## Using it from ZCode
@@ -223,10 +225,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (236, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (234, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 15 MECE cases (83 checks; ultracode/workflow + fleet scaling e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 17 MECE cases (93 checks; ultracode/workflow + fleet scaling e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)
 node scripts/cancel-test.mjs <repoPath>         # is the process tree killed right after cancel (billed, a few cents)

@@ -89,13 +89,13 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `outputLanguage` | `中文` | - | report language |
 | `postToPR` | `false` | - | additionally post the summary back to the PR via `gh pr comment` (by default the report is only returned, nothing leaves the machine) |
 | `fix` | `false` | - | **fix mode**: after the report, edit repo files to fix the findings (only Edit/Write unlocked, **zero git write commands**, no commits; `.git/**`, `.env*` and secret files are all in the deny list — blocking verified on a real CLI) |
-| `effort` | `high` | low/medium/high/xhigh/max | **model reasoning effort**, same levels as Claude Code's native `--effort`; degrades to think/ultrathink keywords when the CLI lacks the flag (never both at once) |
+| `effort` | `max` | low/medium/high/xhigh/max | **model reasoning effort**, same levels as Claude Code's native `--effort`; defaults to max (deepest, slowest, priciest) — pass low/medium explicitly for a fast, cheap pass; degrades to think/ultrathink keywords when the CLI lacks the flag (never both at once) |
 | `reviewLevel` | derived from `effort` | low/medium/high/max | **the review's own depth** — the same argument the native `/code-review low\|high\|max` takes. Sizes the finder fleet from the diff: about `max(2, min(8, ceil(lines/150)))` (low 2-3 / medium 3-5 / high 4-8 / max 5-8; a max run reaches 10-15+ agents with verification). A separate knob from `effort` and `ultracode` |
 | `ultracode` | `false` | - | **Ultracode mode**: writes `ultracode: true` into the `--settings` file, enabling claude's standing dynamic-workflow orchestration (every substantive step via the Workflow tool, multi-agent, token cost no object). Orthogonal to effort; older CLIs ignore the key (`workflow_runs` in the result shows whether it took effect) |
 | `model` | - | - | model override (`--model` passthrough) |
 | `maxTurns` | `80` | 4–200 | agentic turn cap |
 | `timeoutMinutes` | `20` | 1–60 | hard timeout |
-| `maxBudgetUsd` | `5` | 0–50 | API spend cap (`--max-budget-usd`, 0 = disabled; behind third-party gateways this depends on the gateway reporting usage and is estimated at Anthropic list prices — may be inaccurate or trip early) |
+| `maxBudgetUsd` | derived from effort | 0–50 | API spend cap (`--max-budget-usd`). Omitted, it follows the effort: low $3 / medium $5 / high $10 / xhigh $20 / max $25; 0 = disabled; behind third-party gateways this depends on the gateway reporting usage and is estimated at Anthropic list prices — may be inaccurate or trip early |
 | `installSkillIfMissing` | `true` | - | auto-install the skill when missing |
 
 Returns (async by default: a jobId (<1s) plus the preflight verdict, with the report fetched via claude_review_status(jobId); with waitForResult: true the synchronous form below applies): a markdown report (Review Summary / Findings / Notes) + each of the 5 reviewer subagents' own reports (`## Reviewer subagent reports`) + metadata (`session_id`, spend, turns, log path, model provenance). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
@@ -210,7 +210,7 @@ Tip: if the host environment has leftover `ANTHROPIC_API_KEY` and friends that `
 
 ## Cost & duration
 
-- Every real review consumes Claude credits (through your subscription/gateway), typically 2–15 minutes and $0.3–5 depending on diff and effort; `maxBudgetUsd` is the backstop.
+- Every real review consumes Claude credits (through your subscription/gateway). With the default effort=max the diff-sized fleet is 2–8+ reviewers (a max run reaches 10-15+ with verification): typically $3–25 and 2–15 minutes; explicit `effort: "low"` drops it to roughly $0.3–3. `maxBudgetUsd` is the backstop — omitted, it follows the effort (low $3 / medium $5 / high $10 / xhigh $20 / max $25; env `CLAUDE_REVIEW_MAX_BUDGET_USD` overrides).
 - `claude_review_env` and version/flag probes are free (results are cached).
 
 ## Using it from ZCode
@@ -223,10 +223,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (229, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (67, free) + audit-fix unit tests (236, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 14 MECE cases (80 checks; ultracode/workflow + fleet scaling e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 15 MECE cases (83 checks; ultracode/workflow + fleet scaling e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)
 node scripts/cancel-test.mjs <repoPath>         # is the process tree killed right after cancel (billed, a few cents)

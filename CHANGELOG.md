@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.12.0 — 2026-10-28
+
+- **`effort` now defaults to `max`** — the deepest review is the default experience (the previous `high` default under-delivered for a tool whose whole point is thoroughness). Pass `low`/`medium` explicitly when you want a fast, cheap pass.
+- **An omitted `maxBudgetUsd` follows the effort**: low $3 / medium $5 / high $10 / xhigh $20 / max $25 (env `CLAUDE_REVIEW_MAX_BUDGET_USD` still overrides). Without this, the new max default met the old flat $5 cap and most real runs were stopped by `error_max_budget_usd` before the parent synthesized — exactly the failure mode the 1.11.0 audit round hit. The derived default always stays within the schema's 0–50 range.
+- `reviewLevel` continues to derive from effort, so a default call now runs at review level max: a diff-sized finder fleet (2–8+) plus verification agents, i.e. 10–15+ subagents on a large diff.
+- The tool description and both READMEs no longer advertise a fixed five subagents; the cost guidance now reflects the max default ($3–25 typical, $0.3–3 at low).
+- Suites: shell-guard 67, audit-fixes 236 (+7: budget defaults), validate 16, cross-cases 83/83 — new C15 locks that a default call really passes `--effort max` and `--max-budget-usd 25` to the CLI (the stub echoes its argv).
+
 ## 1.11.1 — 2026-10-28
 
 Fixes from the atomic audit of the 1.11.0 requirement set (the MCP auditing itself at effort=max / reviewLevel=max; the diff-sized fleet worked as designed — 12 reviewer subagents dispatched and all 12 reports captured before the run's own $30 budget cap; 4 of 12 reviewers reported before the cap, every finding verified against HEAD before fixing):

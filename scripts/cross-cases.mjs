@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * cc-loop cross-case suite — 14 MECE cases over the whole MCP surface.
- * C1-C8, C10-C14 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
+ * cc-loop cross-case suite — 15 MECE cases over the whole MCP surface.
+ * C1-C8, C10-C15 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
  * paid end-to-end and only runs with --paid (CC_LOOP_PAID=1).
  * Exit 0 iff every executed case passes.
  */
@@ -431,7 +431,7 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
     JSON.stringify(sc.subagents || []).slice(0, 200));
   check("C13", "provenance survives the error path", sc.modelProvenance?.substituted === true, JSON.stringify(sc.modelProvenance || {}).slice(0, 200));
   check("C13", "accounting survives the error path", !!sc.modelUsage && sc.subagentStats?.completed === 4, JSON.stringify({ modelUsage: sc.modelUsage, stats: sc.subagentStats }).slice(0, 300));
-  check("C13", "the error-path TEXT carries the run metadata lines", /- review_level: high/.test(text) && /- ultracode:/.test(text) === false && /_run metadata_/.test(text), text.slice(0, 400));
+  check("C13", "the error-path TEXT carries the run metadata lines", /- review_level: max/.test(text) && /- ultracode:/.test(text) === false && /_run metadata_/.test(text), text.slice(0, 400));
   s.kill();
 }
 
@@ -455,7 +455,7 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   check("C14", "workflow dispatches are counted", sc.workflowRuns === 1, `workflowRuns=${sc.workflowRuns}`);
   check("C14", "the metadata marks ultracode and workflow runs", /ultracode: on/.test(text) && /workflow_runs: 1/.test(text), text.slice(0, 300));
   // review_level defaults from effort (high here) and reaches the metadata.
-  check("C14", "review_level defaults from effort and is reported", sc.reviewLevel === "high" && /- review_level: high/.test(text), text.slice(0, 400));
+  check("C14", "review_level defaults from effort (now max) and is reported", sc.reviewLevel === "max" && /- review_level: max/.test(text), text.slice(0, 400));
   s.kill();
 }
 
@@ -479,6 +479,25 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   await s.call("claude_review_env", {}); // runs cleanupGuardSettings()
   const after = ours().length;
   check("C12", "a pre-run refusal does not leak the guard settings file", after <= before, `before=${before} after=${after} [${ours().join(",")}]`);
+  s.kill();
+}
+
+/* ================= C15 defaults: effort=max and its derived budget reach the CLI ================= */
+{
+  // effort defaults to max (deepest review), and an omitted maxBudgetUsd follows
+  // the effort instead of the old flat $5 — which used to stop max-effort runs
+  // before the parent synthesized. The stub echoes its argv so this is exact.
+  const echoArgs = path.join(tmp, `stub-argv-c15-${process.pid}.json`);
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_ECHO_ARGS: echoArgs });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c15"), scope: "last-commit", waitForResult: true });
+  let argv = [];
+  try { argv = JSON.parse(fs.readFileSync(echoArgs, "utf8")); } catch { /* missing */ }
+  const flag = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
+  check("C15", "effort defaults to max and is passed as --effort", flag("--effort"), "max");
+  check("C15", "an omitted budget follows the effort (max -> 25)", flag("--max-budget-usd"), "25");
+  const sc = r.result?.structuredContent || {};
+  check("C15", "the result reports the max review level", sc.reviewLevel === "max", JSON.stringify(sc.reviewLevel));
   s.kill();
 }
 

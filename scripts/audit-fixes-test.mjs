@@ -10,7 +10,7 @@
 import {
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools,
   postPROnlyTools, buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
-  deriveReviewLevel, finderFleetRule,
+  deriveReviewLevel, finderFleetRule, budgetDefaultForEffort,
 } from "../src/prompt.js";
 import {
   versionAtLeast, PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN,
@@ -566,6 +566,20 @@ check("hook allows a plain git diff",
   check("prompt carries the reviewer fleet rule", /Reviewer fleet \(this run's level: max\)/.test(prompt), true);
   check("prompt carries the diff-sized formula", /max\(5, min\(8, ceil\(lines\/150\)\)\)/.test(prompt), true);
   check("prompt says five is not a cap", /10-15\+ subagents/.test(prompt), true);
+}
+
+/* ---------------- the spend cap follows the effort ---------------- */
+{
+  // effort defaults to max; a flat $5 cap used to stop those runs before the
+  // parent synthesized. The derived default must scale with the effort.
+  check("budget default: low", budgetDefaultForEffort("low"), 3);
+  check("budget default: medium", budgetDefaultForEffort("medium"), 5);
+  check("budget default: high", budgetDefaultForEffort("high"), 10);
+  check("budget default: xhigh", budgetDefaultForEffort("xhigh"), 20);
+  check("budget default: max", budgetDefaultForEffort("max"), 25);
+  check("budget default: unknown effort falls back to high's", budgetDefaultForEffort("nope"), 10);
+  check("every derived default stays within the schema cap of 50",
+    ["low", "medium", "high", "xhigh", "max"].every((e) => budgetDefaultForEffort(e) <= 50), true);
 }
 
 /* ---------------- the review allowlist covers native workflow orchestration ---------------- */

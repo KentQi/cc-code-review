@@ -32,6 +32,12 @@ if (args.includes("--help")) {
 
 // STUB_ECHO_SETTINGS=<file>: copy the --settings JSON to that path so a test
 // can assert what the MCP actually handed claude (e.g. the ultracode key).
+// STUB_ECHO_ARGS=<file>: write the argv JSON so a test can assert what the MCP
+// actually passed (default effort, derived budget, ...).
+if (process.env.STUB_ECHO_ARGS) {
+  try { fs.writeFileSync(process.env.STUB_ECHO_ARGS, JSON.stringify(args)); } catch { /* best effort */ }
+}
+
 // STUB_EMIT_WORKFLOW=1: emit one Workflow tool_use, as ultracode runs do.
 if (process.env.STUB_ECHO_SETTINGS) {
   const i = args.indexOf("--settings");

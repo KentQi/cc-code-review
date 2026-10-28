@@ -36,7 +36,7 @@ import {
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools, postPROnlyTools,
-  deriveReviewLevel,
+  deriveReviewLevel, budgetDefaultForEffort,
 } from "./prompt.js";
 import { skillStatus, installBundledSkill, userSkillDir } from "./skill.js";
 
@@ -332,6 +332,11 @@ function subagentReportsText(reports, cap = 4000) {
   return `## Reviewer subagent reports (${reports.length} dispatched)\n\n${blocks.join("\n\n")}`;
 }
 
+/** CLAUDE_REVIEW_MAX_BUDGET_USD set? Then it wins over the effort-derived default. */
+function envBudgetOverride() {
+  return process.env.CLAUDE_REVIEW_MAX_BUDGET_USD != null && String(process.env.CLAUDE_REVIEW_MAX_BUDGET_USD).trim() !== "";
+}
+
 function logNoteOf(logFile) {
   return typeof logFile === "string" ? `\n\n- full log: ${logFile}` : `\n\n- full log: ${logFile?.error || "unavailable"}`;
 }
@@ -439,7 +444,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.11.1";
+const SERVER_VERSION = "1.12.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -721,7 +726,7 @@ function describeSkill(status) {
 
 server.tool(
   "claude_code_review",
-  "Run Claude Code's code-review skill (5 parallel reviewer subagents, 0-100 confidence scoring, keeps findings >=80) " +
+  "Run Claude Code's code-review skill (a diff-sized fleet of parallel reviewer subagents, 0-100 confidence scoring, keeps findings >=80) " +
   "on a repository and return the markdown report. Costs Claude API credits; a run typically takes 2-15 minutes. " +
   "Afterwards, fix the code and re-run to verify, or use claude_review_followup with the returned session_id.",
   {
@@ -735,8 +740,8 @@ server.tool(
     postToPR: z.boolean().default(false).describe("Also post the summary comment to the GitHub PR via gh (default false — report only)"),
     fix: z.boolean().default(false)
       .describe("Fix mode: after the report, Claude Code edits the repo files to fix the confirmed findings (Edit only, no git commands, no commit; .git and secret paths are deny-listed). Adds a '## Fixes Applied' section."),
-    effort: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high")
-      .describe("Review effort / reasoning level, same scale as Claude Code (--effort): low..max. max/xhigh = exhaustive deep review, slower and pricier."),
+    effort: z.enum(["low", "medium", "high", "xhigh", "max"]).default("max")
+      .describe("Review effort / reasoning level, same scale as Claude Code (--effort): low..max. Default max = exhaustive deep review (slower and pricier). Omit for the deepest default; pass low/medium for a fast, cheap pass."),
     reviewLevel: z.enum(["low", "medium", "high", "max"]).optional()
       .describe("The REVIEW's own depth level — the same argument claude's native /code-review command takes. It sizes the reviewer fleet from the diff (about max(2, min(8, ceil(diff_lines/150))) finder subagents; max legitimately fans out 10-15+ with verification agents). Defaults to a mapping of effort (max→max, xhigh/high→high, medium→medium, low→low). Separate knob from the CLI reasoning effort and from ultracode."),
     ultracode: z.boolean().default(false)
@@ -745,7 +750,7 @@ server.tool(
     maxTurns: z.number().int().min(4).max(200).default(80).describe("Agentic turn cap for the review session"),
     timeoutMinutes: z.number().int().min(1).max(60).default(ENV.timeoutMinutes).describe("Hard wall-clock timeout for the run"),
     maxBudgetUsd: z.number().min(0).max(50).optional()
-      .describe(`API spend cap for this run via --max-budget-usd (default ${ENV.maxBudgetUsd}); 0 disables. On third-party gateways this depends on usage data the gateway returns.`),
+      .describe(`API spend cap for this run via --max-budget-usd. Omit and it follows the effort: low $3 / medium $5 / high $10 / xhigh $20 / max $25 (env CLAUDE_REVIEW_MAX_BUDGET_USD overrides). 0 disables. On third-party gateways this depends on usage data the gateway returns.`),
     installSkillIfMissing: z.boolean().default(ENV.autoInstallSkill)
       .describe("Auto-install the bundled code-review skill into ~/.claude/skills when missing (default true)"),
     waitForResult: z.boolean().default(false)
@@ -756,7 +761,7 @@ server.tool(
       scope, baseRef, focus, postToPR, fix, effort, ultracode, reviewLevel,
       model, maxTurns, timeoutMinutes, installSkillIfMissing,
     } = args;
-    const maxBudgetUsd = args.maxBudgetUsd ?? ENV.maxBudgetUsd;
+    const maxBudgetUsd = args.maxBudgetUsd ?? (envBudgetOverride() ? ENV.maxBudgetUsd : budgetDefaultForEffort(effort));
 
     const prCheck = validatePr(args.pr);
     if (!prCheck.ok) return err(prCheck.error);
@@ -1262,7 +1267,7 @@ server.tool(
   },
   async (args, extra) => {
     const { sessionId, message, model, timeoutMinutes } = args;
-    const maxBudgetUsd = args.maxBudgetUsd ?? ENV.maxBudgetUsd;
+    const maxBudgetUsd = args.maxBudgetUsd ?? (envBudgetOverride() ? ENV.maxBudgetUsd : budgetDefaultForEffort("medium"));
 
     const langCheck = validateLanguage(args.outputLanguage);
     if (!langCheck.ok) return err(langCheck.error);

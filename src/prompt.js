@@ -22,6 +22,7 @@
  *  - WebFetch is deliberately absent: the review never needs the network, and
  *    it would be an exfiltration/SSRF channel for repo-controlled text
  */
+import { bashAllowRules } from "./shell-guard.js";
 
 /** Fallback thinking keywords when the CLI lacks --effort (low..max). */
 const EFFORT_KEYWORDS = {
@@ -216,22 +217,19 @@ export function reviewAllowedTools() {
     // Newer CLIs reach for the Task* tools instead of TodoWrite; without these
     // the reviewer burns turns on denied calls before falling back.
     "TaskCreate", "TaskGet", "TaskList", "TaskUpdate",
-    "Bash(git status:*)", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git log:*)",
-    "Bash(git blame:*)", "Bash(git branch -a)", "Bash(git branch --show-current)",
-    "Bash(git branch -vv)", "Bash(git rev-parse:*)",
-    // NB: `git merge-base` is deliberately NOT granted. The deny rule
-    // `Bash(git merge:*)` prefix-matches it (deny beats allow), and `git merge`
-    // mutates the working tree, so that deny must stay broad. The prompt uses
-    // `git log <base>..HEAD` / `git diff <base>...HEAD` instead — the two-dot and
-    // three-dot forms express exactly the same thing without the command.
-    "Bash(git remote -v)", "Bash(git remote get-url:*)", "Bash(git remote show:*)",
-    "Bash(git ls-files:*)", "Bash(git stash list:*)", "Bash(git stash show:*)",
-    // `git symbolic-ref` is NOT allowed: it also WRITES (`git symbolic-ref HEAD
-    // refs/heads/x` moves the branch pointer), so it is denied instead — see
-    // reviewDisallowedTools. Default-branch detection uses `git rev-parse`.
-    "Bash(find:*)", "Bash(rg:*)",
-    "Bash(gh pr view:*)", "Bash(gh pr diff:*)", "Bash(gh pr list:*)",
-    "Bash(gh pr checks:*)", "Bash(gh repo view:*)",
+    // The Bash surface is defined ONCE, in shell-guard.js, and rendered here as
+    // permission rules. The hook decides the same list per segment, so the two
+    // layers cannot drift. NB: `git merge-base` is deliberately absent — the
+    // deny rule `Bash(git merge:*)` prefix-matches it and `git merge` mutates
+    // the tree; the prompt uses `git log <base>..HEAD` instead. `git
+    // symbolic-ref` is absent too: it also WRITES the branch pointer.
+    ...bashAllowRules(),
+    // `cd` is a no-op in a review (every call already starts in the repo root),
+    // but models write `cd <repo> && git show HEAD`. The permission engine
+    // gates the FIRST command of a string, so without this rule that shape is
+    // denied before the hook — which can only subtract — ever sees it. The hook
+    // allows `cd` only when it resolves to the repo root.
+    "Bash(cd:*)",
   ];
 }
 

@@ -39,8 +39,23 @@ branch, (3) the last commit.
    a brief across finders (per file / per concern) so every finder gets a
    focused scope, and add verification subagents for step 5. A max-level review
    legitimately runs 10-15+ subagents in total. Give each the diff (or the exact
-   commands to obtain it) plus its brief. Every subagent returns ONLY a JSON
-   list of issues:
+   commands to obtain it) plus its brief.
+
+   **Include this execution contract verbatim in EVERY subagent prompt** — a
+   subagent does not see this file, and a subagent that guesses at its shell
+   burns turns on calls the guard refuses:
+
+   > Your working directory is already the repository root. Every Bash call runs
+   > there, so never prefix a command with `cd`, `git -C`, or an absolute path.
+   > Allowed Bash programs: git status/diff/show/log/blame/rev-parse/ls-files,
+   > git branch -a|--show-current|-vv, git remote -v|get-url|show, git stash
+   > list|show, find, rg, and gh pr view|diff|list|checks / gh repo view.
+   > Commands may be combined with `&&`, `;` or `|` as long as EVERY part is one
+   > of those read-only commands (after a pipe: head, tail, cat, wc, uniq, cut,
+   > tr, grep, sort, sed -n). No redirection (`>`, `>>`, `<`), no `$(...)` or
+   > backticks, no `&`. For file contents prefer the Read/Grep/Glob tools.
+
+   Every subagent returns ONLY a JSON list of issues:
    `{"file": "...", "line_range": "12-18", "reason": "...", "category": "..."}`.
 
    - **#1 Conventions** — audit the changes against the CLAUDE.md / AGENTS.md

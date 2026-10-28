@@ -28,7 +28,7 @@ import {
   supportsFlag, supportsStreamJson, supportsPermissionPrompts,
   writeGuardSettings, guardState, guardSelfTest, hookScriptPath, removeGuardSettings,
   cleanupGuardSettings, settingsParseProblem, peekSettingsEnv, markGuardSettingsInFlight,
-  analyseCommand, gitWriteFlagReason, shellGuardNote, shellChainingNote,
+  analyseCommand, shellGuardNote, shellChainingNote,
   probeGateway, gatewayTarget, authEnvResidue, modelEnvOverrides, gitPreflight,
   buildClaudeEnv, repoRunsGitPrograms, gitSpawnOpts, GIT_HARDENING_ARGS,
   buildModelProvenance, resultFacts,
@@ -496,7 +496,7 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
-const SERVER_VERSION = "1.13.2";
+const SERVER_VERSION = "1.14.0";
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -516,9 +516,9 @@ const server = new McpServer(
  *
  * Two independent things can silently disarm a review:
  *  1. the PreToolUse guard is off, unwritable, or installed-but-not-firing. It is
- *     the only mechanism that blocks shell-chained Bash commands and writes
- *     outside the repo, so a run without it is refused unless the operator sets
- *     CLAUDE_REVIEW_ALLOW_UNGUARDED=1;
+ *     the only mechanism that polices every segment of a Bash command and the
+ *     only one that scopes writes to the repo, so a run without it is refused
+ *     unless the operator sets CLAUDE_REVIEW_ALLOW_UNGUARDED=1;
  *  2. `--permission-mode manual` (>= 2.1.200) and `--permission-prompts none`
  *     (>= 2.1.259) are newer-CLI options — passing either to an older claude
  *     makes it exit with "unknown option", which the caller sees as an opaque
@@ -539,7 +539,7 @@ async function prepareRunHardening(cli, { ultracode = false } = {}) {
         ok: false,
         error: guard.state === "off"
           ? `Refusing to run unguarded: the PreToolUse shell guard is switched off (${guard.reason}). ` +
-            `It is the only thing that blocks shell-chained Bash commands and writes outside the reviewed repo. ` +
+            `It is the only thing that polices every segment of a Bash command and the only thing that keeps writes inside the reviewed repo. ` +
             `Unset CLAUDE_REVIEW_SHELL_GUARD (or set it to 1), or set CLAUDE_REVIEW_ALLOW_UNGUARDED=1 to accept the risk.`
           : `Refusing to run unguarded: the PreToolUse shell guard could not be installed (${guard.reason}). ` +
             `Check that ${hookScriptPath()} exists and that node can spawn it, or set ` +
@@ -1058,7 +1058,7 @@ server.tool(
 
     // Under `--permission-mode manual` a missing allowlist entry shows up here
     // instead of aborting the run — surface it, or a silently degraded review
-    // (e.g. the 5 reviewer subagents never ran) would look like a clean result.
+    // (e.g. the reviewer subagents never ran) would look like a clean result.
     const denials = Array.isArray(j.permission_denials) ? j.permission_denials : [];
     const deniedCommands = denials.map((d) => d?.tool_input?.command).filter((c) => typeof c === "string");
     // A denial the guard produced is the guard doing its job, not a degraded
@@ -1066,7 +1066,9 @@ server.tool(
     // retry differently. Keeping the two apart is what stops the warning from
     // crying wolf. The predicate is the same one the hook applies, so "reported
     // as blocked" and "actually blocked" cannot disagree.
-    const guardWouldBlock = (cmd) => !analyseCommand(cmd).ok || gitWriteFlagReason(cmd) !== null;
+    // Same options as the hook: `cd <repoRoot>` is allowed, so it must not be
+    // reported as a guard block here either.
+    const guardWouldBlock = (cmd) => !analyseCommand(cmd, { repoRoot: repoPath }).ok;
     const guardBlocked = deniedCommands.filter(guardWouldBlock);
     const realDenials = denials.filter((d) => {
       const cmd = d?.tool_input?.command;

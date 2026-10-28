@@ -126,6 +126,22 @@ if (args.includes("stream-json")) {
       })),
     },
   });
+  // 2.1.x also runs `Monitor` background tasks and emits a task_notification
+  // for them ("… stream ended"). It is NOT a reviewer subagent.
+  if (process.env.STUB_EMIT_MONITOR === "1") {
+    say({
+      type: "assistant",
+      message: { role: "assistant", model: "stub-main-model", content: [{
+        type: "tool_use", id: "stub-tool-monitor-1", name: "Monitor",
+        input: { description: "wait for second finder agent output" },
+      }] },
+    });
+    say({
+      type: "system", subtype: "task_notification", task_id: "stub-monitor-1",
+      tool_use_id: "stub-tool-monitor-1", status: "completed",
+      summary: 'Monitor "wait for second finder agent output" stream ended',
+    });
+  }
   if (lostOutputFile) {
     // The lost agent's transcript: a subagent JSONL whose last assistant text
     // is the work a 429 would otherwise have thrown away.

@@ -645,6 +645,24 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   s.kill();
 }
 
+/* ================= C20 a Monitor task is not a reviewer subagent ================= */
+{
+  // Observed live (paid smoke, 2.1.311): the CLI runs a `Monitor` background
+  // task alongside the fleet and emits a task_notification for it. Recorded as
+  // a reviewer it looked like a sixth subagent whose "report" was
+  // `Monitor "…" stream ended` — while claude's own subagent_stats said 2.
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_EMIT_MONITOR: "1" });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c20"), scope: "last-commit", waitForResult: true });
+  const subs = r.result?.structuredContent?.subagents || [];
+  check("C20", "the Monitor task is not counted as a reviewer", subs.length === 5, JSON.stringify(subs.length));
+  check("C20", "no reviewer report is the Monitor notice",
+    subs.every((a) => !/stream ended/.test(String(a.report || ""))), JSON.stringify(subs.map((a) => a.description)));
+  check("C20", "every reviewer record is a real dispatch",
+    subs.every((a) => a.subagentType === "general-purpose"), JSON.stringify(subs.map((a) => a.subagentType)));
+  s.kill();
+}
+
 /* ---------- summary ---------- */
 const failed = results.filter((r) => !r.ok);
 const skipped = results.filter((r) => r.skipped);

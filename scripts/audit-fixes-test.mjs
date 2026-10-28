@@ -502,6 +502,12 @@ check("hook allows a plain git diff",
     type: "assistant",
     message: { role: "assistant", content: [{ type: "tool_use", id: "b1", name: "Bash", input: { command: "git status" } }, { type: "tool_use", id: "b2", name: "Bash", input: { command: "git diff" } }] },
   }).bashCommands, ["git status", "git diff"]);
+  // Which tool owns an id: task_notifications are keyed by tool_use_id, and a
+  // Monitor task's notification is not a reviewer report (observed live).
+  check("streamEventFacts maps every tool_use id to its tool name", streamEventFacts({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "tool_use", id: "a1", name: "Agent", input: {} }, { type: "tool_use", id: "m1", name: "Monitor", input: {} }] },
+  }).toolUses, [{ id: "a1", name: "Agent" }, { id: "m1", name: "Monitor" }]);
 
   const subMsg = streamEventFacts({
     type: "assistant",

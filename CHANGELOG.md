@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.13.2 — 2026-10-28
+
+Found by the first real-CLI smoke after 1.13.1 (claude 2.1.311, effort=low, reviewLevel=low, $0.47-0.63/run): a background task that is not a reviewer was being counted as one.
+
+- **A `Monitor` task is no longer reported as a sixth reviewer subagent.** 2.1.x runs `Monitor` background tasks (e.g. "wait for second finder agent output") and emits a `system/task_notification` for them, keyed by `tool_use_id`. The MCP treated every such notification as a reviewer report, so a live run reported 3 subagents — the two real finders plus a record with no description whose "report" was `Monitor "…" stream ended` — while claude's own `subagent_stats` said 2. The stream parser now maps every `tool_use` id to its tool name and only accepts a notification whose owner is `Agent`/`Task` (an id never seen in the stream is still accepted, so a truncated stream cannot drop a real report). New C20 locks it; the `toolUses` fact has its own unit check.
+- **The substitution note no longer says "5 parallel expert reviewers"** (the last stale fixed-five copy, this one inside the runtime warning text).
+- **New `npm run test:paid`** (`scripts/paid-smoke.mjs`): one REAL review through the installed CLI against a throwaway repo with three planted bugs (SQL injection, swallowed error, pagination off-by-one), effort/reviewLevel low, 8-minute timeout, no spend cap unless `--cap=<usd>` is passed. It asserts the report came back, that reports were visible incrementally while the run continued, and that the JSONL is on disk — the checks the stub suite cannot make. Costs real credits; not part of `npm test`.
+- Suites: shell-guard 90, audit-fixes 242 (+1), validate 16, cross-cases 108/108 (new C20).
+
 ## 1.13.1 — 2026-10-28
 
 Verification round on the 1.13.0 work: every finding from the multi-expert audit was re-checked against the code and the ones that were real are fixed here, with a regression test each.

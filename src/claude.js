@@ -581,8 +581,16 @@ export function streamEventFacts(obj) {
   const agentDispatches = [];
   const agentResults = [];
   const workflowDispatches = [];
+  const toolUses = [];
   for (const block of content) {
     if (block?.type !== "tool_use" && block?.type !== "tool_result") continue;
+    if (block.type === "tool_use" && typeof block.id === "string") {
+      // Which tool owns this id. Task notifications are keyed by tool_use_id,
+      // and not every background task is a reviewer: 2.1.x also runs a
+      // `Monitor` task, whose notification ("… stream ended") used to be
+      // recorded as a sixth reviewer subagent.
+      toolUses.push({ id: block.id, name: String(block.name ?? "") });
+    }
     if (block.type === "tool_use" && block.name === "Bash" && typeof block.input?.command === "string") {
       bashCommands.push(block.input.command);
     }
@@ -608,6 +616,7 @@ export function streamEventFacts(obj) {
   if (agentDispatches.length) facts.agentDispatches = agentDispatches;
   if (agentResults.length) facts.agentResults = agentResults;
   if (workflowDispatches.length) facts.workflowDispatches = workflowDispatches;
+  if (toolUses.length) facts.toolUses = toolUses;
   return facts;
 }
 
@@ -778,8 +787,8 @@ export function buildModelProvenance({ requestedModel, mainModels = [], subagent
       `⚠ MODEL SUBSTITUTION — this review did NOT run on the requested Claude model (${parts.join(" · ")}). ` +
       `A local gateway (CC Switch / ANTHROPIC_BASE_URL) or ~/.claude/settings.json env ` +
       `(CLAUDE_CODE_SUBAGENT_MODEL, ANTHROPIC_DEFAULT_*_MODEL_NAME) rewrites the model, so this output is NOT ` +
-      `comparable to the same prompt run directly in Claude Code, and the "5 parallel expert reviewers" are ` +
-      `instances of the substituted model. claude itself logged ` +
+      `comparable to the same prompt run directly in Claude Code, and every reviewer subagent is an instance of ` +
+      `the substituted model. claude itself logged ` +
       `[claude-code:unrecognized_model] for ${unrecognized.length || "the"} substituted request(s). ` +
       `Switch the provider back (or unset those env keys) and re-run for a Claude-native review.`;
   }
@@ -1294,6 +1303,7 @@ export function runClaude({
     const bashCommands = [];
     const agentDispatches = [];
     const agentResults = new Map();
+    const toolNames = new Map(); // tool_use id -> tool name (Agent/Task/Monitor/…)
     const taskNotifications = new Map();
     const workflowDispatches = [];
     const notifiedReports = new Map(); // tool_use id -> the record emitted for it
@@ -1353,6 +1363,7 @@ export function runClaude({
       const facts = streamEventFacts(obj);
       if (facts.result) { resultEvent = facts.result; return; }
       if (facts.bashCommands) bashCommands.push(...facts.bashCommands);
+      if (facts.toolUses) for (const t of facts.toolUses) toolNames.set(t.id, t.name);
       if (facts.agentDispatches) agentDispatches.push(...facts.agentDispatches);
       if (facts.agentResults) for (const r of facts.agentResults) {
         agentResults.set(r.id, r.text);
@@ -1360,16 +1371,22 @@ export function runClaude({
         // for the recovery pass if this agent never reports.
         if (r.ack?.outputFile) dispatchOutputFiles.set(r.id, r.ack.outputFile);
       }
-      if (facts.taskNotification) {
-        const n = facts.taskNotification;
+      const n = facts.taskNotification;
+      if (n) {
         taskNotifications.set(n.toolUseId, n);
         if (n.outputFile) dispatchOutputFiles.set(n.toolUseId, n.outputFile);
       }
       if (facts.workflowDispatches) workflowDispatches.push(...facts.workflowDispatches);
       if (facts.model) (facts.model.subagent ? subagentModels : mainModels).add(facts.model.model);
+      // Not every background task is a reviewer: 2.1.x also runs `Monitor`
+      // tasks, whose notifications ("… stream ended") are not reports. Only an
+      // id we know belongs to another tool is filtered — an id we have not seen
+      // (truncated stream) is still accepted, because dropping a real report is
+      // worse than keeping one extra.
+      const owner = n ? toolNames.get(n.toolUseId) : null;
+      const reviewerTask = !n || !owner || owner === "Agent" || owner === "Task";
       // One sub finished -> one durable record, right now, not at the end.
-      if (facts.taskNotification) {
-        const n = facts.taskNotification;
+      if (n && reviewerTask) {
         const d = agentDispatches.find((x) => x.id === n.toolUseId);
         // A stopped/failed notification can carry an EMPTY summary (the agent
         // was killed before it wrote one). Its transcript still exists — fall
@@ -1385,7 +1402,7 @@ export function runClaude({
           async: true, status: n.status, report, outputFile: n.outputFile, partial, recovery,
           authoritative: true,
         });
-      } else if (facts.agentResults) {
+      } else if (!n && facts.agentResults) {
         for (const r of facts.agentResults) {
           // Launch ack (strict or loose shape): the report comes later, via a
           // task_notification or the transcript recovery pass.

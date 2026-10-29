@@ -11,6 +11,8 @@ import os from "node:os";
 import { connectServer } from "./lib/mcp-client.mjs";
 
 const serverPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "index.js");
+// The stub CLI keeps the skill round-trip below free and host-independent.
+const STUB = path.join(path.dirname(fileURLToPath(import.meta.url)), "stub-claude.mjs");
 
 // Shared stdio client (audit Q20): JSON-RPC framing / timeout / pending map.
 const srv = connectServer({
@@ -57,6 +59,18 @@ check("multi-line outputLanguage refused", r.result?.isError === true && /single
 // 3b. baseRef that would be parsed as a git option refused (`--output=<file>` writes a file)
 r = await call("claude_code_review", { repoPath: cleanRepo, scope: "branch", baseRef: "--output=/tmp/pwn" });
 check("baseRef starting with '-' refused", r.result?.isError === true && /must not start with "-"/i.test(textOf(r)), textOf(r).slice(0, 200));
+
+// 3b2. ".." / "..." are REVISION RANGE operators, not refs. The prompt appends
+// its own "..HEAD"/"...HEAD", so baseRef="main..x" rendered
+// `git log --oneline main..x..HEAD` and the review silently examined a
+// materially different diff. Only the leading-"-" branch of validateBaseRef was
+// tested; deleting the ".." check left the whole gate green (audit P2-14).
+r = await call("claude_code_review", { repoPath: cleanRepo, scope: "branch", baseRef: "main..x" });
+check("baseRef with '..' (a revision range) refused",
+  r.result?.isError === true && /single ref, not a revision range/i.test(textOf(r)), textOf(r).slice(0, 220));
+r = await call("claude_code_review", { repoPath: cleanRepo, scope: "branch", baseRef: "main...x" });
+check("baseRef with '...' (a revision range) refused",
+  r.result?.isError === true && /single ref, not a revision range/i.test(textOf(r)), textOf(r).slice(0, 220));
 
 // 3c. focus is caller DATA: control characters / absurd length refused before it reaches the prompt
 r = await call("claude_code_review", { repoPath: cleanRepo, focus: "look at this\u0000\u0001 carefully" });
@@ -202,6 +216,37 @@ await withServer({ CLAUDE_REVIEW_SHELL_GUARD: "0", CLAUDE_REVIEW_ALLOW_UNGUARDED
   check("CLAUDE_REVIEW_ALLOW_UNGUARDED=1 overrides the refusal",
     rr.result?.isError === true && /does not exist/i.test(t2) && !/Refusing to run unguarded/i.test(t2), t2.slice(0, 200));
 });
+
+/* ---- 9b. installSkill -> uninstallSkill round trip (audit P2-16) ---- */
+// uninstallSkill=true is how a user un-shadows claude's built-in /code-review:
+// it must delete ONLY the files this server wrote (SKILL.md + the marker) and
+// keep whatever the user added there. It had ZERO coverage — the previous
+// round's crash (a missing import, one call away) was found by reading, not by
+// a test. A throwaway skill dir keeps ~/.claude untouched.
+{
+  const skillDir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "skills-rt-")), "code-review");
+  fs.mkdirSync(skillDir, { recursive: true });
+  fs.writeFileSync(path.join(skillDir, "notes.md"), "user note\n");
+  await withServer({ CLAUDE_CODE_PATH: STUB, CLAUDE_REVIEW_SKILL_DIR: skillDir }, async (call2) => {
+    const installed = await call2("claude_review_env", { installSkill: true });
+    const it = textOf(installed);
+    check("installSkill installs the bundled skill (SKILL.md + ownership marker)",
+      fs.existsSync(path.join(skillDir, "SKILL.md"))
+      && fs.existsSync(path.join(skillDir, "installed-by-cc-code-review"))
+      && /installSkill: installed/.test(it), it.slice(-200));
+    let bundledBytes = 0;
+    try { bundledBytes = fs.statSync(path.join(skillDir, "SKILL.md")).size; } catch { /* asserted below */ }
+    check("installSkill wrote the real bundled pipeline", bundledBytes > 1000, String(bundledBytes));
+    const un = await call2("claude_review_env", { uninstallSkill: true });
+    const ut = textOf(un);
+    check("uninstallSkill removes the two files this server wrote",
+      !fs.existsSync(path.join(skillDir, "SKILL.md"))
+      && !fs.existsSync(path.join(skillDir, "installed-by-cc-code-review")), ut.slice(-200));
+    check("uninstallSkill keeps the user's own file and the directory",
+      fs.existsSync(path.join(skillDir, "notes.md")) && fs.existsSync(skillDir), ut.slice(-200));
+    check("uninstallSkill reports the removal", /uninstallSkill: removed/.test(ut), ut.slice(-200));
+  });
+}
 
 const failed = results.filter((x) => !x.ok);
 console.log(`\n${failed.length === 0 ? "ALL VALIDATION TESTS PASSED" : `${failed.length} FAILED`} (${results.length} checks)`);

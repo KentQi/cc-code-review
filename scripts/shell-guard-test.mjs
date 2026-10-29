@@ -193,6 +193,35 @@ for (const c of SCOPE_BAD) {
 }
 check("a path that does not exist yet is not an escape", analyseCommand("rg -n x src/new-file.js", OPTS).ok, true);
 
+/* ---- P2-12: readers that take a LIST or a REFERENCE FILE ----
+ * `rg --files <dir>` has no pattern, and `find -newer/-samefile <file>` names a
+ * second file the walk only escorts. Both path checks shipped with ZERO
+ * assertions: deleting `&& !noPattern` or a whole FLAG_KINDS.find branch left
+ * every fast suite green while `rg --files /etc` and `find . -newer
+ * /etc/passwd` flipped from DENY to ALLOW (audit P2-12, mutation-tested). */
+fs.writeFileSync(path.join(REPO, "README.md"), "x\n");
+for (const c of [
+  "rg --files /etc",
+  "rg --files -g '*.js' /etc",
+  "rg --files ../other",
+  "find . -newer /etc/passwd",
+  "find . -anewer /etc/passwd",
+  "find . -cnewer /etc/passwd",
+  "find . -samefile /etc/passwd",
+]) {
+  const v = analyseCommand(c, OPTS);
+  check(`block outside path (${JSON.stringify(c)})`, [v.ok, /outside|repository/.test(String(v.reason))], [false, true]);
+}
+for (const c of [
+  "rg --files",
+  "rg --files src",
+  "rg --files -g '*.js' src",
+  "find . -newer README.md",
+  "find src -samefile src/index.js",
+]) {
+  check(`allow in-repo path (${JSON.stringify(c)})`, analyseCommand(c, OPTS).ok, true);
+}
+
 /* ---- the widened read-only explorers keep their write forms closed ---- */
 for (const c of ["git branch -d feature", "git branch -D feature", "git branch -m old new", "git branch -f x HEAD", "git branch --delete x", "git branch --set-upstream-to=origin/x"]) {
   check("block branch write: " + JSON.stringify(c), analyseCommand(c, OPTS).ok, false);

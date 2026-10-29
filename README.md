@@ -48,7 +48,7 @@ ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --
 
 ## 注册到 ZCode（已完成则跳过）
 
-**推荐：一条命令自动配置（v1.7.0 起）**。克隆/安装本仓库后，在里面跑：
+**推荐：一条命令自动配置（v1.7.0 起）**。克隆本仓库（或安装 npm 包——`scripts/init.mjs` 自 v1.18.5 起随包发布）后，在里面跑：
 
 ```bash
 npm install
@@ -88,10 +88,10 @@ npm run init
 | `baseRef` | - | 纯 ref 字符 | `branch` 范围的基线（缺省自动探测默认分支；非法字符会被忽略） |
 | `focus` | - | - | 额外关注点（仅作为评审提示，不会被当作指令执行；**必须单行**） |
 | `outputLanguage` | `中文` | - | 报告语言 |
-| `postToPR` | `false` | - | 额外用 `gh pr comment` 把摘要贴回 PR（默认只返回报告，不外发） |
+| `postToPR` | `false` | - | 额外用 `gh pr comment` 把摘要贴回 PR（默认只返回报告，不外发）。**必须同时给 `pr`**：没有具名 PR 时预检直接拒绝（否则会带着一个无处可写的 GitHub 写权限，且提示词会要求模型猜一个 PR 号） |
 | `fix` | `false` | - | **修复模式**：报告后直接修改仓库文件修复 findings（只放开 Edit/Write，**无任何 git 写命令**，不 commit；`.git/**`、`.env*`、密钥文件均在 deny 列表，实测拦截有效） |
 | `effort` | `max` | low/medium/high/xhigh/max | **模型推理力度**，与 Claude Code 原生 `--effort` 同档位；默认 max（最深、最慢、最贵），想快想省就显式传 `low`/`medium`；CLI 不支持时自动退化为 think/ultrathink 关键词（两者不会叠加） |
-| `reviewLevel` | 由 `effort` 派生 | low/medium/high/max | **评审自身深度**（同原生 `/code-review low\|high\|max` 的参数）。舰队结构与原生 playbook 同为三阶段（finder → 每存活候选 1 个 verifier → sweep），数字与 prompt/SKILL.md 同一套：low = 单遍无子代理（≤4 findings）；medium/high = **8 个 finder**（"3+5" 形态：5 个 brief + 3 个拆分 finder，× 6 候选，findings 上限 8）；max = **10 个 finder**（"5+5" 形态：每个 brief 拆两次，× 8 候选）+ **每个存活候选 1 个 verifier**（CONFIRMED/PLAUSIBLE/REFUTED）+ **1 个 sweep finder**，findings 上限 15。max 的总代理数是结构性的 15+（实测 17），不是硬编码数字 |
+| `reviewLevel` | 由 `effort` 派生 | low/medium/high/max | **评审自身深度**（同原生 `/code-review low\|high\|max` 的参数）。舰队结构与原生 playbook 同为三阶段（finder → 每存活候选 1 个 verifier → sweep），数字由 `src/prompt.js` 的 `FLEET_NUMBERS` 单一来源渲染（工具 schema、prompt、本表同一来源；随包 SKILL.md 不再复述数字，改为指向 run 的 "Reviewer fleet" 行）：low = 单遍无子代理（≤4 findings）；medium/high = **8 个 finder**（"3+5" 形态：5 个 brief + 3 个拆分 finder，× 6 候选，findings 上限 8）；max = **10 个 finder**（"5+5" 形态：每个 brief 拆两次，× 8 候选）+ **每个存活候选 1 个 verifier**（CONFIRMED/PLAUSIBLE/REFUTED）+ **1 个 sweep finder**，findings 上限 15；进入验证的候选上限 20。max 的总代理数是结构性的 15+（实测 17），不是硬编码数字 |
 | `ultracode` | `false` | - | **Ultracode 模式**：通过 `--settings` 写入 `ultracode: true`，启用原生"常驻动态工作流编排"（每个实质任务走 Workflow 工具、多代理、不计 token 成本）；与 effort 正交；旧版 CLI 忽略该键（结果里的 `workflow_runs` 显示是否真正生效） |
 | `model` | - | - | 覆盖模型（`--model` 透传） |
 | `maxTurns` | `80` | 4–200 | agentic 轮数上限 |
@@ -110,7 +110,7 @@ npm run init
 
 拿着上一次返回的 `session_id` 继续对话（`claude --resume`）。
 
-### 4. `claude_review_env` — 环境自检（免费）
+### 4. `claude_review_env` — 环境自检（免费；**不是只读工具**）
 
 CLI 解析结果与来源、版本、`--effort`/`--max-budget-usd` 支持情况、skill 状态、网关连通性（回环网关 TCP 预检）、宿主环境中残留的认证变量告警、`git`/`gh` 可用性、`CLAUDE_CODE_EFFORT_LEVEL` 覆盖告警。首行输出机器可读的 `verdict: OK|NOT_FOUND|MISCONFIGURED`。`installSkill: true` 可手动（重）装 skill。
 
@@ -165,6 +165,16 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 **策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs`（238 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）与 `scripts/p0-regression-test.mjs`（95 条：2026-10 多专家审计的全部 P0 形态——ANSI-C 引用/反斜杠转义/紧贴短选项、`.GIT` 大小写变体、fix 模式持久化路径、仓库自带 git driver 的 RCE 形态、符号链接冻结）锁定——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
 
 重定向（含 `2>/dev/null`）仍然整体拒绝：它是绕过 allowlist 的读写原语，改成"允许读重定向"需要先证明每个目标路径都无害，代价大于收益。需要看输出就直接让命令写到 stdout。
+
+**v1.18.5 补齐的边界（第三轮审计的 7 P0 / 14 P1）**
+
+- **git 选项缩写不再能绕过 deny 表**：`git`/`sort`/`wc`/`rg` 接受无歧义缩写，deny 表现在按"无歧义前缀"匹配，`--cont`（`--contents`）、`--files0`（`--files0-from`）、`--ignore-revs-file`/`--mailmap-file` 等一律拒绝；`find -- <path>` 的 `--` 也按路径校验。
+- **`gh pr comment --body-file/-F`** 的文件参数走仓内校验（`postToPR` 也不例外），不再能把宿主机凭据文件 POST 出去。
+- **`echo` 的引号按字符判定**：只有未加引号的 glob/`~` 会被拒（`echo "prefix"*`、`echo ~"/".ssh/*` DENY），合法字面量（`echo '*'`、`echo 'price: $5'`）仍可用。
+- **仓库配置改为从 git 枚举**：主工作树的 `.git/config.worktree`、`git ls-files` 枚举出的全部 `.gitattributes`（含 `node_modules/` 内）、越界 `[include]` 目标、超过 200 个 include 的仓库，全部拒绝；`protocol.ext.allow`/`protocol.file.allow`/`url.*.insteadOf`/`remote.*.vcs` 被扫描器拒绝，且子进程 git 环境直接中和 `protocol.ext.allow=never`/`protocol.file.allow=never`（`ext::` 传输在评审进程里不可用）。
+- **读边界覆盖 Grep/Glob 与 Bash**：hook 的 matcher 改为 catch-all，`Grep`/`Glob` 的 `path` 与 `Read` 同样受仓内约束与密钥黑名单约束；Bash 命令里引用 `.env`/`id_rsa`/`.ssh/`/`credentials`/`.npmrc`/`.git-credentials` 等密钥路径同样被拒（此前只有 `Read` 工具受限）。
+- **fix 模式的持久化拒绝扩表**：`.husky/**`、`.github/actions/**`、`.gitlab-ci.yml`、`Jenkinsfile`、`Makefile`、`.pre-commit-config.yaml`、`.devcontainer/**`、`.cargo/config(.toml)`、`.circleci/**`、`.npmrc` 与密钥文件均不可写；`package.json` 只在写入内容含 `scripts`/`postinstall`/`preinstall` 时拒绝（普通依赖改动仍允许）。
+- **策略指纹现在覆盖 hook 的两张表**（`PROTECTED_WRITE`/`SECRET_READ` 移入 `shell-guard.js` 并纳入哈希），升级只改了 hook 策略时 stale-policy 自检同样会拒绝。
 
 hook 还有第二条确定性规则：**git 的 `--output=` / `--output-directory=` 会让"只读"命令写文件**（`git diff/show/log --output=<file>`、`git format-patch --output-directory=` 实测都会落盘；`--output-to=` 不是真实旗标）。deny glob 对这条无能为力——Bash 规则是整条命令前缀匹配，`Bash(git diff --output=*)` 拦不住 `git diff HEAD --output=x`，而中间带 `*` 的规则语义无法从 CLI 外验证——所以这一条由 hook 直接判掉。注意 `grep --output`、`find -print` 等非 git 的 `--output` 不受影响。
 

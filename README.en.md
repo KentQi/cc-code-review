@@ -48,7 +48,7 @@ Notes:
 
 ## Register with ZCode (skip if already done)
 
-**Recommended: one command, auto-configured (since v1.7.0)**. Clone/install this package, then inside it run:
+**Recommended: one command, auto-configured (since v1.7.0)**. Clone this repository (or install the npm package — `scripts/init.mjs` ships in the tarball since v1.18.5), then inside it run:
 
 ```bash
 npm install
@@ -90,10 +90,10 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `baseRef` | - | plain ref chars | baseline for `branch` scope (default branch auto-detected when omitted; illegal characters rejected) |
 | `focus` | - | - | extra focus points (a review hint only — never executed as instructions; **must be a single line**) |
 | `outputLanguage` | `中文` | - | report language |
-| `postToPR` | `false` | - | additionally post the summary back to the PR via `gh pr comment` (by default the report is only returned, nothing leaves the machine) |
+| `postToPR` | `false` | - | additionally post the summary back to the PR via `gh pr comment` (by default the report is only returned, nothing leaves the machine). **Requires `pr`**: with no named PR the preflight refuses (otherwise the run would hold an unusable GitHub write grant and the prompt would ask the model to guess a PR) |
 | `fix` | `false` | - | **fix mode**: after the report, edit repo files to fix the findings (only Edit/Write unlocked, **zero git write commands**, no commits; `.git/**`, `.env*` and secret files are all in the deny list — blocking verified on a real CLI) |
 | `effort` | `max` | low/medium/high/xhigh/max | **model reasoning effort**, same levels as Claude Code's native `--effort`; defaults to max (deepest, slowest, priciest) — pass low/medium explicitly for a fast, cheap pass; degrades to think/ultrathink keywords when the CLI lacks the flag (never both at once) |
-| `reviewLevel` | derived from `effort` | low/medium/high/max | **the review's own depth** — the same argument the native `/code-review low\|high\|max` takes. The fleet has the same three-phase structure as the native playbook, with these numbers (shared with the prompt and SKILL.md): low = one pass, no subagents (≤4 findings); medium/high = **8 finders** (the 3+5 shape, filled from 5 briefs × 6 candidates, findings capped at 8); max = **10 finders** (the 5+5 shape, every brief split × 8 candidates) + **one verifier per surviving candidate** (CONFIRMED/PLAUSIBLE/REFUTED) + **1 sweep finder**, findings capped at 15. A max run therefore exceeds 15 agents structurally (measured: 17), not by a hard-coded number |
+| `reviewLevel` | derived from `effort` | low/medium/high/max | **the review's own depth** — the same argument the native `/code-review low\|high\|max` takes. The numbers are rendered from `FLEET_NUMBERS` in `src/prompt.js` (single source for the tool schema, the prompt and this table; the bundled SKILL.md no longer repeats them — it points at the run's "Reviewer fleet" line): low = one pass, no subagents (≤4 findings); medium/high = **8 finders** (the 3+5 shape, filled from 5 briefs × 6 candidates, findings capped at 8); max = **10 finders** (the 5+5 shape, every brief split × 8 candidates) + **one verifier per surviving candidate** (CONFIRMED/PLAUSIBLE/REFUTED) + **1 sweep finder**, findings capped at 15; at most 20 candidates reach verification. A max run therefore exceeds 15 agents structurally (measured: 17), not by a hard-coded number |
 | `ultracode` | `false` | - | **Ultracode mode**: writes `ultracode: true` into the `--settings` file, enabling claude's standing dynamic-workflow orchestration (every substantive step via the Workflow tool, multi-agent, token cost no object). Orthogonal to effort; older CLIs ignore the key (`workflow_runs` in the result shows whether it took effect) |
 | `model` | - | - | model override (`--model` passthrough) |
 | `maxTurns` | `80` | 4–200 | agentic turn cap |
@@ -112,7 +112,7 @@ Returns (async by default: a jobId (<1s) plus the preflight verdict, with the re
 
 Continue the conversation using the `session_id` returned by the previous run (`claude --resume`).
 
-### 4. `claude_review_env` — environment self-check (free)
+### 4. `claude_review_env` — environment self-check (free; **not a read-only tool**)
 
 CLI resolution result and its source, version, `--effort`/`--max-budget-usd` support, skill status, gateway reachability (loopback TCP preflight), leftover auth-variable warnings, `git`/`gh` availability, `CLAUDE_CODE_EFFORT_LEVEL` override warnings. The first line is a machine-readable `verdict: OK|NOT_FOUND|MISCONFIGURED`. `installSkill: true` manually (re)installs the skill.
 

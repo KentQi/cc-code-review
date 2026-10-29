@@ -26,6 +26,7 @@ import {
   resolveClaudeCliSettled, claudeVersion, claudeSemver, versionAtLeast,
   PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN, supportsFlag,
   guardState, guardSelfTest, gatewayTarget, probeGateway, buildClaudeEnv,
+  peekSettingsEnv,
 } from "../src/claude.js";
 import { skillStatus, installBundledSkill } from "../src/skill.js";
 
@@ -142,11 +143,15 @@ const zcodeConfigPath = path.join(os.homedir(), ".zcode", "cli", "config.json");
 const envBlock = {};
 const t = gatewayTarget();
 if (t) {
-  // Gateway auth comes from the effective env (settings.json env block or the
-  // host env). Carry the BASE_URL + tokens into the server's env so the MCP
-  // works regardless of how ZCode itself was launched. Direct-OAuth / API-key
-  // users need nothing here.
-  const merged = { ...JSON.parse(JSON.stringify(process.env)) };
+  // Gateway auth comes from the EFFECTIVE env — the same rule claude itself (and
+  // this server's own gatewayTarget()) applies: the settings.json env block wins
+  // over the inherited process env. Reading only process.env here meant that a
+  // machine configured entirely through ~/.claude/settings.json (CC Switch's
+  // normal shape) got `✓ gateway: …` printed and an env block with NO base URL
+  // and NO token — so the registered server failed auth or talked to the wrong
+  // endpoint on every review (audit P1-9). peekSettingsEnv() is mergedAuthEnv()'s
+  // exported half; keep the two in step.
+  const merged = { ...process.env, ...peekSettingsEnv() };
   for (const k of ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]) {
     if (merged[k]) envBlock[k] = merged[k];
   }

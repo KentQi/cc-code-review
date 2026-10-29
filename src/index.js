@@ -36,7 +36,7 @@ import {
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt, buildNativeCommand, buildNativeAppendix,
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools, postPROnlyTools,
-  deriveReviewLevel, validateBaseRef,
+  deriveReviewLevel, validateBaseRef, FLEET_NUMBERS,
 } from "./prompt.js";
 
 /**
@@ -44,13 +44,17 @@ import {
  * - pr        → the PR number/URL (also when scope=auto was given a pr, which
  *   the tool documents as "auto: PR if pr given")
  * - branch    → the base branch (the built-in diffs <base>...HEAD)
+ * - auto without a pr but with a baseRef → the same base branch: scope=auto's
+ *   first usable target is "commits ahead of the base", so a caller-named base
+ *   must reach the command (P1-6 — it used to be dropped here, and a review of
+ *   release-1.2 silently reviewed the default branch instead)
  * - last-commit → HEAD~1
- * - working-dir / auto without pr → no target (the built-in includes
- *   uncommitted changes and infers the upstream range by itself)
+ * - working-dir / auto without pr or baseRef → no target (the built-in
+ *   includes uncommitted changes and infers the upstream range by itself)
  */
 function nativeTarget({ scope, pr, baseRef }) {
   if (pr && (scope === "pr" || scope === "auto")) return String(pr);
-  if (scope === "branch") return baseRef || undefined;
+  if (scope === "branch" || scope === "auto") return baseRef || undefined;
   if (scope === "last-commit") return "HEAD~1";
   return undefined;
 }
@@ -59,6 +63,25 @@ import { SERVER_VERSION, codeDrift } from "./version.js";
 
 const execFileAsync = promisify(execFile);
 const log = (...a) => console.error("[cc-code-review]", ...a);
+
+/**
+ * The reviewLevel schema text, rendered from FLEET_NUMBERS so the tool
+ * description, the prompt and the README cannot drift (P2-19). SKILL.md no
+ * longer repeats the numbers — it points at the run's "Reviewer fleet" line.
+ */
+function reviewLevelDescription() {
+  const { briefs, low, medium, max, maxCandidates, sweepFinders } = FLEET_NUMBERS;
+  return (
+    "The REVIEW's own depth level — the same argument claude's native /code-review command takes. " +
+    "The fleet has the same three-phase structure as the native playbook (finder -> one verifier per surviving candidate -> sweep), " +
+    "with these numbers (rendered from FLEET_NUMBERS in src/prompt.js): " +
+    `low = one pass, no subagents (<= ${low.cap} findings); ` +
+    `medium/high = ${medium.finders} finders (${medium.finders - briefs} extra finders split briefs on top of the ${briefs} briefs) x up to ${medium.candidates} candidates, findings capped at ${medium.cap}; ` +
+    `max = ${max.finders} finders (every brief split) x up to ${max.candidates} candidates + one verifier per surviving candidate + ${sweepFinders} sweep finder, findings capped at ${max.cap}; ` +
+    `at most ${maxCandidates} candidates reach verification. Defaults to a mapping of effort (max/xhigh->max, high->high, medium->medium, low->low). ` +
+    "Separate knob from the CLI reasoning effort and from ultracode."
+  );
+}
 
 const ENV = {
   // clamp to the same ranges the zod schema enforces, otherwise an out-of-range
@@ -164,9 +187,10 @@ function pruneReviewJobs() {
     // Evict in COMPLETION order. The Map's insertion order is START order, so a
     // long review that started first and finished last was the first entry
     // deleted the moment it settled — a client polling it got "unknown jobId"
-    // right after it completed (audit P2-4). settledAt is stamped by
-    // settleReviewJob; finishedAt is the older field kept for compatibility.
-    .sort((a, b) => (a.settledAt ?? a.finishedAt ?? 0) - (b.settledAt ?? b.finishedAt ?? 0));
+    // right after it completed (audit P2-4). P3-5: settledAt is the single
+    // ordering key; settleReviewJob stamps finishedAt from it for compatibility
+    // only, so the old `?? finishedAt` fallback could never fire and is gone.
+    .sort((a, b) => (a.settledAt ?? 0) - (b.settledAt ?? 0));
   for (const j of finished.slice(0, Math.max(0, finished.length - JOB_KEEP))) reviewJobs.delete(j.id);
 
   // P-20: the count limit alone bounds NOTHING in bytes — ten max-effort reports
@@ -199,10 +223,14 @@ function settleReviewJob(job, result) {
   // the total payload budget without re-serializing every stored report.
   job.resultBytes = resultByteSize(result);
   job.state = result?.isError === true ? "failed" : "done";
-  job.finishedAt = Date.now();
   // Completion time, used by pruneReviewJobs to evict the oldest FINISHED job
-  // instead of the oldest STARTED one.
-  job.settledAt = job.finishedAt;
+  // instead of the oldest STARTED one (P2-4). P3-5: one instant, two names —
+  // settledAt is the value ordering uses, finishedAt is kept because the job
+  // list exposed it before; assigning it FROM settledAt keeps them identical by
+  // construction (the old code wrote finishedAt first and then copied it, which
+  // read like two independent facts and invited them to drift).
+  job.settledAt = Date.now();
+  job.finishedAt = job.settledAt;
   // P1-16: the fix-mode repo lock belongs to the JOB, not to the request that
   // created it. Releasing here covers the async path, a client that cancelled
   // the initial call, and a crashed run (the .catch() settles too) — without it
@@ -366,11 +394,17 @@ function capSavedResult(result) {
       })
     : result.content;
   const sc = sourceSc ? { ...sourceSc } : null;
-  if (sc && typeof sc.report === "string") {
-    const cut = truncateUtf8(sc.report, MAX_RESULT_BYTES);
-    if (cut.truncated) {
-      sc.report = cut.text + note;
-      truncated = true;
+  if (sc) {
+    // A review stores the report under `report`; a followup stores the same
+    // text under `reply` (P2-5: capping only one of them left every followup
+    // reply — which can be just as large — uncapped on the wire).
+    for (const key of ["report", "reply"]) {
+      if (typeof sc[key] !== "string") continue;
+      const cut = truncateUtf8(sc[key], MAX_RESULT_BYTES);
+      if (cut.truncated) {
+        sc[key] = cut.text + note;
+        truncated = true;
+      }
     }
   }
   if (!truncated) return result;
@@ -726,7 +760,18 @@ function classifyDenials(json, repoPath) {
   const deniedCommands = denials.map((d) => d?.tool_input?.command).filter((c) => typeof c === "string");
   // The predicate is the same one the hook applies, so "reported as blocked"
   // and "actually blocked" cannot disagree.
-  const guardWouldBlock = (cmd) => !analyseCommand(cmd, { repoRoot: repoPath }).ok;
+  //
+  // P3-7: this predicate used to run analyseCommand (a full shell parse) once
+  // per command in EACH filter, so a command string repeated across denials was
+  // analysed 2x — and both call sites of this function only read .length. Memo-
+  // ize per distinct command so the cost is one parse per unique command.
+  // (shellGuardNote below still runs its own chaining analysis; that is a
+  // different question — "did it run?" — and is left to that helper.)
+  const blockedByCommand = new Map();
+  const guardWouldBlock = (cmd) => {
+    if (!blockedByCommand.has(cmd)) blockedByCommand.set(cmd, !analyseCommand(cmd, { repoRoot: repoPath }).ok);
+    return blockedByCommand.get(cmd);
+  };
   const guardBlocked = deniedCommands.filter(guardWouldBlock);
   const realDenials = denials.filter((d) => {
     const cmd = d?.tool_input?.command;
@@ -808,8 +853,15 @@ function err(text) {
 function subagentsView(agentReports) {
   return (agentReports || []).map((r) => ({
     description: r.description, subagentType: r.subagentType || undefined,
-    async: r.async || undefined, status: r.status || undefined,
-    partial: r.partial || undefined, recovery: r.recovery || undefined,
+    // P3-4: `r.async || undefined` (and the same for partial) turned a real
+    // false into "unknown": JSON.stringify drops the undefined key, so a client
+    // could not tell "ran synchronously / not a partial recovery" from "this
+    // run did not report the field". Booleans are only preserved when they are
+    // actually booleans, so the field keeps its type.
+    async: typeof r.async === "boolean" ? r.async : undefined,
+    status: r.status || undefined,
+    partial: typeof r.partial === "boolean" ? r.partial : undefined,
+    recovery: r.recovery || undefined,
     report: (r.report || "").length > 8000 ? `${r.report.slice(0, 8000)}…(truncated)` : (r.report || ""),
   }));
 }
@@ -939,6 +991,40 @@ function emptyReportBanner(j, kind = "review") {
     "- Reviewer subagent reports that did arrive are still included below (and in partial_reports_file when present) — only the parent's summary is missing.",
     "- Re-run; claude_review_env shows which CLI/auth setup was resolved if the same wrapper keeps returning nothing.",
   ].join("\n");
+}
+
+/**
+ * P3-6: the "did this run succeed, and if not, why" verdict for one claude
+ * result — shared by the review and the followup path.
+ *
+ * The two handlers carried this block twice, differing only in variable names
+ * (reportText/replyText, emptyReport/emptyReply). Any new "succeeded but
+ * produced nothing usable" rule had to be written in two places or the tools
+ * would disagree about what "empty" means; the empty-report banner they share
+ * would then be reached by one tool and not the other.
+ *
+ * @returns {{text:string, empty:boolean, abnormalExit:boolean, ok:boolean, status:string}}
+ */
+function classifyRunOutcome(j, run) {
+  const text = String(j.result ?? "");
+  const looksLikeApiError = /^API Error/i.test(String(j.result || ""));
+  // An empty result is not "no findings": it means the reviewer produced
+  // nothing (a gateway/wrapper that returned no text, a CLI without
+  // stream-json whose forked-command answer cannot be recovered from the event
+  // stream, or a turn cap hit before writing). Returning that as success is
+  // how a caller concludes "clean review" from a run that never reviewed anything.
+  const empty = text.trim().length === 0;
+  // A signal / non-zero exit with a parseable result used to be reported as
+  // success because only the JSON event was consulted (audit P2-7). The report
+  // is kept, but the run is failed and the banner names the exit.
+  const abnormalExit = !run.timedOut && !run.cancelled && run.ok === false;
+  const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !empty && !abnormalExit;
+  // A non-success subtype is the more specific diagnosis (budget/turn cap);
+  // "empty_report" is used only when claude itself claimed success.
+  const status = ok ? "success"
+    : (abnormalExit ? "completed_with_error"
+      : (j.subtype && j.subtype !== "success" ? j.subtype : (empty ? "empty_report" : "claude reported an error")));
+  return { text, empty, abnormalExit, ok, status };
 }
 
 const server = new McpServer(
@@ -1254,6 +1340,177 @@ async function prepareRunHardening(cli, { ultracode = false, probeBudgetMs = 0 }
 }
 
 /* ------------------------------------------------------------------ */
+/* Shared paid-preflight gate (review + followup)                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P2-20: the free preflight both agentic tools must pass before a paid run.
+ *
+ * The two handlers carried this block almost verbatim (async budget, CLI
+ * resolve, guard hardening, repo checks, git preflight, repo-controlled git
+ * programs, gateway probe) and had already drifted: a missing CLI was a long
+ * actionable paragraph in one tool and a one-liner in the other, and the
+ * refusal for a repository whose own git config executes programs kept its
+ * "restart the host" hint only on the review side. One function, one wording.
+ *
+ * Returns either { ok:false, result } — already a complete tool result, with
+ * the in-flight guard settings file released — or the pieces the caller still
+ * needs (the cli handle, the guard settings for runClaude, the git facts used
+ * to pick a pipeline, and the remaining async budget for later probes).
+ *
+ * @param {object} opts
+ * @param {string} opts.repoPath
+ * @param {boolean} opts.waitForResult  synchronous calls keep the unbounded budget
+ * @param {"review"|"followup"} opts.label  subject used in the refusal text
+ * @param {boolean} [opts.ultracode]    review only: claude's standing workflow mode
+ * @param {"refuse"|"allow"} [opts.emptyRepo]  review refuses a repo with no commits
+ * @returns {{ok:true, cli, guard, guardSettings, permissionMode, permissionPrompts,
+ *            hardening, note, preflightFail, preflightCap, pre, repoWarning,
+ *            gitProgramNotes} | {ok:false, result}}
+ */
+async function paidPreflight({ repoPath, waitForResult, label, ultracode = false, emptyRepo = "allow" }) {
+  // P-05: the async contract is "a jobId after a fast preflight" — but every
+  // stage below spawns child processes whose own timeouts are 15-30s. Give the
+  // whole free preflight a soft budget for async calls; the synchronous
+  // contract keeps waiting, since callers there accept a 2-15 minute call.
+  const asyncBudget = waitForResult ? null : preflightBudget(ASYNC_PREFLIGHT_BUDGET_MS);
+  const preflightCap = (ms) => (asyncBudget ? asyncBudget.cap(ms) : 0); // 0 = unbounded
+  // P-06: wait out an in-flight async npm-prefix probe (bounded) instead of
+  // reporting NOT_FOUND on the first call after a cold start.
+  const cli = await resolveClaudeCliForCall(asyncBudget ? asyncBudget.cap(CLI_RESOLVE_TIMEOUT_MS) : CLI_RESOLVE_TIMEOUT_MS);
+  if (!cli) {
+    return {
+      ok: false,
+      result: err(
+        "Claude Code CLI not found. Install it (https://code.claude.com/docs/en/setup), or set CLAUDE_CODE_PATH to the claude executable / cli.js, " +
+        "then retry. claude_review_env shows what was probed."
+      ),
+    };
+  }
+  if (cli.error) return { ok: false, result: err(cli.error) };
+
+  // --- shell guard + permission-mode version floors (H4, D1) ---------------
+  // Checked before anything repo-specific: a disarmed guard is the one failure
+  // that must never be discovered three minutes and a few dollars into a run.
+  const hard = await prepareRunHardening(cli, {
+    ultracode,
+    // P-05: one 6s deadline for the guard self-test + version/help probes of
+    // this async call (0 = unbounded, i.e. waitForResult=true).
+    probeBudgetMs: asyncBudget ? preflightCap(6_000) : 0,
+  });
+  if (!hard.ok) return { ok: false, result: err(hard.error) };
+  const { guard, guardSettings, permissionMode, permissionPrompts, hardening } = hard;
+  // Any refusal between here and runClaude must release the guard file:
+  // prepareRunHardening marked it in-flight and only runClaude (or this
+  // helper) clears the mark — a leaked mark keeps the file undeletable
+  // until the 2h sweep (cleanupGuardSettings skips in-flight entries).
+  const preflightFail = (msg) => {
+    markGuardSettingsInFlight(guardSettings, false);
+    removeGuardSettings(guardSettings);
+    return err(msg);
+  };
+  // (prepareRunHardening already marked guardSettings in-flight for BOTH
+  // agentic tools — one marking site, no second call needed here.)
+
+  // P-17: stat once, inside try/catch. The old existsSync()+statSync() pair
+  // could throw out of the handler (leaving the in-flight guard mark behind)
+  // when the path vanished or became unreadable between the two calls.
+  const repoProblem = repoDirProblem(repoPath);
+  if (repoProblem) return { ok: false, result: preflightFail(repoProblem) };
+  // Every documented scope (auto/pr/branch/working-dir/last-commit) is
+  // git-based, so a non-repo directory can only produce a doomed paid run.
+  if (!isRepo(repoPath)) {
+    return {
+      ok: false,
+      result: preflightFail(
+        `${repoPath} is not a version-controlled repository (no .git/.hg/.svn found). Every ${label} reads git history from that repository, ` +
+        (label === "followup"
+          ? `so it cannot run here — point repoPath at the repository the original review ran in.`
+          : `so there is nothing to review here. Point repoPath at the repository root, or run \`git init\` and commit first.`)
+      ),
+    };
+  }
+  // Preflight git so an empty repo / missing git fails here, not 3 minutes
+  // and a few dollars into the run. P-05: bounded — git can hang on a network
+  // mount, and this refusal is more useful than a jobId for a doomed run.
+  const preProbe = await boundedAwait(gitPreflight(repoPath), preflightCap(8_000), {
+    gitError: { message: "git preflight timed out" },
+  });
+  const pre = preProbe.value;
+  if (preProbe.timedOut) {
+    return {
+      ok: false,
+      result: preflightFail(
+        `git did not answer within the preflight budget in ${repoPath}. Every ${label} reads git history, so the ${label} cannot start here — ` +
+        `if the repository lives on a network drive or in a slow sandbox, mount it locally and retry, or use waitForResult=true to wait without the budget.`
+      ),
+    };
+  }
+  if (pre.gitError) {
+    // Not a warning: every scope reads git, so the run would burn credits and
+    // fail. Say exactly what git said so the cause is actionable.
+    const e = pre.gitError;
+    const detail = [e.code, e.message].filter(Boolean).join(": ") || String(e);
+    return {
+      ok: false,
+      result: preflightFail(
+        `git failed in ${repoPath} (${detail}). Every ${label} reads git history, so the ${label} cannot run. ` +
+        `If the repo lives on a network drive or in a sandbox, check that git can access it (ownership/safe.directory, permissions).`
+      ),
+    };
+  }
+  let repoWarning = "";
+  if (emptyRepo === "refuse" && !pre.hasCommits) {
+    if (pre.dirty) {
+      repoWarning += `⚠ note: the repository has no commits yet, so history-based scopes (branch/pr/last-commit) have nothing to diff — the reviewer can only look at uncommitted files.\n\n`;
+    } else {
+      return {
+        ok: false,
+        result: preflightFail(`Nothing to review: ${repoPath} has no commits and no uncommitted changes. Make a commit (or leave changes in the working tree) first.`),
+      };
+    }
+  }
+
+  // Repo-controlled git config that runs programs cannot be neutralised with
+  // -c overrides (an arbitrary .gitattributes filter driver), so refuse it.
+  // Dead config — a path carried over from another OS that does not exist on
+  // this machine — cannot execute and is only noted in the report.
+  const gitPrograms = repoRunsGitPrograms(repoPath);
+  if (gitPrograms.refusals.length) {
+    return {
+      ok: false,
+      result: preflightFail(
+        `Refusing to run the ${label} in ${repoPath}: its own git configuration executes programs, which would run on the first git command the reviewer makes:\n` +
+        gitPrograms.refusals.slice(0, 5).map((h) => `- ${h}`).join("\n") +
+        `\nRemove the offending entries (.git/config / .gitattributes), or review a copy of the repository. ` +
+        `(cc-code-review server v${SERVER_VERSION}; dead cross-machine paths are normally only a note — if you expected this to pass, the host may be running an older server process: restart ZCode / reconnect the MCP.)`
+      ),
+    };
+  }
+  const gitProgramNotes = gitPrograms.notes.length
+    ? `note: stale/cross-machine git config in the repo (harmless on this machine, kept as a note):\n` +
+      gitPrograms.notes.slice(0, 5).map((h) => `- ${h}`).join("\n") + "\n\n"
+    : "";
+
+  // Fail fast when a loopback gateway (CC Switch & friends) is down: claude
+  // would otherwise retry silently for minutes and surface as a timeout.
+  const gw = await probeGateway();
+  if (gw && gw.ok === false) {
+    return {
+      ok: false,
+      result: preflightFail(
+        `Local gateway not reachable: ${gw.host} (${gw.reason}). If you use CC Switch / claude-code-router / a local proxy, start it first, then retry.`
+      ),
+    };
+  }
+
+  return {
+    ok: true, cli, guard, guardSettings, permissionMode, permissionPrompts, hardening,
+    note: hard.note, preflightFail, preflightCap, pre, repoWarning, gitProgramNotes,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* Tool 1: claude_review_env                                          */
 /* ------------------------------------------------------------------ */
 
@@ -1261,8 +1518,12 @@ registerTool(
   "claude_review_env",
   {
     // P-13: title + annotations are the tool metadata clients render and route
-    // on. env/status are read-only; review/followup run agentic work (review may
-    // edit files in fix mode). server.tool() is deprecated in SDK 1.32.
+    // on. review/followup run agentic work (review may edit files in fix mode).
+    // P2-17: env is a diagnostic but NOT read-only — installSkill/uninstallSkill
+    // write into and delete from ~/.claude/skills/code-review. A client that
+    // honours readOnlyHint ran it without approval, which could change the
+    // /code-review command the user's next Claude Code session executes.
+    // server.tool() is deprecated in SDK 1.32.
     title: "Check Claude Code Review Environment",
     description:
       "Check the Claude Code CLI installation, the code-review skill, the auth/gateway setup, and helper tools (git/gh). " +
@@ -1271,7 +1532,7 @@ registerTool(
       "Diagnostic contract: the verdict (OK / NOT_FOUND / MISCONFIGURED) is reported in the text and in structuredContent; " +
       "isError is reserved for a failure of this diagnostic itself.",
     inputSchema: { installSkill: z.boolean().default(false), uninstallSkill: z.boolean().default(false) },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
   async (args) => {
     // P-19: a NOT_FOUND/MISCONFIGURED verdict is a successful answer to "is my
@@ -1501,8 +1762,15 @@ async function runEnvTool({ installSkill, uninstallSkill }) {
     }
     if (uninstallSkill) {
       const r = uninstallBundledSkill();
+      // P2-16: uninstallBundledSkill reports uninstalled:true even when every
+      // rmSync failed (best-effort deletes), with removed:[]. Printing
+      // "removed  from …" for that case claimed a deletion that did not happen,
+      // so the two outcomes get two sentences.
+      const removed = Array.isArray(r.removed) ? r.removed : [];
       lines.push(r.uninstalled
-        ? `uninstallSkill: removed ${(r.removed || []).join(", ")} from ${r.dir} — claude's built-in /code-review command is no longer shadowed (files you added there are kept)`
+        ? (removed.length
+          ? `uninstallSkill: removed ${removed.join(", ")} from ${r.dir} — claude's built-in /code-review command is no longer shadowed (files you added there are kept)`
+          : `uninstallSkill: nothing was removed from ${r.dir} — the managed files were already gone or could not be deleted (check permissions, then retry); the directory was left in place`)
         : `uninstallSkill: skipped — ${r.reason}`);
       facts.skillAction = { action: "uninstall", uninstalled: !!r.uninstalled, dir: r.dir ?? null, reason: r.reason ?? null };
     }
@@ -1555,18 +1823,18 @@ registerTool(
     inputSchema: {
       repoPath: z.string().describe("Absolute path to the git repository to review (the review runs with cwd=repoPath; ~/ prefix allowed)"),
     scope: z.enum(["auto", "pr", "branch", "working-dir", "last-commit"]).default("auto")
-      .describe("auto: PR if pr given / branch ahead of default / working-dir changes / last commit"),
+      .describe("auto: PR if pr given / branch ahead of baseRef (when given) or the default branch / working-dir changes / last commit"),
     pr: z.string().optional().describe('GitHub PR number or URL, e.g. "123" or "owner/repo#123" (for scope=pr, or as first choice in auto)'),
-    baseRef: z.string().optional().describe("Base branch/tag for scope=branch (default: auto-detect the default branch)"),
+    baseRef: z.string().optional().describe("Base branch/tag for scope=branch and for scope=auto's branch step (default: auto-detect the default branch). A validated ref always reaches the reviewer — it is never silently dropped."),
     focus: z.string().optional().describe("Extra review focus or instructions, e.g. '重点看并发安全'"),
     outputLanguage: z.string().default("中文").describe('Language for the report, e.g. "中文" or "English"'),
-    postToPR: z.boolean().default(false).describe("Also post the summary comment to the GitHub PR via gh (default false — report only)"),
+    postToPR: z.boolean().default(false).describe("Also post the summary comment to a GitHub PR via gh. Requires pr (the PR to comment on) — without it the call is refused before any paid work (default false — report only)."),
     fix: z.boolean().default(false)
       .describe("Fix mode: after the report, Claude Code edits the repo files to fix the confirmed findings (Edit only, no git commands, no commit; .git and secret paths are deny-listed). Adds a '## Fixes Applied' section."),
     effort: z.enum(["low", "medium", "high", "xhigh", "max"]).default("max")
       .describe("Review effort / reasoning level, same scale as Claude Code (--effort): low..max. Default max = exhaustive deep review (slower and pricier). Omit for the deepest default; pass low/medium for a fast, cheap pass."),
     reviewLevel: z.enum(["low", "medium", "high", "max"]).optional()
-      .describe("The REVIEW's own depth level — the same argument claude's native /code-review command takes. The fleet has the same three-phase structure as the native playbook (finder -> one verifier per surviving candidate -> sweep), with these numbers (shared with the README and the bundled SKILL.md): low = one pass, no subagents (<=4 findings); medium/high = 8 finders filled from the 5 briefs (the 3+5 shape: 5 briefs + 3 split finders) x up to 6 candidates, findings capped at 8; max = 10 finders (the 5+5 shape: every brief split) x up to 8 candidates + one verifier per surviving candidate + 1 sweep finder, findings capped at 15 — so max exceeds 15 subagents structurally. Defaults to a mapping of effort (max/xhigh->max, high->high, medium->medium, low->low). Separate knob from the CLI reasoning effort and from ultracode."),
+      .describe(reviewLevelDescription()),
     ultracode: z.boolean().default(false)
       .describe("Enable claude's Ultracode mode for this run (the `ultracode` settings key): standing dynamic-workflow orchestration — every substantive step goes through the native Workflow tool, multi-agent and token-cost-no-object. Orthogonal to effort (any effort level). Requires a claude CLI that supports the key; older builds ignore it (see workflowRuns in the result)."),
     model: z.string().optional().describe("Claude model override (passed as --model)"),
@@ -1607,6 +1875,19 @@ registerTool(
         `scope=pr requires a pr — pass the PR number ("123"), "owner/repo#123", or a GitHub PR URL. ` +
         `Without it the fleet prompt would name "pull request undefined" and the native /code-review command would silently ` +
         `fall back to claude's inferred default target, so the review would cover a different diff than the one you asked for.`
+      );
+    }
+    // P1-10: postToPR grants Bash(gh pr comment:*) and the prompt tells the
+    // reviewer to comment on a PR — but without a pr there is no PR to write
+    // to. Both outcomes are bad: the reviewer fails on the literal "<NUMBER>"
+    // after burning turns, or it picks a PR itself and publishes the review
+    // (with the repo's private code quoted in it) to a repository the caller
+    // never named. Refuse before anything paid starts.
+    if (postToPR && !prCheck.pr) {
+      return err(
+        `postToPR=true requires a pr — name the pull request to comment on ("123", "owner/repo#123", or a GitHub PR URL). ` +
+        `Without one the reviewer has no target for the summary comment: it would either fail after burning turns or choose a PR itself and publish ` +
+        `the review somewhere you never named. Pass pr (e.g. pr: "123"), or set postToPR=false to keep the report local.`
       );
     }
     const langCheck = validateLanguage(args.outputLanguage);
@@ -1653,98 +1934,28 @@ registerTool(
       }
     };
     try {
-    // P-05: the async contract is "a jobId after a fast preflight" — but every
-    // stage below spawns child processes whose own timeouts are 15-30s. Give the
-    // whole free preflight a soft budget for async calls; the synchronous
-    // contract keeps waiting, since callers there accept a 2-15 minute call.
-    const asyncBudget = args.waitForResult ? null : preflightBudget(ASYNC_PREFLIGHT_BUDGET_MS);
-    const preflightCap = (ms) => (asyncBudget ? asyncBudget.cap(ms) : 0); // 0 = unbounded
-    // P-06: wait out an in-flight async npm-prefix probe (bounded) instead of
-    // reporting NOT_FOUND on the first call after a cold start.
-    const cli = await resolveClaudeCliForCall(asyncBudget ? asyncBudget.cap(CLI_RESOLVE_TIMEOUT_MS) : CLI_RESOLVE_TIMEOUT_MS);
-    if (!cli) {
-      return err("Claude Code CLI not found. Install it (https://code.claude.com/docs/en/setup), or set CLAUDE_CODE_PATH to the claude executable / cli.js, then retry. claude_review_env shows what was probed.");
-    }
-    if (cli.error) return err(cli.error);
-
-    // --- shell guard + permission-mode version floors (H4, D1) ---------------
-    // Checked before anything repo-specific: a disarmed guard is the one failure
-    // that must never be discovered three minutes and a few dollars into a run.
-    // Shared with claude_review_followup — both runs are agentic in the same repo.
-    const hard = await prepareRunHardening(cli, {
+    // P-05/P2-20: the whole free preflight — CLI, guard/version floors, repo,
+    // git, repo-controlled git programs, gateway — is one shared gate with
+    // claude_review_followup (see paidPreflight), so the two tools cannot drift
+    // in what they refuse or how they word it.
+    const pf = await paidPreflight({
+      repoPath,
+      waitForResult: args.waitForResult,
+      label: "review",
       ultracode,
-      // P-05: one 6s deadline for the guard self-test + version/help probes of
-      // this async call (0 = unbounded, i.e. waitForResult=true).
-      probeBudgetMs: asyncBudget ? preflightCap(6_000) : 0,
+      emptyRepo: "refuse",
     });
-    if (!hard.ok) return err(hard.error);
-    const { guard, guardSettings, permissionMode, permissionPrompts, hardening } = hard;
-    const guardSetupNote = hard.note;
-    // Any refusal between here and runClaude must release the guard file:
-    // prepareRunHardening marked it in-flight and only runClaude (or this
-    // helper) clears the mark — a leaked mark keeps the file undeletable
-    // until the 2h sweep (cleanupGuardSettings skips in-flight entries).
-    const preflightFail = (msg) => {
-      markGuardSettingsInFlight(guardSettings, false);
-      removeGuardSettings(guardSettings);
-      return err(msg);
-    };
-    // (prepareRunHardening already marked guardSettings in-flight for BOTH
-    // agentic tools — one marking site, no second call needed here.)
-
-    // P-17: stat once, inside try/catch. The old existsSync()+statSync() pair
-    // could throw out of the handler (leaving the in-flight guard mark behind)
-    // when the path vanished or became unreadable between the two calls.
-    const repoProblem = repoDirProblem(repoPath);
-    if (repoProblem) return preflightFail(repoProblem);
-    // Every documented scope (auto/pr/branch/working-dir/last-commit) is
-    // git-based, so a non-repo directory can only produce a doomed paid run.
-    if (!isRepo(repoPath)) {
-      return preflightFail(
-        `${repoPath} is not a version-controlled repository (no .git/.hg/.svn found). ` +
-        `Every review scope reads git history, so there is nothing to review here. ` +
-        `Point repoPath at the repository root, or run \`git init\` and commit first.`
-      );
-    }
-    let repoWarning = "";
-
-    // Preflight git so an empty repo / missing git fails here, not 3 minutes
-    // and a few dollars into the run. P-05: bounded — git can hang on a network
-    // mount, and this refusal is more useful than a jobId for a doomed run.
-    const preProbe = await boundedAwait(gitPreflight(repoPath), preflightCap(8_000), {
-      gitError: { message: "git preflight timed out" },
-    });
-    const pre = preProbe.value;
-    if (preProbe.timedOut) {
-      return preflightFail(
-        `git did not answer within the preflight budget in ${repoPath}. Every review scope reads git history, so the review cannot start here — ` +
-        `if the repository lives on a network drive or in a slow sandbox, mount it locally and retry, or use waitForResult=true to wait without the budget.`
-      );
-    }
-    if (pre.gitError) {
-      // Not a warning: every scope reads git, so the run would burn credits and
-      // fail. Say exactly what git said so the cause is actionable.
-      const e = pre.gitError;
-      const detail = [e.code, e.message].filter(Boolean).join(": ") || String(e);
-      return preflightFail(
-        `git failed in ${repoPath} (${detail}). Every review scope reads git history, so the review cannot run. ` +
-        `If the repo lives on a network drive or in a sandbox, check that git can access it (ownership/safe.directory, permissions).`
-      );
-    } else if (!pre.hasCommits) {
-      if (pre.dirty) {
-        repoWarning += `⚠ note: the repository has no commits yet, so history-based scopes (branch/pr/last-commit) have nothing to diff — the reviewer can only look at uncommitted files.\n\n`;
-      } else {
-        return preflightFail(`Nothing to review: ${repoPath} has no commits and no uncommitted changes. Make a commit (or leave changes in the working tree) first.`);
-      }
-    }
-
-    // Fail fast when a loopback gateway (CC Switch & friends) is down: claude
-    // would otherwise retry silently for minutes and surface as a timeout.
-    const gw = await probeGateway();
+    if (!pf.ok) return pf.result;
+    const {
+      cli, guard, guardSettings, permissionMode, permissionPrompts, hardening,
+      preflightFail, preflightCap, gitProgramNotes,
+    } = pf;
+    const guardSetupNote = pf.note;
+    // Rendered (not refused) when the repo has no commits BUT has uncommitted
+    // changes — the shared gate returns that note instead of an error.
+    let repoWarning = pf.repoWarning;
+    const pre = pf.pre; // git facts: hasCommits / dirty / hasParent (pipeline choice)
     const gwBefore = gatewayTarget(); // for the mid-run "gateway disappeared" check
-    if (gw && gw.ok === false) {
-      return preflightFail(`Local gateway not reachable: ${gw.host} (${gw.reason}). If you use CC Switch / claude-code-router / a local proxy, start it first, then retry.`);
-    }
 
     // The review's own depth level (third knob): defaults to a mapping of the
     // CLI effort; it sizes the reviewer fleet from the diff.
@@ -1878,7 +2089,10 @@ registerTool(
     let appendSystemPrompt;
     if (pipeline === "native") {
       prompt = buildNativeCommand({ reviewLevel: effectiveReviewLevel, target: nativeTarget({ scope, pr, baseRef: baseRefCheck.ref }), fix });
-      appendSystemPrompt = buildNativeAppendix({ outputLanguage, focus: focusCheck.focus, postToPR, cwd: repoPath, fix });
+      // pr travels too: the native appendix names the PR to comment on for
+      // postToPR (P1-10) — without it the appendix can only describe a generic
+      // "<selector>" and the native path keeps the old guessing problem.
+      appendSystemPrompt = buildNativeAppendix({ outputLanguage, focus: focusCheck.focus, postToPR, cwd: repoPath, fix, pr });
       skillMode = "native /code-review (built into claude; nothing installed)";
     } else {
       prompt = buildReviewPrompt({
@@ -1896,7 +2110,10 @@ registerTool(
     const disallowedTools = [...reviewDisallowedTools({ fix, postToPR }), ...(fix ? fixDisallowedTools() : [])];
 
     // gh preflight (D6): a PR scope or postToPR without a usable gh fails deep
-    // inside the run, after the model has already spent turns.
+    // inside the run, after the model has already spent turns. Both branches
+    // imply a named pr — scope=pr refuses without one, and postToPR does too
+    // (P1-10 gate above) — so this condition is exactly "a PR has to be
+    // reachable", and the comment target can never be a guessed number.
     if (scope === "pr" || postToPR) {
       // P-05: two gh spawns with 15s timeouts each — bound them like the rest.
       const ghProbe = await boundedAwait(ghPreflight(), preflightCap(8_000), {
@@ -1912,23 +2129,8 @@ registerTool(
       }
     }
 
-    // Repo-controlled git config that runs programs cannot be neutralised with
-    // -c overrides (an arbitrary .gitattributes filter driver), so refuse it.
-    // Dead config — a path carried over from another OS that does not exist on
-    // this machine — cannot execute and is only noted in the report.
-    const gitPrograms = repoRunsGitPrograms(repoPath);
-    if (gitPrograms.refusals.length) {
-      return preflightFail(
-        `Refusing to review ${repoPath}: its own git configuration executes programs, which would run on the first git command the reviewer makes:\n` +
-        gitPrograms.refusals.slice(0, 5).map((h) => `- ${h}`).join("\n") +
-        `\nRemove the offending entries (.git/config / .gitattributes), or review a copy of the repository. ` +
-        `(cc-code-review server v${SERVER_VERSION}; dead cross-machine paths are normally only a note — if you expected this to pass, the host may be running an older server process: restart ZCode / reconnect the MCP.)`
-      );
-    }
-    const gitProgramNotes = gitPrograms.notes.length
-      ? `note: stale/cross-machine git config in the repo (harmless on this machine, kept as a note):\n` +
-        gitPrograms.notes.slice(0, 5).map((h) => `- ${h}`).join("\n") + "\n\n"
-      : "";
+    // (The repo-controlled-git-config gate — refusals plus the cross-machine
+    // note that becomes gitProgramNotes — now runs inside paidPreflight above.)
 
     // Snapshot the working tree so a fix run can be verified against disk
     // instead of trusting the reviewer's own claim that it applied the fixes.
@@ -1971,12 +2173,18 @@ registerTool(
     let subagentsDir;
     try { subagentsDir = logsDir(); }
     catch (e) {
+      // P2-15: this early return used to skip clearInterval, leaving a repeating
+      // 60s timer (and its "in progress" notifications) alive for the life of
+      // this long-lived server, for a request that already failed.
+      if (progressTimer) clearInterval(progressTimer);
       return preflightFail(
         `Could not prepare this review's log directory: ${e?.message || e}. ` +
         `Set CLAUDE_REVIEW_LOG_DIR to a writable directory (or fix its permissions) and retry — the review was not started.`
       );
     }
 
+    // .finally (not a bare await) so a throwing runClaude cannot leave the
+    // progress timer behind; the normal path clears it here too.
     const run = await runClaude({
       cli,
       repoPath,
@@ -2009,8 +2217,9 @@ registerTool(
         liveJob.subagents = [...(liveJob.subagents ?? []), rec];
         if (typeof file === "string") liveJob.subagentsFile = file;
       },
+    }).finally(() => {
+      if (progressTimer) clearInterval(progressTimer);
     });
-    if (progressTimer) clearInterval(progressTimer);
 
     const logFile = writeLogFile(run.stdout, run.stderr, [run.subagentsFile]);
     const j = run.json;
@@ -2034,24 +2243,12 @@ registerTool(
       );
     }
 
-    const looksLikeApiError = /^API Error/i.test(String(j.result || ""));
-    const reportText = String(j.result ?? "");
-    // An empty result is not "no findings": it means the reviewer produced
-    // nothing (a gateway/wrapper that returned no text, a CLI without
-    // stream-json whose forked-command answer cannot be recovered from the event
-    // stream, or a turn cap hit before writing). Returning that as success is
-    // how a caller concludes "clean review" from a run that never reviewed anything.
-    const emptyReport = reportText.trim().length === 0;
-    // A signal / non-zero exit with a parseable result used to be reported as
-    // success because only the JSON event was consulted (audit P2-7). The report
-    // is kept, but the run is failed and the banner names the exit.
-    const abnormalExit = !run.timedOut && !run.cancelled && run.ok === false;
-    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !emptyReport && !abnormalExit;
-    // A non-success subtype is the more specific diagnosis (budget/turn cap);
-    // "empty_report" is used only when claude itself claimed success.
-    const status2 = ok ? "success"
-      : (abnormalExit ? "completed_with_error"
-        : (j.subtype && j.subtype !== "success" ? j.subtype : (emptyReport ? "empty_report" : "claude reported an error")));
+    // P3-6: one shared verdict (classifyRunOutcome), so a review and a followup
+    // can never disagree about what "empty" or "did not finish cleanly" means.
+    const outcome = classifyRunOutcome(j, run);
+    const abnormalExit = outcome.abnormalExit;
+    const ok = outcome.ok;
+    const status2 = outcome.status;
 
     // Under `--permission-mode manual` a missing allowlist entry shows up here
     // instead of aborting the run — surface it, or a silently degraded review
@@ -2270,9 +2467,17 @@ registerTool(
       try {
         // P-03: a synchronous result IS a job result — stamp the same identity
         // fields, so one shape works for both contracts.
-        const result = withJobIdentity(await executeRun(jobAbort.signal, extra?._meta?.progressToken), job);
+        // P1-7: settle BEFORE stamping. withJobIdentity derives a missing status
+        // from job.state, which only turns "failed" when the job settles — the
+        // old order stamped "running" into BOTH the returned result and the
+        // stored job.result, so a failed waitForResult call (cancel, timeout,
+        // crash, empty log dir) reported "running" forever.
+        // P2-5: cap on the way out as well. This response travels over the same
+        // stdio transport as a poll, so an uncapped multi-MB report is exactly
+        // what the 512 KiB limit exists to keep deliverable.
+        const result = await executeRun(jobAbort.signal, extra?._meta?.progressToken);
         settle(result);
-        return result;
+        return capSavedResult(withJobIdentity(result, job));
       } catch (e) {
         const crashed = err(`review crashed before it produced a result: ${e?.message || e}. The job is settled as failed; retry, or check the server log.`);
         // Settle BEFORE stamping: withJobIdentity derives a missing status from
@@ -2373,11 +2578,11 @@ registerTool(
       // report until the whole fleet is done, but a 429 / halt / cancel can
       // stop it before then — so the finished work is visible (and durable)
       // while the run continues.
-      const sofar = (job.subagents ?? []).map((r) => ({
-        description: r.description, subagentType: r.subagentType || undefined,
-        status: r.status, async: r.async || undefined, partial: r.partial || undefined,
-        report: r.report,
-      }));
+      // P2-6: the same bounded view the settled results use. This branch used
+      // to copy r.report verbatim, so a max-effort fleet (15+ reviewers) made
+      // every poll re-send megabytes of JSON-RPC — repeated on every poll.
+      // (P3-4 disappears here with the copy: subagentsView keeps async:false.)
+      const sofar = subagentsView(job.subagents);
       const lines = [
         `still running: ${secs}s elapsed (${job.scope}, ${job.repoPath}). Reviews typically take 2-15 minutes — poll again in a minute or two. Cancel with {"jobId": "${jobId}", "cancel": true}.`,
       ];
@@ -2465,88 +2670,18 @@ registerTool(
     if (!repoCheck.ok) return err(repoCheck.error);
     const repoPath = repoCheck.path;
 
-    // P-05/P-06: the same soft budget and settled CLI resolve as the review
-    // tool — the async contract is identical (a jobId after a fast preflight).
-    const asyncBudget = args.waitForResult ? null : preflightBudget(ASYNC_PREFLIGHT_BUDGET_MS);
-    const preflightCap = (ms) => (asyncBudget ? asyncBudget.cap(ms) : 0); // 0 = unbounded
-    const cli = await resolveClaudeCliForCall(asyncBudget ? asyncBudget.cap(CLI_RESOLVE_TIMEOUT_MS) : CLI_RESOLVE_TIMEOUT_MS);
-    if (!cli) return err("Claude Code CLI not found (set CLAUDE_CODE_PATH or see claude_review_env).");
-    if (cli.error) return err(cli.error);
-
-    // Same fail-closed guard gate as a full review, and in the same order: a
-    // disarmed guard is reported before anything repo-specific.
-    const hard = await prepareRunHardening(cli, { probeBudgetMs: asyncBudget ? preflightCap(6_000) : 0 });
-    if (!hard.ok) return err(hard.error);
-    const { guardSettings, permissionMode, permissionPrompts, hardening } = hard;
-    // Any refusal between here and runClaude must release the guard file:
-    // prepareRunHardening marked it in-flight and only runClaude (or this
-    // helper) clears the mark — a leaked mark keeps the file undeletable
-    // until the 2h sweep (cleanupGuardSettings skips in-flight entries).
-    const preflightFail = (msg) => {
-      markGuardSettingsInFlight(guardSettings, false);
-      removeGuardSettings(guardSettings);
-      return err(msg);
-    };
-
-    // P-17: one stat inside try/catch (see repoDirProblem) — a path that
-    // disappears between checks must become a clean refusal, not an exception
-    // that leaks the in-flight guard settings mark.
-    const repoProblem = repoDirProblem(repoPath);
-    if (repoProblem) return preflightFail(repoProblem);
-
-    // The followup child runs the same allowlisted git reads from cwd=repoPath,
-    // so it gets the same repo preflight as a full review: a directory that is
-    // no longer a repository (moved, or .git removed since the original run)
-    // would otherwise spawn a paid run that fails late, and a broken git
-    // surfaces as a timeout instead of git's own error.
-    if (!isRepo(repoPath)) {
-      return preflightFail(
-        `${repoPath} is not a version-controlled repository (no .git/.hg/.svn found). ` +
-        `The followup resumes a review session inside that repository, so it cannot run here — ` +
-        `point repoPath at the repository the original review ran in.`
-      );
-    }
-    // P-05: bounded like the review path.
-    const preProbe = await boundedAwait(gitPreflight(repoPath), preflightCap(8_000), {
-      gitError: { message: "git preflight timed out" },
+    // P-05/P-06/P2-20: the same shared paid gate as the review tool (CLI,
+    // guard/version floors, repo, git, repo-controlled git programs, gateway).
+    // One implementation, so a missing CLI or a program-running repo is refused
+    // with the same actionable text by both tools.
+    const pf = await paidPreflight({
+      repoPath,
+      waitForResult: args.waitForResult,
+      label: "followup",
+      emptyRepo: "allow",
     });
-    const pre = preProbe.value;
-    if (preProbe.timedOut) {
-      return preflightFail(
-        `git did not answer within the preflight budget in ${repoPath}, so the followup cannot start here — ` +
-        `mount the repository locally and retry (or use waitForResult=true to wait without the budget).`
-      );
-    }
-    if (pre.gitError) {
-      const e = pre.gitError;
-      const detail = [e.code, e.message].filter(Boolean).join(": ") || String(e);
-      return preflightFail(
-        `git failed in ${repoPath} (${detail}). The followup cannot run there — ` +
-        `check that git can access the repo (ownership/safe.directory, permissions), then retry.`
-      );
-    }
-
-    // Same repo-controlled git-config gate as a full review: the followup child
-    // runs the same allowlisted git reads from cwd=repoPath, so a live
-    // core.fsmonitor / driver would execute here too. (Dead cross-machine
-    // config only notes, matching the review path.)
-    const gitPrograms = repoRunsGitPrograms(repoPath);
-    if (gitPrograms.refusals.length) {
-      return preflightFail(
-        `Refusing to run the followup in ${repoPath}: its own git configuration executes programs, which would run on the first git command the reviewer makes:\n` +
-        gitPrograms.refusals.slice(0, 5).map((h) => `- ${h}`).join("\n") +
-        `\nRemove the offending entries (.git/config / .gitattributes), or review a copy of the repository. (cc-code-review server v${SERVER_VERSION})`
-      );
-    }
-    const gitProgramNotes = gitPrograms.notes.length
-      ? `note: stale/cross-machine git config in the repo (harmless on this machine):\n` +
-        gitPrograms.notes.slice(0, 5).map((h) => `- ${h}`).join("\n") + "\n\n"
-      : "";
-
-    const gw = await probeGateway();
-    if (gw && gw.ok === false) {
-      return preflightFail(`Local gateway not reachable: ${gw.host} (${gw.reason}). Start CC Switch / your local gateway, then retry.`);
-    }
+    if (!pf.ok) return pf.result;
+    const { cli, guardSettings, permissionMode, permissionPrompts, hardening, preflightFail, preflightCap, gitProgramNotes } = pf;
 
     log(`followup start: session=${sessionId}`);
     // A followup is an agentic run in the same repo, so it gets the same
@@ -2586,11 +2721,15 @@ registerTool(
     let subagentsDir;
     try { subagentsDir = logsDir(); }
     catch (e) {
+      // P2-15: same leak as the review path — the early return left the 60s
+      // progress timer running forever.
+      if (progressTimer) clearInterval(progressTimer);
       return preflightFail(
         `Could not prepare this followup's log directory: ${e?.message || e}. ` +
         `Set CLAUDE_REVIEW_LOG_DIR to a writable directory (or fix its permissions) and retry — the followup was not started.`
       );
     }
+    // .finally: clear the timer on the normal path AND if runClaude throws.
     const run = await runClaude({
       cli,
       repoPath,
@@ -2617,8 +2756,9 @@ registerTool(
       },
       timeoutMs: timeoutMinutes * 60_000,
       signal,
+    }).finally(() => {
+      if (progressTimer) clearInterval(progressTimer);
     });
-    if (progressTimer) clearInterval(progressTimer);
 
     const logFile = writeLogFile(run.stdout, run.stderr, [followSubagentsFile]);
     const logNote = logNoteOf(logFile);
@@ -2637,18 +2777,13 @@ registerTool(
     if (run.timedOut) return err(`followup timed out after ${timeoutMinutes} minutes.${logNote}${stderrTail(run.stderr)}${carried}`);
     if (!j) return err(`claude exited (code ${run.exitCode}) without a parseable result (bad session_id? gateway down?).${logNote}${stderrTail(run.stderr)}${carried}`);
 
-    const looksLikeApiError = /^API Error/i.test(String(j.result || ""));
-    const replyText = String(j.result ?? "");
-    // Same rule as a review: an empty reply is a failed turn, not a clean
-    // answer. A caller that trusts status/isError would otherwise read "the
-    // reviewer said nothing" as "there is nothing to say".
-    const emptyReply = replyText.trim().length === 0;
-    // Same abnormal-exit rule as a review (audit P2-7).
-    const abnormalExit = !run.timedOut && !run.cancelled && run.ok === false;
-    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !emptyReply && !abnormalExit;
-    const status2 = ok ? "success"
-      : (abnormalExit ? "completed_with_error"
-        : (j.subtype && j.subtype !== "success" ? j.subtype : (emptyReply ? "empty_report" : "claude reported an error")));
+    // P3-6: same shared verdict as the review path (an empty reply is a failed
+    // turn, not a clean answer; an abnormal exit is a failed run).
+    const outcome = classifyRunOutcome(j, run);
+    const replyText = outcome.text;
+    const abnormalExit = outcome.abnormalExit;
+    const ok = outcome.ok;
+    const status2 = outcome.status;
     // Same denial split as a full review (audit P0-7). The chaining reporter
     // needs the set of commands that were actually DENIED: passing an empty set
     // turned every command the guard correctly blocked into "RAN WITHOUT BEING
@@ -2741,9 +2876,12 @@ registerTool(
     if (args.waitForResult) {
       try {
         // P-03: same identity envelope as the review tool (one shape per job).
-        const result = withJobIdentity(await executeFollowup(jobAbort.signal, extra?._meta?.progressToken), job);
+        // P1-7/P2-5: settle first (so a failed job stamps "failed", not the
+        // job.state "running" from before settle), then cap the response the
+        // same way claude_review_status caps a polled result.
+        const result = await executeFollowup(jobAbort.signal, extra?._meta?.progressToken);
         settle(result);
-        return result;
+        return capSavedResult(withJobIdentity(result, job));
       } catch (e) {
         const crashed = err(`followup crashed before it produced a reply: ${e?.message || e}. It is settled in the job list; retry, or fetch it with claude_review_status.`);
         // Settle first, then stamp (see the review path).

@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.18.5 — 2026-10-30
+
+Third audit of the stacked PRs (#1–#4): 7 P0 / 14 P1 / 22 P2 / 8 P3, every P0 reproduced against real git, real hook processes and a real stdio server before counting. This release fixes all 7 P0 and all 14 P1, plus the selected P2/P3 items below.
+
+- **[P0] Repository-controlled code execution via the `ext::` transport.** `protocol.ext.allow` was in the server's own `-c` hardening list but not in the claude child's `GIT_CONFIG_*` environment, so a repo could set `remote.origin.url = ext::<command>` plus `protocol.ext.allow = always` and the allowlisted (and prompt-suggested) `git remote show origin` executed it. The child environment now neutralises `protocol.ext.allow=never` and `protocol.file.allow=never`, and the scanner refuses transport/URL keys (`protocol.*.allow`, `url.*.insteadOf`, `remote.*.vcs`).
+- **[P0] `.git/config.worktree` was never scanned in the main worktree.** A repo with `extensions.worktreeConfig=true` could keep a live `diff.<name>.textconv` there and `git log -p` executed it. The main worktree now reads `config.worktree` too (linked worktrees already did).
+- **[P0] `node_modules/` was pruned from the `.gitattributes` walk.** Git applies attributes from every directory level, so a committed `node_modules/.gitattributes` activated a repo-supplied driver while the scanner saw nothing. The scanner now enumerates every tracked/untracked `.gitattributes` via `git ls-files -z`, covering `node_modules/` as well.
+- **[P0] Unambiguous long-option abbreviations bypassed the deny tables.** `git blame --cont` (`--contents`), `sort/wc --files0` (`--files0-from`), `git blame --ignore-revs-file`/`--mailmap-file` all read host files while the exact spellings were denied. Deny matching now accepts unambiguous prefixes, and the missing file-reading options are denied.
+- **[P0] `gh pr comment --body-file/-F <host path>`** read a host file and POSTed it to GitHub (postToPR grants the command). The file argument is now scoped to the repository, `--repo` shape-checked.
+- **Read boundaries:** the PreToolUse matcher is catch-all and the hook now confines `Grep`/`Glob` `path` to the repo (and applies the secret-file list), and a Bash command that references `.env`/`id_rsa`/`.ssh/`/`credentials`/`.npmrc`/`.git-credentials` etc. is refused — previously only the `Read` tool was protected.
+- **fix-mode persistence:** `.husky/**`, `.github/actions/**`, `.gitlab-ci.yml`, `Jenkinsfile`, `Makefile`, `.pre-commit-config.yaml`, `.devcontainer/**`, `.cargo/config(.toml)`, `.circleci/**`, `.npmrc` are refused (package.json only when the written content carries `scripts`/`postinstall`/`preinstall`).
+- **`find -- <path>`** and **`echo "prefix"*` / `echo ~"/".ssh/*`** (quoted-partial globs) no longer escape the in-repo path/glob checks; `echo` quoting is judged per character, so literal forms (`echo '*'`, `echo 'price: $5'`) still work.
+- **Repo config enumeration hardening:** an `[include]` target that exists but is unreadable is now a refusal (was silent), more than 200 include files is refused (1200 includes used to freeze the event loop for 13 s), and the scanner rejects `protocol.ext/file.allow`, `url.*.insteadOf`, `remote.*.vcs`.
+- **[P1] `baseRef` is honoured in `scope=auto`** (the tool default) instead of being silently dropped: a named ref now selects that branch range in both the prompt and the native command.
+- **[P1] Synchronous failures no longer report `status:"running"`:** the sync path settles the job before stamping it, so a cancelled/timed-out/failed `waitForResult=true` call (and every later poll) reports `failed`.
+- **[P1] `postToPR` now requires `pr`** (preflight refuses otherwise), and `scope=pr` keeps the caller's full selector (`owner/repo#N`, URL) instead of letting the reviewer fall back to a bare number resolved against the reviewed repo's remote.
+- **[P1] `scripts/init.mjs` ships in the npm tarball again** (it was excluded by the narrowed `files` while `npm run init` still pointed at it), and it now includes gateway credentials that live only in `~/.claude/settings.json`.
+- **Gate honesty:** the policy fingerprint covers the hook's `PROTECTED_WRITE`/`SECRET_READ` tables (a hook-only policy change now trips the stale-policy check), the smoke test fails on a `MISCONFIGURED` verdict instead of printing PASS, and the worktree fixture that used to be a vacuous `check(..., true, true)` is an explicit SKIP.
+- **Prompt/playbook single sources:** `REPORT_FORMAT` is extracted from the bundled SKILL.md (one contract, no second copy), fleet numbers come from `FLEET_NUMBERS` (tool schema, prompt and README all render from it; SKILL.md no longer repeats numbers), and `scope=auto` ordering is PR > baseRef > working-dir > last commit everywhere.
+- Suites: shell-guard 272, audit-fixes 305, p0-regression 163, validation 30, pack 43, cross-cases 154/154 (new C27: auto+baseRef, postToPR without pr, sync-failure job status), smoke PASS — `npm test` green (7 suites).
+- **Upgrade notes:** `postToPR` without `pr` is now rejected; `focus`/`outputLanguage` are stricter (from 1.18.4); the policy tables changed, so restart the MCP host; `claude_review_env` is no longer advertised as read-only (it can install/uninstall the skill).
+
 ## 1.18.4 — 2026-10-29
 
 Clears the remaining P2/P3 backlog (the triage in `audit/TRIAGE.md`): the guard-policy holes, the runtime/protocol rough edges, prompt/playbook consistency, and the test/packaging debt. No behaviour change in the happy path; the changes below are the ones a caller can observe.

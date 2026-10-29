@@ -22,7 +22,7 @@
  *      fingerprint probe and an MCP initialize/tools-list handshake run against
  *      the extracted copy — a tarball that is present-but-broken still fails.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -51,6 +51,7 @@ const truthy = (label, cond) => {
 const EXPECTED_FILES = [
   "src",
   "scripts/pre-tool-hook.js",
+  "scripts/init.mjs",
   "assets",
   "README.md",
   "README.en.md",
@@ -68,6 +69,7 @@ const REQUIRED_IN_TARBALL = [
   "src/skill.js",
   "src/version.js",
   "scripts/pre-tool-hook.js",
+  "scripts/init.mjs",
   "assets/skills/code-review/SKILL.md",
   "README.md",
   "LICENSE",
@@ -82,7 +84,6 @@ const FORBIDDEN_IN_TARBALL = [
   "scripts/smoke-test.mjs",
   "scripts/pack-test.mjs",
   "scripts/stub-claude.mjs",
-  "scripts/init.mjs",
   "scripts/paid-smoke.mjs",
   "scripts/e2e-test.mjs",
   "scripts/lib/mcp-client.mjs",
@@ -95,6 +96,16 @@ const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"))
 check("package.json files is the reviewed narrow list", pkg.files, EXPECTED_FILES);
 truthy("package.json still points at src/index.js", pkg.main === "src/index.js", pkg.main);
 truthy("the bin still points at src/index.js", pkg.bin?.["cc-code-review"] === "src/index.js", JSON.stringify(pkg.bin));
+// The manifest advertises `npm run init` as the one-command setup, so the file it
+// names must be part of the published package. 1.18.4 narrowed `files` to
+// scripts/pre-tool-hook.js only while scripts.init still pointed at
+// scripts/init.mjs, so the INSTALLED package died with MODULE_NOT_FOUND and
+// README's recommended setup was unreachable — while every checkout test stayed
+// green because the checkout has the file. Lock the specific entrypoint (the
+// general "every shipped npm script resolves" rule cannot hold: test/smoke/
+// validate are checkout-only on purpose).
+check("package.json scripts.init points at scripts/init.mjs",
+  /scripts[\\/]init\.mjs/.test(String(pkg.scripts?.init || "")), true);
 
 /* ---- 2. npm's own file list (dry run) ---- */
 const packJson = (args, opts = {}) =>
@@ -120,6 +131,8 @@ const dryFiles = (dry[0]?.files || []).map((f) => f.path).sort();
 const drySet = new Set(dryFiles);
 for (const f of REQUIRED_IN_TARBALL) check(`tarball contains ${f}`, drySet.has(f), true);
 for (const f of FORBIDDEN_IN_TARBALL) check(`tarball excludes ${f}`, drySet.has(f), false);
+// ...and the file scripts.init runs is really one of them (P1-8).
+check("tarball contains the file scripts.init runs", drySet.has("scripts/init.mjs"), true);
 check("tarball contains no node_modules entry", dryFiles.some((f) => f.startsWith("node_modules/")), false);
 check("every tarball path is a regular packaged file", dryFiles.every((f) => !f.startsWith("/") && !f.includes("..")), true);
 // The whole point of narrowing files: a published package is a runtime artifact,
@@ -203,6 +216,35 @@ try {
       console.error(String(e?.message || e).slice(-1000));
     } finally {
       srv.close();
+    }
+
+    // 3c. The INSTALLED package can run the setup command it advertises.
+    // `npm run init` (README: "one command, then restart the host") resolved
+    // node scripts/init.mjs inside a tarball that did not contain it, so the
+    // recommended setup died with MODULE_NOT_FOUND on every real install.
+    // A throwaway HOME keeps the developer's own ~/.zcode — and any live
+    // gateway token it would carry — out of the test.
+    {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "cc-pack-home-"));
+      const env = { ...process.env, HOME: home, USERPROFILE: home };
+      delete env.CLAUDE_CONFIG_DIR;
+      for (const k of ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]) delete env[k];
+      const run = spawnSync(NPM, ["run", "init"], {
+        cwd: appDir, env, encoding: "utf8", timeout: 180_000, windowsHide: true,
+      });
+      const out = `${run.stdout || ""}${run.stderr || ""}`;
+      check("npm run init in the extracted package has no MODULE_NOT_FOUND",
+        /MODULE_NOT_FOUND|Cannot find module/.test(out), false);
+      // 0 = self-check passed, 2 = self-check findings (e.g. no claude CLI on
+      // this machine, or the guard disabled): both mean the script RAN. A
+      // crash (1 / null) is the packaging regression this block exists for.
+      check("npm run init in the extracted package exits cleanly (0 ok / 2 self-check findings)",
+        [0, 2].includes(run.status), true);
+      let cfg = null;
+      try { cfg = JSON.parse(fs.readFileSync(path.join(home, ".zcode", "cli", "config.json"), "utf8")); } catch { /* asserted below */ }
+      const registered = String(cfg?.mcp?.servers?.["cc-code-review"]?.args?.[0] ?? "").split(path.sep).join("/");
+      truthy("npm run init registered the packaged entry file", registered.endsWith("src/index.js"), registered || "no config.json");
+      fs.rmSync(home, { recursive: true, force: true });
     }
   }
 } finally {

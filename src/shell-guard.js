@@ -131,6 +131,13 @@ export function policyFingerprint() {
     deny: OUTRIGHT_DENY,
     findWrite: [...FIND_WRITE_FLAGS],
     segments: MAX_SEGMENTS,
+    // The hook's write/read tables live in this module too, so a policy that
+    // changed only a protected path or a secret pattern is still a different
+    // policy (audit P1-13).
+    protectedWrite: PROTECTED_WRITE.map((re) => re.source + "/" + re.flags),
+    secretRead: SECRET_READ.map((re) => re.source + "/" + re.flags),
+    secretEnv: SECRET_ENV.source + "/" + SECRET_ENV.flags,
+    secretEnvAllow: SECRET_READ_ALLOW.source + "/" + SECRET_READ_ALLOW.flags,
   });
   return crypto.createHash("sha256").update(canon).digest("hex").slice(0, 16);
 }
@@ -152,7 +159,22 @@ export function bashAllowRules() {
 
 const MAX_SEGMENTS = 8;
 
-const FIND_WRITE_FLAGS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"]);
+const FIND_WRITE_FLAGS = new Set([
+  "-delete", "-exec", "-execdir", "-ok", "-okdir",
+  // GNU find's -fprint family includes the NUL-terminated spellings; a Set
+  // match on "-fprint" alone let -fprint0 / -fprintf0 write outside the repo.
+  "-fprint", "-fprint0", "-fprintf", "-fprintf0", "-fls",
+]);
+
+/**
+ * find's global options may precede the start paths. BSD find accepts the
+ * boolean cluster (-E -X -d -s -x) and -f PATH; GNU find accepts -Olevel and
+ * -Ddebugopts. Any of them used to end the leading-path loop at the flag, so
+ * the path after it was never checked: `find -x /etc` and `find -f /etc`
+ * both enumerate a host directory (audit P1-2 covers `find -- /etc`; these
+ * are the same escape through a different spellings).
+ */
+const FIND_GLOBAL_FLAGS = new Set(["-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"]);
 
 /**
  * Does cmd[i] start an expansion bash performs BEFORE the command runs?
@@ -174,31 +196,41 @@ function startsExpansion(cmd, i) {
  * Quote-aware: `git log --format="%h; %s"` is ONE segment. Reports the first
  * construct that makes the command unsafe regardless of the policy.
  *
- * @returns {{segs: {words: string[]}[], ops: string[], unsafe: null|"redirection"|"substitution"|"unbalanced"|"ansi-quoting"}}
+ * @returns {{segs: {words: string[], unquoted: string[], tilde: boolean[]}[], ops: string[], unsafe: null|"redirection"|"substitution"|"unbalanced"|"ansi-quoting"}}
  */
 function parseCommand(cmd) {
   const segs = [];
   const ops = [];
   let words = [];
-  let quoted = [];        // parallel to words: was any part of this word quote-protected?
+  // Parallel to words, the characters bash would still expand. Quoting is
+  // PER CHARACTER, not per word: in echo ~"/".ssh/* only the "/" is quoted,
+  // and bash still expands the leading ~ and the trailing *. The old per-word
+  // boolean marked the whole word literal and let that form through (audit
+  // P1-14). The tilde array records an unquoted ~ in the FIRST position, which
+  // is the only place bash performs tilde expansion.
+  let unquoted = [];
+  let tilde = [];
   let word = "";
-  let wordQuoted = false;
+  let wordUnquoted = "";
+  let wordTilde = false;
   let inWord = false;
   let quote = null;
   let unsafe = null;
 
   const endWord = () => {
-    if (inWord) { words.push(word); quoted.push(wordQuoted); word = ""; inWord = false; wordQuoted = false; }
+    if (inWord) {
+      words.push(word); unquoted.push(wordUnquoted); tilde.push(wordTilde);
+      word = ""; wordUnquoted = ""; wordTilde = false; inWord = false;
+    }
   };
   const endSeg = (op) => {
     endWord();
-    if (words.length) { segs.push({ words, quoted }); words = []; quoted = []; }
+    if (words.length) { segs.push({ words, unquoted, tilde }); words = []; unquoted = []; tilde = []; }
     if (op) ops.push(op);
   };
 
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
-    if (quote !== null) wordQuoted = true; // any character that arrives inside quotes is literal
     if (quote === "'") {
       if (c === "'") quote = null; else word += c;
       continue;
@@ -222,7 +254,7 @@ function parseCommand(cmd) {
       word += c;
       continue;
     }
-    if (c === "'" || c === '"') { quote = c; inWord = true; wordQuoted = true; continue; }
+    if (c === "'" || c === '"') { quote = c; inWord = true; continue; }
     if (c === "$" && (cmd[i + 1] === "'" || cmd[i + 1] === '"')) {
       // ANSI-C quoting ($'...') and locale quoting ($"...") are expanded by bash
       // BEFORE the command runs: $'-exec' is the argv word -exec. The parser only
@@ -244,7 +276,7 @@ function parseCommand(cmd) {
       // above, which is how the model writes them.
       const next = cmd[i + 1];
       if (next === "\n") { i++; continue; }          // line continuation: both gone
-      if (next !== undefined) { word += next; i++; inWord = true; wordQuoted = true; }
+      if (next !== undefined) { word += next; i++; inWord = true; }
       continue;
     }
     if (c === " " || c === "\t" || c === "\r") { endWord(); continue; }
@@ -259,6 +291,8 @@ function parseCommand(cmd) {
     }
     if (c === ">" || c === "<") { unsafe = unsafe || "redirection"; continue; }
     if (startsExpansion(cmd, i)) unsafe = unsafe || "substitution";
+    if (c === "~" && !inWord) wordTilde = true;
+    wordUnquoted += c;
     word += c;
     inWord = true;
   }
@@ -330,9 +364,10 @@ const FLAG_KINDS = {
     "-s": "skip", "--squeeze-repeats": "skip",
     "-c": "skip", "-C": "skip", "--complement": "skip",
   },
-  // echo reads nothing, but bash expands globs and ~ before it runs (audit
-  // P0-1), so every positional is checked against the repository like a read.
-  echo: {},
+  // echo has no entry: pathArgs returns before FLAG_KINDS, because its
+  // operands are judged by the expansion rule in segmentProblem (audit P0-1 /
+  // P1-14), not as in-repo paths. The old empty entry was unreachable (audit
+  // P2-4).
   cat: {},
   ls: { "--block-size": "skip", "-I": "skip", "--ignore": "skip", "--time-style": "skip", "--format": "skip", "-w": "skip", "--width": "skip", "--color": "skip", "--quoting-style": "skip", "--sort": "skip" },
   head: { "-n": "skip", "--lines": "skip", "-c": "skip", "--bytes": "skip" },
@@ -358,13 +393,52 @@ const FLAG_KINDS = {
   wc: { "--files0-from": "skip" },
 };
 
-/** Flags whose very existence is a read outside the tree. */
+/**
+ * Long options may be abbreviated to any unambiguous prefix: git accepts
+ * --cont for --contents, GNU sort accepts --files0 for --files0-from and
+ * --rand for --random-source. The deny table used to compare the complete
+ * spelling only, so every abbreviation was an escape hatch that read a host
+ * file (audit P0-4/P0-5/P0-7). A flag is in the table when it is a prefix of a
+ * denied long option and carries at least two characters after "--" (the
+ * conservative form of git's rule; a one-letter prefix is too ambiguous to
+ * judge). The comparison is one-directional on purpose: --no-indexx is NOT
+ * --no-index, and --no-color is not a prefix of --no-index.
+ */
+function flagName(token) {
+  const eq = token.indexOf("=");
+  return eq >= 0 ? token.slice(0, eq) : token;
+}
+
+function longOptionIs(name, option) {
+  if (name === option) return true;
+  if (!name.startsWith("--") || !option.startsWith("--")) return false;
+  if (name.length < 4) return false; // "--" plus at least two characters
+  return option.startsWith(name);
+}
+
+/** The deny reason for a token, honoring long-option abbreviations. */
+function denyReasonIn(table, word) {
+  const name = flagName(word);
+  for (const [option, why] of Object.entries(table)) {
+    if (option.startsWith("--") ? longOptionIs(name, option) : name === option) return why;
+  }
+  // Glued short option (-X/etc/passwd): the value never becomes a separate
+  // token, so the table has to see the two-character form.
+  if (/^-[^-]./.test(word)) return table[word.slice(0, 2)];
+  return undefined;
+}
+
+/** Flags whose very existence is a read outside the tree (or a write). */
 const OUTRIGHT_DENY = {
   git: {
     "--no-index": "`git diff --no-index` reads arbitrary paths outside the repository",
     "--contents": "`git blame --contents` reads an arbitrary file outside the repository",
     "-X": "`git ls-files -X` reads a path list from an arbitrary file outside the repository",
     "--exclude-from": "`git ls-files --exclude-from` reads a path list from an arbitrary file outside the repository",
+    "--ignore-revs-file": "`git blame --ignore-revs-file` reads an arbitrary file outside the repository and echoes its lines",
+    "--mailmap-file": "`git --mailmap-file` reads an arbitrary file outside the repository",
+    "--output": "`git --output` writes a file, and a read-only review must not write anything",
+    "--output-directory": "`git --output-directory` writes files, and a read-only review must not write anything",
   },
   wc: {
     "--files0-from": "`wc --files0-from` follows a list of paths that may point outside the repository",
@@ -378,7 +452,216 @@ const OUTRIGHT_DENY = {
     "--pre": "`rg --pre` runs an arbitrary program",
     "--pre-glob": "`rg --pre-glob` runs an arbitrary program",
   },
+  // GNU find only, but the guard must not depend on which find the host has:
+  // the flag follows a NUL-separated list of start paths from an arbitrary file.
+  find: {
+    "-files0-from": "`find -files0-from` follows a list of paths that may point outside the repository",
+  },
 };
+
+/**
+ * The PreToolUse hook's write/read policy tables live here, next to the Bash
+ * policy, for two reasons:
+ *   1. policyFingerprint() can cover them, so an upgrade that adds a protected
+ *      path is visible to the stale-process self-test (audit P1-13); before,
+ *      the server hashed only this file's tables while the hook enforced its own.
+ *   2. the hook already imports this module for every Bash call, so the tables
+ *      travel with the guard instead of becoming a second hand-maintained
+ *      dialect of prompt.js's globs (audit P2-2).
+ * They are regexes, not globs, because the hook must judge paths that do not
+ * exist yet, which the permission engine's deny globs cannot match.
+ *
+ * prompt.js still renders its own glob list for the permission engine. It is
+ * not imported here on purpose: that module pulls in the skill/prompt builders,
+ * and a hook that depends on them would lose its fail-closed write/read
+ * boundary whenever prompt construction breaks (which happened during this
+ * very audit). The two lists are kept in step by hand; the hook's regexes are
+ * the layer that must stay self-contained.
+ */
+
+/** In-repo paths that are execution configuration rather than source. */
+export const PROTECTED_WRITE = [
+  /(^|\/)\.claude(\/|$)/i,
+  /(^|\/)\.envrc(\.|$)/i,
+  /(^|\/)\.husky(\/|$)/i,
+  /(^|\/)\.github\/workflows(\/|$)/i,
+  // Composite actions are checked out and run by the next CI job with the
+  // workflow's secrets, exactly like the workflow file itself (audit P1-3).
+  /(^|\/)\.github\/actions(\/|$)/i,
+  /(^|\/)\.gitlab-ci\.yml$/i,
+  /(^|\/)Jenkinsfile$/i,
+  /(^|\/)Makefile$/i,
+  /(^|\/)(justfile|taskfile[^/]*)$/i,
+  /(^|\/)\.pre-commit-config\.ya?ml$/i,
+  /(^|\/)\.devcontainer(\/|$)/i,
+  /(^|\/)\.cargo\/config(\.toml)?$/i,
+  /(^|\/)\.circleci(\/|$)/i,
+  // .npmrc can set script-shell, which decides which shell runs every npm
+  // lifecycle script (audit P1-3); it is also credential material.
+  /(^|\/)\.npmrc$/i,
+  /(^|\/)\.vscode(\/|$)/i,
+  /(^|\/)\.idea(\/|$)/i,
+  /(^|\/)\.mcp\.json$/i,
+  /(^|\/)\.gitmodules$/i,
+  /(^|\/)\.gitattributes$/i,
+  /(^|\/)\.gitconfig$/i,
+  // Self-review: the reviewed repository can be this very package. Writing its
+  // guard files would disarm the hook for every later run, so these two
+  // package-relative paths are protected even though they are ordinary source.
+  // Root-anchored on purpose — other src/* files stay editable.
+  /^scripts\/pre-tool-hook\.js$/i,
+  /^src\/shell-guard\.js$/i,
+];
+
+/**
+ * Secret material a review must not copy into the transcript (audit SEC-23).
+ * Read, Grep, Glob and the Bash surface (P1-4) all share this list.
+ */
+export const SECRET_READ = [
+  /(^|\/)\.ssh(\/|$)/i,
+  /(^|\/)\.aws(\/|$)/i,
+  /(^|\/)\.gnupg(\/|$)/i,
+  /(^|\/)\.netrc$/i,
+  /(^|\/)\.pgpass$/i,
+  // Credential stores the old list missed (audits P1-4 / P2-2): npm auth
+  // tokens, git's plaintext https credentials, PyPI, Docker and KeePass vaults.
+  /(^|\/)\.npmrc$/i,
+  /(^|\/)\.git-credentials$/i,
+  /(^|\/)\.pypirc$/i,
+  /(^|\/)\.dockercfg$/i,
+  // .dockercfg is the legacy name; current Docker stores the same registry
+  // credentials in .docker/config.json.
+  /(^|\/)\.docker\/config\.json$/i,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)[^/]*$/i,
+  /(^|\/)[^/]+\.(pem|key|p12|pfx|keystore|jks)$/i,
+  /(^|\/)[^/]+\.kdbx$/i,
+  /(^|\/)credentials(\.[^/]*)?$/i,
+  /(^|\/)secrets\.[^/]+$/i,
+];
+// .env is a separate rule so a template can be allowed without exempting a
+// .env.example file that sits inside .ssh/.aws (the directory rules win).
+export const SECRET_ENV = /(^|\/)\.env(\.[^/]*)?$/i;
+export const SECRET_READ_ALLOW = /(^|\/)\.env\.(example|sample|template|dist)$/i;
+
+/** Is relSlash secret material? Shared by every tool boundary. */
+export function isSecretPath(relSlash) {
+  return SECRET_READ.some((re) => re.test(relSlash)) ||
+    (SECRET_ENV.test(relSlash) && !SECRET_READ_ALLOW.test(relSlash));
+}
+
+/**
+ * A word whose pattern can reach a dotfile, or null.
+ *
+ * Two different expansions are involved:
+ *  - Bash expands a word only when some part of it was unquoted, but a quoted
+ *    dot still contributes a literal dot to the pattern (the word ''"."*
+ *    reaches .*). The tokenizer records the unquoted characters per word, so
+ *    a dot-prefixed component with a glob is dangerous exactly when one of
+ *    its glob characters was unquoted.
+ *  - git expands wildcards in its own pathspecs regardless of shell quoting:
+ *    git diff -- 'src/.*' matches src/.env. For git segments every non-flag
+ *    word is therefore judged even when it was quoted.
+ * A fully quoted non-git pattern (find . -name '.*', rg '.*') stays usable.
+ */
+export function dotGlobProblem(cmd) {
+  if (typeof cmd !== "string") return null;
+  const parsed = parseCommand(cmd);
+  if (parsed.unsafe) return null;
+  for (const { words, unquoted } of parsed.segs) {
+    const isGit = words[0] === "git";
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      if (!word) continue;
+      const dottedGlob = word.split("/").some((part) => part.startsWith(".") && /[*?\[\]]/.test(part));
+      if (!dottedGlob) continue;
+      if (isGit && i > 0 && !word.startsWith("-")) return word;
+      if (/[*?\[\]]/.test(unquoted[i] || "")) return word;
+    }
+  }
+  return null;
+}
+
+/** owner/repo, or host/owner/repo as gh accepts for --repo. */
+const GH_REPO_SHAPE = /^(?:[A-Za-z0-9.-]+(?::[0-9]+)?\/)?[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+/** A value gh can safely parse as a repository selector. */
+function ghRepoIsShape(value) {
+  if (typeof value !== "string" || value.startsWith("-")) return false;
+  if (!GH_REPO_SHAPE.test(value)) return false;
+  // "." and ".." satisfy the character class but are path traversal, not a
+  // repository name; the regex alone would accept --repo ../..
+  return value.split("/").every((part) => part !== "." && part !== "..");
+}
+
+/**
+ * gh's file-bearing flags. --body-file/-F names a HOST file that gh opens and
+ * POSTs to GitHub before any network check, so it must obey the same in-repo
+ * rule as every other path operand (audit P0-6). -F- / --body-file - reads
+ * stdin and names no file.
+ */
+function ghPathArgs(words) {
+  const out = [];
+  for (let i = 1; i < words.length; i++) {
+    const t = words[i];
+    if (t === "--body-file" || t === "-F") {
+      const v = words[++i];
+      if (typeof v === "string" && v !== "-") out.push({ value: v });
+      continue;
+    }
+    if (t.startsWith("--body-file=")) {
+      const v = t.slice("--body-file=".length);
+      if (v && v !== "-") out.push({ value: v });
+      continue;
+    }
+    // Go's pflag accepts a shorthand's value glued on (-Ffile) and with an
+    // equals sign (-F=file). Verified against gh 2.92: -F=/tmp/x opens /tmp/x,
+    // so the equals form must be stripped before the path check or a host path
+    // would be judged as the repo-relative name "=/tmp/x" (audit P0-6).
+    if (t.startsWith("-F=") && !t.startsWith("--")) {
+      const v = t.slice(3);
+      if (v !== "-") out.push({ value: v });
+      continue;
+    }
+    if (t.startsWith("-F") && !t.startsWith("--") && t.length > 2) {
+      const v = t.slice(2);
+      if (v !== "-") out.push({ value: v });
+    }
+  }
+  return out;
+}
+
+/**
+ * gh target validation: --repo/-R must name owner/repo (or host/owner/repo).
+ * A free-form value could select a different host or smuggle an option into
+ * the argument gh parses next (audit P0-6).
+ */
+function ghProblem(words) {
+  for (let i = 1; i < words.length; i++) {
+    const t = words[i];
+    let value = null;
+    if (t === "--repo" || t === "-R") {
+      value = words[++i];
+      if (typeof value !== "string") {
+        return "blocked: `gh --repo` needs an owner/repo value. Name the repository explicitly.";
+      }
+    } else if (t.startsWith("--repo=")) {
+      value = t.slice("--repo=".length);
+    } else if (t.startsWith("-R=")) {
+      value = t.slice(3);
+    } else if (t.startsWith("-R") && !t.startsWith("--") && t.length > 2) {
+      value = t.slice(2);
+    } else if (t === "--body-file" || t === "-F") {
+      const next = words[i + 1];
+      if (typeof next !== "string") {
+        return "blocked: `gh --body-file` needs a file path inside the reviewed repository (or - for stdin).";
+      }
+    }
+    if (value !== null && !ghRepoIsShape(value)) {
+      return "blocked: `gh --repo " + value + "` is not an owner/repo name. Name the repository as owner/repo (or host/owner/repo).";
+    }
+  }
+  return null;
+}
 
 /**
  * The tokens of one segment that name filesystem paths.
@@ -394,13 +677,31 @@ function pathArgs(words) {
     // start paths; once the expression begins, only file-reference predicates
     // name files (-newer FILE, -samefile FILE). Both forms must be checked:
     // the old loop stopped at the first flag, so `find . -newer /etc/passwd`
-    // never reached the path check (audit P2-2).
+    // never reached the path check (audit P2-2). `--` ends option parsing but
+    // the operands after it are still start paths, so they are checked too
+    // (audit P1-2: `find -- /etc` enumerated a host directory).
     const out = [];
     let i = 0;
+    let endOfOptions = false;
     for (; i < rest.length; i++) {
       const t = rest[i];
-      if (t === "-H" || t === "-L" || t === "-P") continue;
-      if (t === "-D" || t === "-O") { i++; continue; } // their value
+      if (t === "--") { endOfOptions = true; continue; }
+      if (!endOfOptions) {
+        if (FIND_GLOBAL_FLAGS.has(t)) continue;
+        if (t === "-D" || t === "-O") { i++; continue; } // their value
+        if (/^-O[0-9]+$/.test(t) || /^-D.+/.test(t)) continue; // glued value
+        if (t === "-f") {
+          const v = rest[i + 1];
+          if (typeof v === "string") out.push({ value: v });
+          i++;
+          continue;
+        }
+        // getopt also accepts the value glued on: -f/etc (BSD find reads /etc).
+        if (t.startsWith("-f") && !t.startsWith("--") && t.length > 2) {
+          out.push({ value: t.slice(2) });
+          continue;
+        }
+      }
       if (t.startsWith("-") || t === "(" || t === "!" || t === "\\(") break;
       out.push({ value: t });
     }
@@ -415,10 +716,15 @@ function pathArgs(words) {
     }
     return out;
   }
-  // Programs whose arguments are never filesystem paths. git/gh report paths
-  // from the repository itself; every other program (echo and tr included)
-  // goes through FLAG_KINDS so its operands get the in-repo path check.
-  if (prog === "git" || prog === "gh" || prog === "echo") return [];
+  // git reports paths from the repository itself (its own deny table covers the
+  // flags that read host files); gh reads files through --body-file/-F, which
+  // is checked here; echo's operands are expansion-checked in segmentProblem
+  // rather than treated as paths. Every other program (tr and the rest of the
+  // sinks included) goes through FLAG_KINDS so its operands get the in-repo
+  // path check.
+  if (prog === "git") return [];
+  if (prog === "gh") return ghPathArgs(words);
+  if (prog === "echo") return [];
   const kinds = FLAG_KINDS[prog];
   if (!kinds) return [];
   const out = [];
@@ -547,11 +853,7 @@ function outrightDeny(words) {
   const table = OUTRIGHT_DENY[words[0]];
   if (!table) return null;
   for (const w of words) {
-    let name = w.includes("=") ? w.slice(0, w.indexOf("=")) : w;
-    let why = table[name];
-    // Glued short option (-X/etc/passwd): the value never becomes a separate
-    // token, so the table has to see the two-character form.
-    if (!why && /^-[^-]./.test(w)) { name = w.slice(0, 2); why = table[name]; }
+    const why = denyReasonIn(table, w);
     if (why) return `blocked: ${why}. Review mode is read-only and scoped to the repository.`;
   }
   return null;
@@ -563,7 +865,7 @@ function outrightDeny(words) {
  * positional). Applied to both policy commands and pipe sinks.
  * @returns {string | null}
  */
-function segmentProblem(words, repoRoot, quoted = []) {
+function segmentProblem(words, repoRoot, unquoted = [], tilde = []) {
   const prog = words[0];
 
   const outright = outrightDeny(words);
@@ -572,8 +874,15 @@ function segmentProblem(words, repoRoot, quoted = []) {
   if (prog === "find" && words.some((w) => FIND_WRITE_FLAGS.has(w))) {
     return "blocked: find with a write/execute action (-delete, -exec, -ok, -fprint, ...). Review mode is read-only — use Read/Glob/Grep, or a plain find without those flags.";
   }
-  if (prog === "rg" && words.some((w) => w === "--pre" || w.startsWith("--pre=") || w === "--pre-glob" || w.startsWith("--pre-glob="))) {
+  if (prog === "rg" && words.some((w) => {
+    const name = flagName(w);
+    return longOptionIs(name, "--pre") || longOptionIs(name, "--pre-glob");
+  })) {
     return "blocked: rg --pre / --pre-glob runs an arbitrary program for every file. Review mode is read-only — use a plain rg.";
+  }
+  if (prog === "gh") {
+    const problem = ghProblem(words);
+    if (problem) return problem;
   }
   if (prog === "git") {
     const write = gitWriteFlagIn(words);
@@ -587,10 +896,13 @@ function segmentProblem(words, repoRoot, quoted = []) {
     // operand the guard sees is not the one that executes. A review only
     // needs literal text; refuse the expansion instead of checking a pattern
     // that no longer describes the output (audit P0-1).
-    // Only UNQUOTED operands expand: `echo *` lists the cwd, but `echo "*"` prints
-    // a star and `echo 'price: $5'` prints text. The tokenizer records which words
-    // were quote-protected, so the legitimate literal form is not refused.
-    const expands = words.slice(1).find((w, i) => !quoted[i + 1] && (w.startsWith("~") || /[?*\[\]]/.test(w)));
+    // Only UNQUOTED characters expand: `echo *` lists the cwd, but `echo "*"`
+    // prints a star and `echo 'price: $5'` prints text. The tokenizer records
+    // the characters that were NOT inside quotes, so a word with one quoted
+    // character (`echo "/x/"*`) is still judged by its unquoted glob (audit
+    // P1-14: the old per-word boolean let that form through).
+    const expands = words.slice(1).find((w, i) =>
+      /[?*\[\]]/.test(unquoted[i + 1] || "") || Boolean(tilde[i + 1]));
     if (expands) {
       return `blocked: \`echo ${expands}\` is expanded by the shell before echo runs (a glob or ~ enumerates files the review must not list). Echo literal text without wildcards or ~; use the Read/Grep/Glob tools for file contents.`;
     }
@@ -598,10 +910,14 @@ function segmentProblem(words, repoRoot, quoted = []) {
   if (prog === "sort") {
     // -oFILE / -TFILE (value glued to the short option) are the same write and
     // temp-dir escapes as their spaced forms; match the tight spelling too or the
-    // only file-write primitive left in the policy stays open.
-    const bad = words.find((w) =>
-      w === "-o" || w === "-T" || w.startsWith("--output") || w.startsWith("--compress-program") ||
-      w.startsWith("--temporary-directory") || /^-[A-Za-z]*[oT]./.test(w));
+    // only file-write primitive left in the policy stays open. The long forms
+    // accept the same unambiguous abbreviations as the deny table.
+    const bad = words.find((w) => {
+      if (w === "-o" || w === "-T" || /^-[A-Za-z]*[oT]./.test(w)) return true;
+      const name = flagName(w);
+      return longOptionIs(name, "--output") || longOptionIs(name, "--compress-program") ||
+        longOptionIs(name, "--temporary-directory");
+    });
     if (bad) {
       return "blocked: sort -o/--compress-program/--temporary-directory write files or run a program outside the reviewed repository. Review mode is read-only.";
     }
@@ -649,10 +965,11 @@ function cdProblem(words, repoRoot) {
 }
 
 function gitWriteFlagIn(words) {
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
-    if (/^--output(-directory)?=/.test(w) || /^--output-to=/.test(w)) return w.split("=")[0] + "=";
-    if (w === "--output" || w === "--output-directory" || w === "--output-to") return `${w} `;
+  for (const w of words) {
+    const name = flagName(w);
+    for (const option of ["--output", "--output-directory", "--output-to"]) {
+      if (longOptionIs(name, option)) return `${option} `;
+    }
     if (w === "-o") return "-o ";
   }
   return null;
@@ -771,14 +1088,14 @@ export function analyseCommand(cmd, opts = {}) {
           };
         }
       }
-      const why = segmentProblem(words, opts.repoRoot, segs[i].quoted);
+      const why = segmentProblem(words, opts.repoRoot, segs[i].unquoted, segs[i].tilde);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }
 
     // A pipe sink consumes stdin only; it is never a valid first command.
     if (i > 0 && ops[i - 1] === "|" && PIPE_SINKS.has(words[0])) {
-      const why = segmentProblem(words, opts.repoRoot, segs[i].quoted);
+      const why = segmentProblem(words, opts.repoRoot, segs[i].unquoted, segs[i].tilde);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }

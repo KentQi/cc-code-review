@@ -3,52 +3,46 @@
  * Followup e2e: continues a previous review session through the MCP stdio
  * interface. argv: <repoPath> <sessionId>. Uses real Claude credits.
  */
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { connectServer } from "./lib/mcp-client.mjs";
 
 const [, , repoPath, sessionId] = process.argv;
 if (!repoPath || !sessionId) { console.error("usage: node followup-e2e.mjs <repoPath> <sessionId>"); process.exit(1); }
 
 const serverPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "index.js");
-const child = spawn(process.execPath, [serverPath], { stdio: ["pipe", "pipe", "inherit"] });
-
-let nextId = 1;
-const pending = new Map();
-let buf = Buffer.alloc(0);
-child.stdout.on("data", (d) => {
-  buf = Buffer.concat([buf, d]);
-  let idx;
-  while ((idx = buf.indexOf(0x0a)) >= 0) {
-    const line = buf.subarray(0, idx).toString("utf8").trim();
-    buf = buf.subarray(idx + 1);
-    if (!line) continue;
-    try {
-      const msg = JSON.parse(line);
-      if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
-    } catch { /* ignore */ }
-  }
+// Shared stdio client (audit Q20/P2-10). The 10 min budget is this suite's (a
+// real followup turn), so it is passed here instead of living in a second copy
+// of the client that had drifted from the other paid suites.
+const srv = connectServer({
+  args: [serverPath],
+  timeoutMs: 10 * 60_000,
+  clientInfo: { name: "followup-e2e", version: "0.0.1" },
 });
-const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
-const request = (method, params) => new Promise((resolve, reject) => {
-  const id = nextId++;
-  const t = setTimeout(() => reject(new Error(`timeout: ${method}`)), 10 * 60_000);
-  pending.set(id, (msg) => { clearTimeout(t); resolve(msg); });
-  send({ jsonrpc: "2.0", id, method, params });
-});
+await srv.initialize();
 
-await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "followup-e2e", version: "0.0.1" } });
-send({ jsonrpc: "2.0", method: "notifications/initialized" });
-
-const res = await request("tools/call", {
-  name: "claude_review_followup",
-  arguments: { sessionId, repoPath, message: "用一句话复述你报告里最严重的那条 finding（含文件与行号）。", outputLanguage: "中文", timeoutMinutes: 8 },
+// waitForResult:true is REQUIRED here (audit P2-11). claude_review_followup
+// defaults to async: without the flag it acknowledges with a jobId and this
+// script printed "FOLLOWUP E2E OK" the moment the preflight passed — the reply
+// was never fetched, so a followup that returned nothing at all still passed.
+const res = await srv.call("claude_review_followup", {
+  sessionId, repoPath, waitForResult: true,
+  message: "用一句话复述你报告里最严重的那条 finding（含文件与行号）。", outputLanguage: "中文", timeoutMinutes: 8,
 });
 
 const text = res.result?.content?.[0]?.text ?? JSON.stringify(res, null, 2);
 console.log(`\n===== claude_review_followup result =====\n`);
 console.log(text);
+// A synchronous followup must come back with a REPLY, not an ack: assert the
+// call did not fail, the content is non-empty, AND the payload is not the async
+// acknowledgment. The ack check is what makes a future removal of
+// waitForResult:true visible — the ack is non-empty text too, so "non-empty"
+// alone would still print OK while the reply was never fetched (audit P2-11).
+const body = String(text || "").trim();
+const empty = body.length === 0;
+const asyncAck = /^Followup started in the background/i.test(body)
+  || res.result?.structuredContent?.status === "running";
 const failed = res.result?.isError || !!res.error;
-child.kill();
-console.log(`\nFOLLOWUP E2E ${failed ? "FAILED (isError)" : "OK"}`);
-process.exit(failed ? 1 : 0);
+srv.close();
+console.log(`\nFOLLOWUP E2E ${failed ? "FAILED (isError)" : empty ? "FAILED (empty reply)" : asyncAck ? "FAILED (async ack: waitForResult was not honoured)" : "OK"}`);
+process.exit(failed || empty || asyncAck ? 1 : 0);

@@ -406,12 +406,19 @@ export function buildClaudeEnv() {
 
   const target = gatewayTarget();
   if (target && isLoopbackHost(target.host)) {
-    const covers = (v) =>
-      !!v && v.split(",").map((s) => s.trim().toLowerCase())
-        .some((s) => ["localhost", "127.0.0.1", "::1", "<local>", ".local", "*"].includes(s));
-    const add = "localhost,127.0.0.1,::1";
+    // SEC-09: one loopback sentinel is not enough. The old covers() treated the
+    // list as an OR, so NO_PROXY=localhost still sent http://127.0.0.1 traffic
+    // (with its Bearer token) through the host's proxy. Add every missing
+    // loopback spelling instead of skipping the whole repair (P2-7). A "*" entry
+    // already bypasses the proxy for everything and is left alone.
+    const loopback = ["localhost", "127.0.0.1", "::1", "[::1]", "<local>"];
     for (const key of ["NO_PROXY", "no_proxy"]) {
-      if (!covers(env[key])) env[key] = env[key] ? `${env[key]},${add}` : add;
+      const raw = String(env[key] ?? "").trim();
+      const entries = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+      const have = new Set(entries.map((s) => s.toLowerCase()));
+      if (have.has("*")) continue;
+      const missing = loopback.filter((h) => !have.has(h));
+      if (missing.length) env[key] = entries.length ? [...entries, ...missing].join(",") : missing.join(",");
     }
   }
   // GIT_CONFIG_* is the ENV equivalent of "git -c key=value": it applies at
@@ -423,7 +430,8 @@ export function buildClaudeEnv() {
   // suggested by the prompt) runs core.sshCommand before any network I/O.
   // The keys are exactly the ones a review needs to survive: a repository must
   // not choose the ssh transport, the pager, the credential helper, the hook
-  // path, the fsmonitor, the external diff, or a third attributes file.
+  // path, the fsmonitor, the external diff, a third attributes file, or a
+  // transport (protocol.ext/protocol.file, P0-1).
   // A host-provided GIT_CONFIG_COUNT is preserved (entries are appended after
   // it) so the server never silently drops config the caller injected.
   const gitOverrides = [
@@ -436,6 +444,12 @@ export function buildClaudeEnv() {
     // P0-9: attributesFile is a THIRD attributes source that can activate a
     // live textconv driver on a plain `git log -p`; an empty value removes it.
     ["core.attributesFile", ""],
+    // P0-1: the transport family is an execution surface too. `ext::` runs an
+    // external command as the remote URL's transport, and protocol.file
+    // re-enables file:// URLs (and the local clone helpers) a repo can name.
+    // command-scope "never" beats any protocol.* block in the repo's config.
+    ["protocol.ext.allow", "never"],
+    ["protocol.file.allow", "never"],
   ];
   const hostCount = /^\d+$/.test(String(env.GIT_CONFIG_COUNT ?? "")) ? Number(env.GIT_CONFIG_COUNT) : 0;
   gitOverrides.forEach(([key, value], i) => {
@@ -845,16 +859,18 @@ export function isAllowedTranscriptPath(filePath) {
 }
 
 /**
- * "This tool_result is a launch acknowledgement, not a report" — deliberately
+ * "This tool_result is SHAPED like a launch acknowledgement" — deliberately
  * weaker than parseAgentLaunchAck: it needs the anchored ack line plus one of
  * the two identifying lines, but NOT the transcript path (older CLI shapes omit
- * it). Used only to avoid filing an ack as a report; it never authorises a file
- * read, so the weaker check cannot widen the read surface.
+ * it). It never authorises a file read, so the weaker check cannot widen the read
+ * surface.
  *
- * It is still a BLOCK, not a phrase: the ack sentence has to fill the first line
- * and everything after it has to be ack metadata. A report that merely STARTS
- * with the ack sentence used to be dropped as an ack (R-19) — losing the
- * findings AND leaving only the strict ack's `output_file` as a fallback.
+ * It is a BLOCK, not a phrase: the ack sentence has to fill the first line (the
+ * rest may only be a parenthetical), so an ordinary report that merely mentions
+ * the sentence is not an ack. The lines AFTER it may be metadata only OR metadata
+ * plus a report body: an ack that continues with findings is BOTH, and
+ * launchAckBody() extracts the findings so ingest() can file them (P3-3). A pure
+ * ack is still only an ack and is not filed as a report.
  */
 const ACK_HEAD = /^\s*Async agent launched successfully\.?/i;
 const ACK_TAIL_LINE = [
@@ -882,15 +898,41 @@ export function looksLikeLaunchAck(text) {
   const rest = firstLine.slice(head[0].length).trim();
   if (rest && !/^\([^)]*\)?$/.test(rest)) return false;
   if (!/agentId:\s*\S+/.test(s) && !/working in the background/i.test(s)) return false;
-  // Every following line must be ack metadata. A substantive line means this is
-  // a real report that merely opened with the ack sentence (repo content can
-  // prompt-inject that opening), so it must not be filed away as an ack.
-  if (nl < 0) return true;
+  // P3-3: an ack whose body carries substantive prose is BOTH — the ack must
+  // still be recognized (its transcript path is the 429 fallback), and the prose
+  // must be filed as the reviewer's report. This function only answers "is this
+  // an ack shape"; launchAckBody() extracts the report so nothing is dropped.
+  return true;
+}
+
+/**
+ * The substantive lines an ack-shaped tool_result carries after its metadata, or
+ * null when it is a pure acknowledgement. The ack line, agentId/output_file and
+ * the other CLI metadata lines are stripped; everything else is report content.
+ *
+ * This is what lets ingest() keep both halves of a tool_result that opens with
+ * the ack sentence and continues with findings (P3-3). It is only called after
+ * the same shape checks as looksLikeLaunchAck(), so a plain report can never be
+ * mistaken for an ack.
+ */
+function launchAckBody(text) {
+  const s = String(text ?? "");
+  const nl = s.indexOf("\n");
+  if (nl < 0) return null;
+  const firstLine = s.slice(0, nl);
+  const head = ACK_HEAD.exec(firstLine);
+  if (!head) return null;
+  const rest = firstLine.slice(head[0].length).trim();
+  if (rest && !/^\([^)]*\)?$/.test(rest)) return null;
+  if (!/agentId:\s*\S+/.test(s) && !/working in the background/i.test(s)) return null;
+  const body = [];
   for (const line of s.slice(nl + 1).split(/\r?\n/)) {
     const l = line.trim();
-    if (l && !ACK_TAIL_LINE.some((re) => re.test(l))) return false;
+    if (!l) continue;
+    if (ACK_TAIL_LINE.some((re) => re.test(l))) continue;
+    body.push(line.trimEnd());
   }
-  return true;
+  return body.length ? body.join("\n") : null;
 }
 
 /**
@@ -1476,7 +1518,11 @@ export function writeGuardSettings(extra = {}) {
       ...(shellGuardStatus().enabled ? {
         hooks: {
           PreToolUse: [{
-            matcher: "Bash|Write|Edit|MultiEdit|NotebookEdit|Read",
+            // Catch-all: the reviewed repository must not be able to choose
+            // which tool calls bypass the hook. The old allowlist matcher left
+            // Grep/Glob entirely outside it, and those carry `path` inputs — the
+            // hook itself scopes any call that names a path (P1-5).
+            matcher: ".*",
             hooks: [{ type: "command", command: guardHookCommand(), onFailure: "block" }],
           }],
         },
@@ -1487,6 +1533,26 @@ export function writeGuardSettings(extra = {}) {
   } catch {
     return null; // a broken guard must not take the review down with it
   }
+}
+
+/**
+ * Create and validate a private directory under the shared OS temp dir.
+ *
+ * mkdirSync({recursive:true}) does NOT reject a pre-created symlink to a
+ * directory, so on a multi-user host an attacker can plant
+ * <tmp>/cc-code-review -> ~attacker and receive every file this process writes
+ * there. Same three checks the guard-settings directory uses: no symlink, the
+ * current uid, and mode 0700 on the existing entry (mode only applies on create).
+ */
+function ensureOwnedPrivateDir(dir, what) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = fs.lstatSync(dir);
+  if (st.isSymbolicLink()) throw new Error("refusing a symlinked " + what + " directory");
+  if (!st.isDirectory()) throw new Error(what + " path is not a directory");
+  if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+    throw new Error(what + " directory owned by uid " + st.uid + ", not " + process.getuid());
+  }
+  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
 }
 
 /**
@@ -1615,6 +1681,10 @@ export function runClaude({
     const soChunks = [];
     let soBytes = 0;
     let stdoutTruncated = false;
+    // P3-2: an oversized, unterminated stream-json line is dropped below. Keep
+    // an explicit flag so the caller is told an event may be missing instead of
+    // silently receiving "no report" from a run that exited 0.
+    let streamLineDropped = false;
     const seChunks = [];
     let seBytes = 0;
     let stderrTruncated = false;
@@ -1658,7 +1728,11 @@ export function runClaude({
     const openSubagentsFile = () => {
       if (subagentsFile) return subagentsFile;
       const dir = subagentsDir || path.join(os.tmpdir(), "cc-code-review");
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      // index.js passes logsDir(), which already validates ownership; the
+      // fallback creates the shared temp dir itself and must do the same check
+      // (P2-21) — a symlink there would receive the paid reviewer reports.
+      if (subagentsDir) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      else ensureOwnedPrivateDir(dir, "subagents");
       subagentsFile = path.join(dir, `subagents-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}.jsonl`);
       activeSubagentFiles.add(subagentsFile);
       return subagentsFile;
@@ -1751,10 +1825,22 @@ export function runClaude({
         });
       } else if (!n && facts.agentResults) {
         for (const r of facts.agentResults) {
-          // Launch ack (strict or loose shape): the report comes later, via a
-          // task_notification or the transcript recovery pass.
-          if (r.ack || looksLikeLaunchAck(r.text)) continue;
           const d = agentDispatches.find((x) => x.id === r.id);
+          const ackBody = launchAckBody(r.text);
+          // Launch ack (strict or loose shape): the report normally comes later,
+          // via a task_notification or the transcript recovery pass. P3-3: an ack
+          // that continues with substantive prose is both — remember the ack (the
+          // output_file was already captured above) AND file the prose, instead
+          // of emitting the whole ack text as a fake reviewer report.
+          if (r.ack || ackBody !== null || looksLikeLaunchAck(r.text)) {
+            if (ackBody && d) {
+              emitSubagent({
+                id: r.id, description: d.description, subagentType: d.subagentType,
+                async: false, status: "completed", report: ackBody,
+              });
+            }
+            continue;
+          }
           if (!d) continue; // not a subagent dispatch (some other tool result)
           emitSubagent({
             id: r.id, description: d.description, subagentType: d.subagentType,
@@ -1783,8 +1869,14 @@ export function runClaude({
       }
       // An unterminated multi-MB line (corrupt stream) would otherwise grow
       // unboundedly with per-chunk Buffer.concat (O(n^2)). Drop it: no valid
-      // stream-json event is that large.
-      soPartial = buf.length > 4 * 1024 * 1024 ? Buffer.alloc(0) : buf;
+      // stream-json event is that large. Record it — if the dropped line was the
+      // result event, the run would otherwise report no result with no reason.
+      if (buf.length > 4 * 1024 * 1024) {
+        soPartial = Buffer.alloc(0);
+        streamLineDropped = true;
+      } else {
+        soPartial = buf;
+      }
     });
     child.stderr.on("data", (d) => {
       if (seBytes >= MAX_STREAM_BYTES) { stderrTruncated = true; return; }
@@ -1798,9 +1890,9 @@ export function runClaude({
       // The child already exited: the work is done and only a descendant holding
       // the inherited stdio keeps 'close' from firing. Settle with the real exit
       // status instead of throwing a complete, paid-for report away as timedOut.
-      // The short drain lets a final `result` line still sitting in the pipe be
-      // ingested before finish() destroys the streams.
+      // A tighter drain than the exit handler's: the deadline is already here.
       if (exited) {
+        if (drainTimer) clearTimeout(drainTimer);
         drainTimer = setTimeout(() => finish(exitedCode, exitedSignal), 200);
         return;
       }
@@ -1876,6 +1968,15 @@ export function runClaude({
       let stderr = Buffer.concat(seChunks).toString("utf8");
       if (stdoutTruncated) stderr += `\n[cc-code-review] stdout exceeded ${MAX_STREAM_BYTES} bytes and was truncated`;
       if (stderrTruncated) stderr += `\n[cc-code-review] stderr exceeded ${MAX_STREAM_BYTES} bytes and was truncated`;
+      if (streamLineDropped) {
+        stderr += "\n[cc-code-review] a stream-json line exceeded 4 MB and was discarded; an event (possibly the result) may be missing";
+      }
+      if (flags.streamJson && stdoutTruncated && !resultEvent) {
+        // The result event is the LAST stream-json line, so truncating stdout at
+        // 8 MB removes exactly the line parseResultJson() needs. Say so: the CLI
+        // can exit 0 with a complete report while this server sees none (P3-2).
+        stderr += `\n[cc-code-review] the stream result event was lost to the ${MAX_STREAM_BYTES}-byte stdout cap (no result event was observed); the run may have completed without a report being captured`;
+      }
       // Declared BEFORE the signal-hint block below uses it. Keeping this line
       // after that block was a TDZ bug: on unix every cancelled run or
       // Gatekeeper SIGKILL threw "Cannot access 'wasCancelled' before
@@ -1926,8 +2027,11 @@ export function runClaude({
           subagentType: r.subagentType,
           report: r.report,
           status: r.status,
-          async: r.async || undefined,
-          partial: r.partial || undefined,
+          // P3-4: a boolean false is information ("this dispatch was synchronous",
+          // "this report is complete") — `|| undefined` erased it and the client
+          // could not tell it apart from "unknown".
+          async: typeof r.async === "boolean" ? r.async : undefined,
+          partial: typeof r.partial === "boolean" ? r.partial : undefined,
           recovery: r.recovery || undefined,
           outputFile: r.outputFile || undefined,
         })),
@@ -1961,6 +2065,14 @@ export function runClaude({
       exitedCode = code;
       exitedSignal = signalName;
       reapExitedGroup(child);
+      // P3-1: 'close' can be held open forever by a descendant that escaped the
+      // process group and inherited stdout. The child's own exit already means
+      // the run's work is done, so drain the pipe briefly (a final result line
+      // may still be in flight) and settle with the REAL status instead of
+      // waiting out timeoutMs (20 min by default).
+      if (!settled && !drainTimer) {
+        drainTimer = setTimeout(() => finish(exitedCode, exitedSignal), 1500);
+      }
     });
     child.on("close", (code, signalName) => finish(code, signalName));
 
@@ -1997,7 +2109,9 @@ export const GIT_HARDENING_ARGS = [
   "-c", "gpg.program=",
   "-c", "merge.tool=",
   "-c", "core.hooksPath=",
+  // P0-1: the same transport pair buildClaudeEnv() pins for the reviewer child.
   "-c", "protocol.ext.allow=never",
+  "-c", "protocol.file.allow=never",
 ];
 
 /** git spawn options shared by every git call this server makes. */
@@ -2109,6 +2223,18 @@ const CONFIG_EXEC_KEYS = new Set([
   "core.askpass",
   "sequence.editor",
 ]);
+/**
+ * P0-1: the TRANSPORT family. These keys are not values git executes directly,
+ * but they choose what will execute or where a fetch goes: `ext::` runs an
+ * external command, protocol.file re-enables file:// URLs, url.<base>.insteadOf
+ * rewrites the URL every fetch sees, and remote.<name>.vcs selects a
+ * remote-helper program. buildClaudeEnv() neutralises the two protocol keys for
+ * the reviewer's git, but the scanner must still refuse a repo that sets them —
+ * and the subsection forms cannot be expressed as a GIT_CONFIG_KEY wildcard.
+ */
+const CONFIG_TRANSPORT_KEYS = new Set(["protocol.ext.allow", "protocol.file.allow"]);
+const CONFIG_URL_REWRITE_KEY = /^url\..+\.insteadof$/;
+const CONFIG_REMOTE_VCS_KEY = /^remote\..+\.vcs$/;
 /**
  * `pager.<cmd>` (exactly one subcommand name, no further dots). git resolves
  * the pager for a subcommand from this key BEFORE falling back to core.pager, so
@@ -2316,6 +2442,45 @@ function readRepoFile(file, roots, { followSymlink = false } = {}) {
   try { return { text: fs.readFileSync(real, "utf8") }; } catch { return null; }
 }
 
+/** Is `file` (after resolving links) inside one of `roots`? Missing paths are not. */
+function realPathInside(file, roots) {
+  let real;
+  try { real = fs.realpathSync(file); } catch { return false; }
+  return (Array.isArray(roots) ? roots : [roots]).some((root) => {
+    try {
+      const rel = path.relative(fs.realpathSync(root), real);
+      return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+    } catch { return false; }
+  });
+}
+
+/**
+ * The `[include]` / `[includeIf]` path values in one config file, parsed by
+ * SECTION. A bare `path = …` in another section is not an include: a
+ * `[submodule "x"] path = …` names the submodule's working tree, and walking it
+ * would (now that an unreadable include is fail-closed) turn a legitimate
+ * submodule into a refusal. Git itself only follows the include sections.
+ */
+function configIncludePaths(text) {
+  const out = [];
+  let inInclude = false;
+  for (const line of String(text).split(/\r?\n/)) {
+    const h = /^\s*\[\s*([^\]]+?)\s*\]\s*(.*)$/.exec(line);
+    let rest = line;
+    if (h) {
+      inInclude = /^include(?:if)?(?:\s|$)/i.test(h[1].trim());
+      if (!inInclude) continue;
+      rest = h[2] || ""; // a header may share its line with `path = …`
+    } else if (!inInclude) {
+      continue;
+    }
+    const m = /^\s*path\s*=\s*(.+?)\s*$/i.exec(rest);
+    if (m) out.push(m[1]);
+  }
+  return out;
+}
+
+const MAX_CONFIG_FILES = 200;
 /**
  * `.git/config` plus anything it `[include]s` — an include is repo content too:
  * a repo-relative path can walk to any file in the worktree, and git reads it.
@@ -2332,25 +2497,57 @@ function repoConfigFiles(repoPath) {
   // `roots` = the tree a config file must really live in. For a normal repo that
   // is the worktree; for a worktree's `.git` pointer it is the gitdir the pointer
   // names (a worktree gitdir lives outside the worktree by design).
+  // Every config file costs a synchronous git spawn in repoRunsGitPrograms().
+  // Without a cap, a repo with 1200 includes froze the whole MCP server for 13s
+  // on the request path (P1-12). Past this bound the scan cannot vouch for the
+  // include graph, so it refuses once instead of reading the rest.
+  let tooManyConfigs = false;
   const walk = (file, label, depth, roots) => {
     // Include chains deeper than this are exotic; the cap bounds the read count
     // (seen dedupes) while still following nested includes several levels in,
     // so a live driver cannot hide behind extra indirection.
     if (depth > 5 || seen.has(file)) return;
+    if (seen.size >= MAX_CONFIG_FILES) {
+      if (!tooManyConfigs) {
+        tooManyConfigs = true;
+        refusals.push("the repository's git config includes more than " + MAX_CONFIG_FILES +
+          " files, so every included config could not be verified — a driver or transport setting hidden " +
+          "past that bound would run from an allowlisted git command; remove the excess includes or review " +
+          "a copy of the repository without them");
+      }
+      return;
+    }
     seen.add(file);
     // followSymlink: git follows a symlinked .git/config or [include] target, and
     // executes whatever driver the target defines — verified — so the scan must
     // follow the same links (still only to a regular file inside the tree).
     const read = readRepoFile(file, roots, { followSymlink: true });
-    if (!read) return; // missing, or not repository-controlled content
+    if (!read) {
+      // A missing include is a git no-op. An include that EXISTS but could not be
+      // read — outside the repository, a FIFO/device, a link out of the tree — is
+      // read by git and can define any executable key. That used to be a silent
+      // skip (P1-1); it is a refusal now, matching the UNC and attributesFile
+      // handling. lstat, not existsSync: no network probe on a UNC-looking path.
+      let present = false;
+      try { present = !!fs.lstatSync(file); } catch { present = false; }
+      if (present) {
+        refusals.push(realPathInside(file, roots)
+          ? label + ": included config is not a readable regular file (" + file.slice(0, 200) +
+            ") — git reads it as config, so any program it defines cannot be verified; replace it with a plain file or remove the include"
+          : label + ": config includes a file outside the repository (" + file.slice(0, 200) +
+            ") — git reads that file, so any program it defines cannot be verified; remove the include or review a local copy of the repository");
+      }
+      return;
+    }
     if (read.refusal) { refusals.push(`${label}: ${read.refusal}`); return; }
     files.push({ file, label, text: read.text });
     const base = path.dirname(file); // readRepoFile only ever returns a regular file
-    // The optional bracket part matches a header sharing its line with the key —
-    // `[include] path = ../inc` is the same include as `[include]` + `path = ../inc`,
-    // and git follows it, so the walk must too (P0-5).
-    for (const m of read.text.matchAll(/^\s*(?:\[[^\]]*\]\s*)?path\s*=\s*(.+?)\s*$/gim)) {
-      const raw = m[1].trim().replace(/^["']|["']$/g, "");
+    // Section-aware (P1-1): only an include section names an included file. The
+    // old regex matched any `path = …` line, which also matched a submodule's
+    // working-tree path; that was harmless while unreadable targets were skipped,
+    // and would be a false refusal now that they are fail-closed.
+    for (const value of configIncludePaths(read.text)) {
+      const raw = value.trim().replace(/^["']|["']$/g, "");
       if (!raw || raw.startsWith("~/")) continue; // ~ is the user's own config, not repo-controlled
       // Same pre-spawn hazard as core.attributesFile: the readRepoFile() inside
       // walk() calls lstatSync, which blocks on a UNC target with no timeout
@@ -2381,6 +2578,10 @@ function repoConfigFiles(repoPath) {
   }
   if (st && st.isDirectory()) {
     walk(path.join(gitDir, "config"), ".git/config", 0, [repoPath, gitDir]);
+    // P0-2: with extensions.worktreeConfig=true git also reads .git/config.worktree
+    // in the MAIN worktree, not only in linked worktrees. Try it unconditionally —
+    // git does so whenever the extension is set, and a missing file is a no-op.
+    walk(path.join(gitDir, "config.worktree"), ".git/config.worktree", 0, [repoPath, gitDir]);
   } else if (st) {
     // A worktree (or submodule): .git is a FILE "gitdir: <path>". The real
     // config lives in the gitdir — scanning the pointer file scans nothing.
@@ -2410,7 +2611,7 @@ function repoConfigFiles(repoPath) {
       }
     }
   }
-  return { files, refusals };
+  return { files, refusals, limitReached: tooManyConfigs };
 }
 
 /**
@@ -2453,6 +2654,30 @@ function repoAttributeFiles(repoPath, attributeSources = []) {
   // The worktree root plus git's own per-repo file (not cloned, but a zip can ship it).
   add(".gitattributes");
   add(path.join(".git", "info", "attributes"), true);
+  // P0-3: git applies .gitattributes at EVERY path level it checks out, including
+  // node_modules/ — and it applies them whether the file is tracked or not. The
+  // tree walk below prunes node_modules for performance, so attribute files there
+  // were invisible to the scan. Ask git itself instead: --cached plus --others
+  // (deliberately WITHOUT --exclude-standard, because an IGNORED .gitattributes
+  // still governs git's behaviour) narrowed by a pathspec, so an ordinary
+  // node_modules with 100k files costs one fast index/tree scan, not a walk.
+  // A git failure must not be silent: without this list, an attribute file in a
+  // pruned directory is unverified. A fake .git dir is not a real repository and
+  // is skipped quietly (the walk still covers everything else there).
+  try {
+    const res = spawnSync("git", [...GIT_HARDENING_ARGS, "ls-files", "-z", "--cached", "--others", "--", ":(glob)**/.gitattributes"], gitSpawnOpts(repoPath));
+    if (res && !res.error && res.status === 0 && Buffer.isBuffer(res.stdout)) {
+      for (const rel of res.stdout.toString("utf8").split("\0")) {
+        if (!rel || path.basename(rel) !== ".gitattributes") continue;
+        if (seenRels.size >= MAX_ATTR_FILES) { truncated = true; break; }
+        add(rel);
+      }
+    } else if (!/not a git repository/i.test(String(res?.stderr || ""))) {
+      notes.push("the repository's .gitattributes files could not be enumerated (" +
+        String(res?.stderr || res?.error || "git ls-files failed").trim().slice(0, 160) +
+        "); attribute files under pruned directories (node_modules/) are not covered");
+    }
+  } catch { /* the walk below still covers the reviewable tree */ }
   // P0-9: core.attributesFile is git's THIRD attributes source, and the only one
   // a repository can point at a file it fully controls — yet the scan used to
   // read just the two well-known files. Git applies that file on every diff/log,
@@ -2516,8 +2741,9 @@ function repoAttributeFiles(repoPath, attributeSources = []) {
     let entries;
     try { entries = fs.readdirSync(path.join(repoPath, dirRel), { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
-      // .git (also a FILE in a worktree) and node_modules are never reviewed
-      // content; descending them would only slow the pre-spawn scan down.
+      // .git (also a FILE in a worktree) is never reviewed content. node_modules
+      // is pruned only for UNTRACKED files: tracked .gitattributes files there are
+      // already read from the index above, and git applies them like any other.
       if (e.name === ".git" || e.name === "node_modules") continue;
       const rel = dirRel ? path.join(dirRel, e.name) : e.name;
       // A symlinked directory is not descended: readdir reports the link itself,
@@ -2577,6 +2803,10 @@ export function repoRunsGitPrograms(repoPath) {
   // Oversized repo metadata is a refusal, not a note: we could not read it, so
   // we cannot vouch that it does not run a program (see readRepoFile).
   const refusals = [...configs.refusals];
+  // P1-12: once the include graph is over the bound the review is already
+  // refused. Scanning the files that were read would cost one BLOCKING git
+  // spawn each (seconds on the request path) and could not change that verdict.
+  if (configs.limitReached) return { refusals, notes };
 
   // Split a config file's text into sections keyed by header, so a driver's
   // command lines can be attributed to that driver for the attributes cross-check.
@@ -2655,6 +2885,23 @@ export function repoRunsGitPrograms(repoPath) {
   // One key/value pair as git normalized it (section and variable lowercased).
   const scanKey = (label, key, value) => {
     const val = value === null ? "" : String(value);
+    // P0-1: a repository must not choose git's transport policy. An empty value
+    // is inert (git falls back to its default); every spelled-out setting is
+    // refused, because the transport it selects can execute a command or send
+    // the fetch somewhere this scan never verified. The lowered spelling catches
+    // a subsection git preserves in its original case ([`protocol "EXT"`]).
+    const transportKey = key.toLowerCase();
+    if (CONFIG_TRANSPORT_KEYS.has(transportKey) || CONFIG_URL_REWRITE_KEY.test(transportKey) || CONFIG_REMOTE_VCS_KEY.test(transportKey)) {
+      if (!val.trim()) return;
+      const why = CONFIG_URL_REWRITE_KEY.test(transportKey)
+        ? "it rewrites the URL git fetches, so a transport this scan did not verify can be reached"
+        : CONFIG_REMOTE_VCS_KEY.test(transportKey)
+          ? "it selects a remote-helper program git runs for that remote"
+          : "it chooses git's transport policy (the ext:: transport runs an external command)";
+      refusals.push(shownKey(label, key, val) + " — " + why +
+        "; remove the key from that config file or review a copy of the repository without it");
+      return;
+    }
     if (key === CONFIG_HOOKS_PATH_KEY) { noteHooksPath(label, val); return; }
     if (CONFIG_INCLUDE_PATH_KEY.test(key)) {
       const raw = val.trim();
@@ -2724,6 +2971,11 @@ export function repoRunsGitPrograms(repoPath) {
       // variable name on each line, so the section must be folded back in for
       // the keys whose execution meaning lives in the dotted name.
       const secName = /^\s*([A-Za-z0-9][\w-]*)\s*$/.exec(sec.header || "")?.[1]?.toLowerCase() ?? null;
+      // P0-1: subsection headers the dotted-key scanner handles natively:
+      // [protocol "ext"], [url "..."], [remote "origin"] and their dotted forms.
+      // A line pattern cannot rebuild those keys, so do it here explicitly.
+      const sub = /^\s*(protocol|url|remote)\s+(?:"([^"]+)"|\.([\w.-]+))\s*$/i.exec(sec.header || "");
+      const subSection = sub ? sub[1].toLowerCase() + "." + (sub[2] || sub[3]) : null;
       for (const line of sec.lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
@@ -2749,6 +3001,11 @@ export function repoRunsGitPrograms(repoPath) {
         // `log = ...`, and `[pager] log = ...` (header sharing the line) lands
         // here too, so the full key is derived from the section instead.
         const kv = /^\s*([A-Za-z0-9][\w-]*)\s*=\s*(.*)$/.exec(line);
+        if (kv && subSection) {
+          const val = kv[2].trim().replace(/^["']|["']$/g, "");
+          if (val) scanKey(label, subSection + "." + kv[1].toLowerCase(), val);
+          continue;
+        }
         if (kv && secName) {
           const varName = kv[1].toLowerCase();
           const fullKey = secName === "pager" ? "pager." + varName

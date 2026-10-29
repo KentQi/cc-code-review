@@ -211,6 +211,12 @@ check("analyseCommand ALLOW: tr with no file operand", analyseCommand("echo hi |
 /* the only gate (no -c override can neutralise a named driver).        */
 /* ------------------------------------------------------------------ */
 console.log("-- P0-4/P0-5 repoRunsGitPrograms refuses repo-supplied drivers");
+// git config values treat backslash as an escape character, so a Windows path
+// written raw turns the whole .git/config into "bad config line N" (git then
+// refuses to read ANY key, including the one under test). Git accepts forward
+// slashes on every platform, so fixtures always spell paths that way.
+const cfgPath = (p) => String(p).replace(/\\/g, "/");
+
 function gitRepo(name) {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), name + "-"));
   spawnSync("git", ["init", "-q", repo], { stdio: "ignore" });
@@ -260,7 +266,7 @@ try {
   const sshScript = path.join(ssh, "ssh.sh");
   fs.writeFileSync(sshScript, "#!/bin/sh\nexit 0\n");
   fs.chmodSync(sshScript, 0o755);
-  fs.appendFileSync(path.join(ssh, ".git", "config"), "\n[core]\n\tsshCommand = " + sshScript + "\n");
+  fs.appendFileSync(path.join(ssh, ".git", "config"), "\n[core]\n\tsshCommand = " + cfgPath(sshScript) + "\n");
   spawnSync("git", ["-C", ssh, "remote", "add", "origin", "ssh://git@example.invalid/repo.git"], { stdio: "ignore" });
   check("refuses core.sshCommand", repoRunsGitPrograms(ssh).refusals.length > 0, true);
   fs.rmSync(ssh, { recursive: true, force: true });
@@ -274,7 +280,7 @@ try {
   fs.writeFileSync(attrCmd, "#!/bin/sh\nexit 0\n");
   fs.chmodSync(attrCmd, 0o755);
   fs.writeFileSync(attrFile, "*.txt diff=evil\n");
-  fs.appendFileSync(path.join(attr, ".git", "config"), '\n[core]\n\tattributesFile = ' + attrFile + '\n[diff "evil"]\n\ttextconv = ' + attrCmd + "\n");
+  fs.appendFileSync(path.join(attr, ".git", "config"), '\n[core]\n\tattributesFile = ' + cfgPath(attrFile) + '\n[diff "evil"]\n\ttextconv = ' + cfgPath(attrCmd) + "\n");
   check("refuses a driver activated via core.attributesFile", repoRunsGitPrograms(attr).refusals.length > 0, true);
   fs.rmSync(attr, { recursive: true, force: true });
 
@@ -533,7 +539,7 @@ try {
   const cw = gitRepo("p0-configworktree");
   const cwDrv = liveScript(cw, "tc.sh");
   fs.appendFileSync(path.join(cw, ".git", "config"), "\n[extensions]\n\tworktreeConfig = true\n");
-  fs.writeFileSync(path.join(cw, ".git", "config.worktree"), "[core]\n\tsshCommand = " + cwDrv + "\n");
+  fs.writeFileSync(path.join(cw, ".git", "config.worktree"), "[core]\n\tsshCommand = " + cfgPath(cwDrv) + "\n");
   check("refuses a live sshCommand in .git/config.worktree", repoRunsGitPrograms(cw).refusals.length > 0, true);
   fs.rmSync(cw, { recursive: true, force: true });
 
@@ -543,7 +549,7 @@ try {
   fs.mkdirSync(path.join(nm, "node_modules", "pkg"), { recursive: true });
   fs.writeFileSync(path.join(nm, "node_modules", ".gitattributes"), "*.txt diff=evil\n");
   fs.writeFileSync(path.join(nm, "node_modules", "pkg", "a.txt"), "one\n");
-  fs.appendFileSync(path.join(nm, ".git", "config"), '\n[diff "evil"]\n\ttextconv = ' + nmDrv + "\n");
+  fs.appendFileSync(path.join(nm, ".git", "config"), '\n[diff "evil"]\n\ttextconv = ' + cfgPath(nmDrv) + "\n");
   // Commit it: a repository-delivered node_modules/.gitattributes is the threat
   // model, and `git ls-files --cached` lists it on every platform (the untracked
   // `--others` half is exercised by the other fixtures; on Windows Git does not

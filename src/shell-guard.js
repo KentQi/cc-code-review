@@ -21,7 +21,7 @@
  *
  *   - every segment must match BASH_POLICY (the same list reviewAllowedTools()
  *     renders as Bash(...) rules — one source of truth, so the hook and the
- *     permission engine cannot drift), or be a pipe sink (head/tail/sed -n/…);
+ *     permission engine cannot drift), or be a pipe sink (head/tail/cat/grep/sort/…);
  *   - `cd` is allowed only as the first segment and only when it resolves to
  *     the reviewed repository root, where every Bash call already starts;
  *   - redirection, command substitution and unbalanced quotes stay refused;
@@ -94,6 +94,11 @@ export const BASH_POLICY = [
     prefixes: [
       { words: ["pr", "view"] }, { words: ["pr", "diff"] }, { words: ["pr", "list"] },
       { words: ["pr", "checks"] }, { words: ["repo", "view"] },
+      // postToPR=true instructs the reviewer to post the summary and grants
+      // Bash(gh pr comment:*) through postPROnlyTools(). The hook is subtract-only,
+      // so it must not refuse the very command that grant authorises — but the rule
+      // must stay OUT of the default permission render, or every review could post.
+      { words: ["pr", "comment"], postOnly: true },
     ],
   },
 ];
@@ -103,6 +108,9 @@ export function bashAllowRules() {
   const rules = [];
   for (const { prog, prefixes } of BASH_POLICY) {
     for (const p of prefixes) {
+      // postOnly rules exist for the hook (which only subtracts) and are granted
+      // to the model separately, by postPROnlyTools() when the caller asked to post.
+      if (p.postOnly) continue;
       const head = [prog, ...p.words].join(" ");
       rules.push(p.exact ? `Bash(${head})` : `Bash(${head}:*)`);
     }
@@ -163,16 +171,27 @@ function parseCommand(cmd) {
       continue;
     }
     if (c === "'" || c === '"') { quote = c; inWord = true; continue; }
+    if (c === "$" && (cmd[i + 1] === "'" || cmd[i + 1] === '"')) {
+      // ANSI-C quoting ($'...') and locale quoting ($"...") are expanded by bash
+      // BEFORE the command runs: $'-exec' is the argv word -exec. The parser only
+      // models plain quotes, so every token-exact deny table below would be blind
+      // to the flag hidden inside. Refuse the construct outright — a review has no
+      // legitimate use for either form.
+      unsafe = unsafe || "ansi-quoting";
+      word += c;
+      inWord = true;
+      continue;
+    }
     if (c === "\\") {
-      // Outside quotes, bash deletes a backslash before a newline outright (line
-      // continuation) — `find . \<LF>-delete` runs `find . -delete`. Keeping the
-      // pair as word content hid the flag from every deny check, so this is a
-      // security-critical join, not cosmetics. For any other character, keep the
-      // backslash when it precedes a path-ish one (Windows paths must stay
-      // recognisable) and treat it as a plain escape otherwise.
+      // Outside quotes bash deletes the backslash and keeps the next character
+      // literal: \-exec becomes -exec, \--output= becomes --output=. The old
+      // code kept the backslash for path-ish characters (Windows paths), which
+      // made the parser's token differ from bash's argv and hid every flag behind
+      // an escape. The argv view is what executes, so it is what must be judged;
+      // quoted Windows paths keep their backslashes through the double-quote rule
+      // above, which is how the model writes them.
       const next = cmd[i + 1];
-      if (next === "\n") { i++; continue; }
-      if (next !== undefined && /[A-Za-z0-9._\-/@:]/.test(next)) { word += "\\" + next; i++; inWord = true; continue; }
+      if (next === "\n") { i++; continue; }          // line continuation: both gone
       if (next !== undefined) { word += next; i++; inWord = true; }
       continue;
     }
@@ -279,12 +298,15 @@ const OUTRIGHT_DENY = {
   git: {
     "--no-index": "`git diff --no-index` reads arbitrary paths outside the repository",
     "--contents": "`git blame --contents` reads an arbitrary file outside the repository",
+    "-X": "`git ls-files -X` reads a path list from an arbitrary file outside the repository",
+    "--exclude-from": "`git ls-files --exclude-from` reads a path list from an arbitrary file outside the repository",
   },
   wc: {
     "--files0-from": "`wc --files0-from` follows a list of paths that may point outside the repository",
   },
   sort: {
     "--files0-from": "`sort --files0-from` follows a list of paths that may point outside the repository",
+    "--random-source": "`sort --random-source` reads an arbitrary file outside the repository",
   },
   sed: {
     "-f": "`sed -f` runs a script file, which can write or execute (w/W/e) — use an inline line-range script",
@@ -325,6 +347,10 @@ function pathArgs(words) {
   const out = [];
   let patternSeen = false;
   let positional = 0;
+  // `rg --files [path]` lists files: there is no pattern argument, so every
+  // positional is a path. Without this the first positional was skipped as "the
+  // pattern" and `rg --files /etc` enumerated an outside directory.
+  const noPattern = prog === "rg" && rest.some((t) => t === "--files");
   for (let i = 0; i < rest.length; i++) {
     const t = rest[i];
     if (t === "--") {
@@ -333,28 +359,37 @@ function pathArgs(words) {
     }
     if (t.startsWith("-") && t !== "-") {
       const eq = t.indexOf("=");
-      const name = eq >= 0 ? t.slice(0, eq) : t;
+      let name = eq >= 0 ? t.slice(0, eq) : t;
+      let inline = eq >= 0 ? t.slice(eq + 1) : null;
+      // Short options may carry their value glued on (-f/etc/passwd, -o/tmp/x).
+      // The old code treated any "-xVALUE" as a self-contained flag, so the value
+      // never reached the path check and the flag never reached the deny table —
+      // an escape hatch for every program with a value-taking short option.
+      if (eq < 0 && !name.startsWith("--") && name.length > 2) {
+        const short = name.slice(0, 2);
+        if (kinds[short]) { name = short; inline = t.slice(2); }
+      }
       const kind = kinds[name];
       if (kind === "path") {
-        const v = eq >= 0 ? t.slice(eq + 1) : rest[++i];
+        const v = inline !== null ? inline : rest[++i];
         if (typeof v === "string") out.push({ value: v });
         if (name === "-f" || name === "--file") patternSeen = true;
         continue;
       }
       if (kind === "pattern") {
-        if (eq < 0) i++;
+        if (inline === null) i++;
         patternSeen = true;
         continue;
       }
       if (kind === "skip") {
-        if (eq < 0) i++;
+        if (inline === null) i++;
         continue;
       }
       continue; // self-contained flag
     }
     positional++;
     // The first positional of rg/grep is a pattern; of sed, a script.
-    const takesPattern = (prog === "rg" || prog === "grep" || prog === "sed") && positional === 1 && !patternSeen;
+    const takesPattern = (prog === "rg" || prog === "grep" || prog === "sed") && positional === 1 && !patternSeen && !noPattern;
     if (takesPattern) continue;
     out.push({ value: t });
   }
@@ -387,10 +422,19 @@ export function isInsideRepo(root, token) {
   if (token.includes("{") || token.includes("}")) return false;
   const realRoot = repoRealpath(root);
   if (!realRoot) return false;
-  const target = path.resolve(realRoot, token);
-  const rel = path.relative(realRoot, target);
-  if (!rel) return true;
-  if (rel.startsWith("..") || path.isAbsolute(rel)) return false;
+  // An absolute token must be resolved against itself, not against the root: a
+  // repo reached through a symlinked prefix (macOS /tmp and /var are symlinks)
+  // has a real root of /private/var/..., while the model writes the path it was
+  // given. path.resolve(realRoot, "/var/...") keeps the absolute path, so the
+  // lexical check below saw "outside" and refused every legitimate read. The
+  // realpath pass at the end is the authority for both forms.
+  const absolute = path.isAbsolute(token);
+  const target = absolute ? path.resolve(token) : path.resolve(realRoot, token);
+  if (!absolute) {
+    const rel = path.relative(realRoot, target);
+    if (!rel) return true;
+    if (rel.startsWith("..") || path.isAbsolute(rel)) return false;
+  }
   // Resolve links for the part that exists.
   let probe = target;
   for (;;) {
@@ -426,8 +470,11 @@ function outrightDeny(words) {
   const table = OUTRIGHT_DENY[words[0]];
   if (!table) return null;
   for (const w of words) {
-    const name = w.includes("=") ? w.slice(0, w.indexOf("=")) : w;
-    const why = table[name];
+    let name = w.includes("=") ? w.slice(0, w.indexOf("=")) : w;
+    let why = table[name];
+    // Glued short option (-X/etc/passwd): the value never becomes a separate
+    // token, so the table has to see the two-character form.
+    if (!why && /^-[^-]./.test(w)) { name = w.slice(0, 2); why = table[name]; }
     if (why) return `blocked: ${why}. Review mode is read-only and scoped to the repository.`;
   }
   return null;
@@ -457,8 +504,16 @@ function segmentProblem(words, repoRoot) {
       return `blocked: \`${write}\` makes git write a file, and a read-only review must not write anything (an allowlisted \`git diff\`/\`git show\`/\`git log\` call with --output= would otherwise be a file-write primitive for repo-controlled content). Drop the flag.`;
     }
   }
-  if (prog === "sort" && words.some((w) => w === "-o" || w.startsWith("--output") || w.startsWith("--compress-program") || w === "-T" || w.startsWith("--temporary-directory"))) {
-    return "blocked: sort -o/--compress-program/--temporary-directory write files or run a program outside the reviewed repository. Review mode is read-only.";
+  if (prog === "sort") {
+    // -oFILE / -TFILE (value glued to the short option) are the same write and
+    // temp-dir escapes as their spaced forms; match the tight spelling too or the
+    // only file-write primitive left in the policy stays open.
+    const bad = words.find((w) =>
+      w === "-o" || w === "-T" || w.startsWith("--output") || w.startsWith("--compress-program") ||
+      w.startsWith("--temporary-directory") || /^-[A-Za-z]*[oT]./.test(w));
+    if (bad) {
+      return "blocked: sort -o/--compress-program/--temporary-directory write files or run a program outside the reviewed repository. Review mode is read-only.";
+    }
   }
   if (prog === "sed") {
     if (words.some((w) => w === "-i" || w.startsWith("-i.") || w.startsWith("--in-place"))) {
@@ -468,7 +523,7 @@ function segmentProblem(words, repoRoot) {
     // line range and print: that is the only form a review needs.
     const script = words.slice(1).filter((w) => !w.startsWith("-")).join(" ");
     if (/(^|[\s;{}0-9,])[wWe]\s/.test(script) || /\$[wWe]/.test(script)) {
-      return "blocked: this sed script uses a w/W/e command, which writes a file or runs a program. Use a line-range print (`sed -n '1,120p'`).";
+      return "blocked: this sed script uses a w/W/e command, which writes a file or runs a program. Read the range with the Read tool (offset/limit) or pipe the source through head/tail instead.";
     }
   }
   if (prog === "uniq" && pathArgs(words).length >= 2) {
@@ -525,9 +580,10 @@ function gitWriteFlagIn(words) {
 
 const ALLOWED_HINT =
   "Allowed commands: git status|diff|show|log|blame|rev-parse|ls-files, git branch -a|--show-current|-vv, " +
-  "git remote -v|get-url|show, git stash list|show, find, rg, gh pr view|diff|list|checks, gh repo view — " +
-  "and after a pipe: head, tail, cat, wc, uniq, cut, tr, grep, sort, sed -n. " +
-  "For file contents use the Read/Grep/Glob tools instead of cat/head/tail.";
+  "git remote -v|get-url|show, git stash list|show, find, rg, ls, grep, echo, " +
+  "gh pr view|diff|list|checks, gh repo view — " +
+  "and after a pipe: head, tail, cat, wc, uniq, cut, tr, grep, sort. " +
+  "For file contents use the Read/Grep/Glob tools instead of cat/head/tail; sed is not a permitted sink.";
 
 /**
  * Decide whether one Bash command may run.
@@ -547,6 +603,13 @@ export function analyseCommand(cmd, opts = {}) {
       reason: "blocked: redirection (< > >>). A redirect is a file read/write primitive that bypasses the allowlist — " +
         "read with the Read/Grep tools and let the command write to stdout.",
       chained: false, substituted: false,
+    };
+  }
+  if (parsed.unsafe === "ansi-quoting") {
+    return {
+      ok: false, kind: "substituted",
+      reason: "blocked: ANSI-C / locale quoting ($'...' or $\"...\"). Bash expands it before the command runs, so a flag hidden inside " + "(e.g. $\"-exec\") never reaches the allowlist checks. Write the flag plainly, or use the Read/Grep/Glob tools.",
+      chained: false, substituted: true,
     };
   }
   if (parsed.unsafe === "substitution") {

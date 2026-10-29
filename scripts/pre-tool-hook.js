@@ -35,6 +35,29 @@ const guardUrl = pathToFileURL(
 const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 const READ_TOOLS = new Set(["Read"]);
 
+/**
+ * In-repo paths that are execution configuration rather than source: writing them
+ * survives the run and fires later (a git hook on the next commit, a project
+ * .claude/settings.json hook on the next session, direnv on the next cd, a CI
+ * workflow on the next push). fix mode is allowed to change source; it is not
+ * allowed to plant something that runs. Case-insensitive because macOS/Windows
+ * resolve .GIT to .git and the path check must not depend on the caller's spelling.
+ *
+ * .gitattributes/.gitconfig are here because they can name a diff/filter driver
+ * that git then executes (see repoRunsGitPrograms in src/claude.js).
+ */
+const PROTECTED_WRITE = [
+  /(^|\/)\.claude(\/|$)/i,
+  /(^|\/)\.envrc(\.|$)/i,
+  /(^|\/)\.github\/workflows(\/|$)/i,
+  /(^|\/)\.vscode(\/|$)/i,
+  /(^|\/)\.idea(\/|$)/i,
+  /(^|\/)\.mcp\.json$/i,
+  /(^|\/)\.gitmodules$/i,
+  /(^|\/)\.gitattributes$/i,
+  /(^|\/)\.gitconfig$/i,
+];
+
 let raw = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (d) => { raw += d; });
@@ -117,8 +140,16 @@ process.stdin.on("end", async () => {
     if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
       deny(`${tool} blocked: fix mode may only write inside the reviewed repository (${root}), not ${target}`);
     }
-    if (/^\.git([\\/]|$)/.test(rel)) {
+    // Compare on a forward-slash form and case-insensitively: macOS and Windows
+    // resolve .GIT/.Git to the same directory as .git, and realpath keeps the
+    // case the caller wrote, so an exact lowercase match was bypassable.
+    const relSlash = rel.split(path.sep).join("/");
+    if (/(^|\/)\.git(\/|$)/i.test(relSlash)) {
       deny(`${tool} blocked: refusing to touch .git/ — a hook written there would outlive this run`);
+    }
+    const execCfg = PROTECTED_WRITE.find((re) => re.test(relSlash));
+    if (execCfg) {
+      deny(`${tool} blocked: ${relSlash} is execution configuration — it runs code (or decides what runs) when the project is opened, its diff is taken, or CI starts. fix mode may edit source files, not plant persistence. Edit the source file the finding points at instead.`);
     }
     process.exit(0);
   }

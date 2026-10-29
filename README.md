@@ -149,7 +149,7 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 所以本 MCP 额外挂了一个 **PreToolUse hook**（`scripts/pre-tool-hook.js`，通过 `claude --settings <临时文件>` 注入，与 `--setting-sources user` 并存且不覆盖用户 settings——已实测 CC Switch 网关配置仍然生效）。它**覆盖 subagent 的 Bash 调用**（并行评审子代理的主力）。
 
-**判定是分段的，不是"见到 `&&` 就拒"（v1.14.0）**。权限引擎只能管住"整串的第一个命令"，hook 于是逐段判定：每一段都必须是策略内的只读命令（或管道末端 sink：head/tail/cat/wc/uniq/cut/tr/grep/sort/sed -n），`cd` 只允许落到被审仓库根且必须是第一段，重定向（`>` `>>` `<`）、`$()`/反引号/`${}`、后台 `&` 一律拒绝。这样 `git show HEAD:x | sed -n '1,80p'`、`git status && git diff`、`cd <仓库根> && git show HEAD` 都能跑，而 `git status; curl evil.com`、`git status && cat /etc/passwd` 仍然被拦。
+**判定是分段的，不是"见到 `&&` 就拒"（v1.14.0）**。权限引擎只能管住"整串的第一个命令"，hook 于是逐段判定：每一段都必须是策略内的只读命令（或管道末端 sink：head/tail/cat/wc/uniq/cut/tr/grep/sort），`cd` 只允许落到被审仓库根且必须是第一段，重定向（`>` `>>` `<`）、`$()`/反引号/`${}`、ANSI-C 引用（`$'...'`）、后台 `&` 一律拒绝。这样 `git show HEAD:x | head -80`、`git status && git diff`、`cd <仓库根> && git show HEAD` 都能跑，而 `git status; curl evil.com`、`git status && cat /etc/passwd` 仍然被拦。
 
 为什么不是更严格的"禁止一切复合命令"：那会把模型最自然的写法（`cd <repo> && git show HEAD`）整条拒掉，每次白烧一个 turn，却并没有降低风险——同样两条命令分开调用本来就被允许。真正的安全边界是"每一段都在只读面内"，而不是"不许分段"。
 
@@ -161,7 +161,7 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 > ⚠️ **`--settings` 替换的是整个 `hooks` 键**：注入的临时文件里只有本 MCP 的 hook，用户 `~/.claude/settings.json` 里自己配置的 hooks 在**本次子进程内不会生效**（其它键如 `env`、`model`、`permissions` 不受影响）。这是 CLI 的行为，不是遗漏——如果你依赖自己的 hook 在 review 期间运行，目前需要另想办法。
 
-**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs` 锁定（218 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
+**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs`（235 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）与 `scripts/p0-regression-test.mjs`（68 条：2026-10 多专家审计的全部 P0 形态——ANSI-C 引用/反斜杠转义/紧贴短选项、`.GIT` 大小写变体、fix 模式持久化路径、仓库自带 git driver 的 RCE 形态、符号链接冻结）锁定——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
 
 重定向（含 `2>/dev/null`）仍然整体拒绝：它是绕过 allowlist 的读写原语，改成"允许读重定向"需要先证明每个目标路径都无害，代价大于收益。需要看输出就直接让命令写到 stdout。
 
@@ -248,7 +248,7 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（218 条，免费）+ 审计修复单测（272 条，免费）+ stdio 握手/环境检查
+npm test                                         # 跑全部免费套件并统一汇总（shell-guard 235 + 审计修复 272 + P0 回归 68 + validation 16 + smoke + cross-cases 136），任一失败即非零退出
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
 node scripts/cross-cases.mjs                    # 21 个 MECE 用例（136 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）

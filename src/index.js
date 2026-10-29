@@ -90,8 +90,32 @@ const LOG_KEEP = 20;
 const reviewJobs = new Map();
 const JOB_KEEP = 10;
 function pruneReviewJobs() {
-  const finished = [...reviewJobs.values()].filter((j) => j.state === "done");
+  // A finished job is either "done" (a successful result) or "failed" (the tool
+  // result was an error); every other state is still in flight and addressable.
+  const finished = [...reviewJobs.values()].filter((j) => j.state === "done" || j.state === "failed");
   for (const j of finished.slice(0, Math.max(0, finished.length - JOB_KEEP))) reviewJobs.delete(j.id);
+}
+/**
+ * Record a finished background job. `state` is the first thing a listing/polling
+ * client sees, so an error result must not settle as "done": reading "done" for
+ * a review that produced no report is the same "no findings vs no output"
+ * confusion the empty-report handling in executeRun exists to prevent.
+ */
+function settleReviewJob(job, result) {
+  job.result = result;
+  job.state = result?.isError === true ? "failed" : "done";
+  job.finishedAt = Date.now();
+}
+/**
+ * Add the polled jobId to a finished async result. It used to be dropped once
+ * the job settled, so a client polling several jobs had no machine-readable way
+ * to tie a report back to the job it asked about (audit P-03). Additive only:
+ * every existing field keeps its value and meaning.
+ */
+function withJobId(result, jobId) {
+  if (!result || typeof result !== "object") return result;
+  const sc = result.structuredContent && typeof result.structuredContent === "object" ? result.structuredContent : {};
+  return { ...result, structuredContent: { ...sc, jobId } };
 }
 function logsDir() {
   // 0700 so review logs (they quote repo code) stay private from other local users on macOS/Linux.
@@ -220,21 +244,46 @@ function validateLanguage(lang) {
  * suggested `git merge-base <ref> HEAD` commands. A leading "-" would turn the
  * ref into a git option (`git merge-base --output=... HEAD` writes a file), so
  * the shape is enforced here instead of trusting sanitizeBaseRef downstream.
+ *
+ * Whitespace is refused for the same reason through a different door: the native
+ * pipeline appends baseRef to the `/code-review <level> <target>` command string
+ * (prompt.js), and claude parses that command's own flags ANYWHERE in the string
+ * — so a `"main --fix"` baseRef would turn a fix=false run into a fix run (and
+ * `"main --comment"` would post to the PR) while still looking like a ref.
+ * One ref token, git-safe charset, nothing else.
  */
 function validateBaseRef(ref) {
   if (!ref) return { ok: true, ref: undefined };
   const s = String(ref).trim();
   if (!s) return { ok: true, ref: undefined };
   if (s.length > 200) return { ok: false, error: "baseRef must be a short ref name (<= 200 chars)" };
-  if (/[\r\n`"'\\$;&|<>(){}]/.test(s)) {
-    return { ok: false, error: `baseRef must be a plain branch/tag name — got ${JSON.stringify(ref)}.` };
-  }
+  // Before the charset check, so the original leading-"-" diagnosis (the git
+  // --output=<file> write) keeps its dedicated, actionable message.
   if (s.startsWith("-")) {
     return {
       ok: false,
       error:
         `baseRef must not start with "-" (got ${JSON.stringify(ref)}): it would be parsed as a git option ` +
         `(e.g. git merge-base --output=<file> HEAD writes a file) instead of as a ref. Pass the plain name, e.g. "main".`,
+    };
+  }
+  if (/\s/.test(s)) {
+    return {
+      ok: false,
+      error:
+        `baseRef must be a single ref name with no whitespace (got ${JSON.stringify(ref)}). ` +
+        `It is appended to claude's "/code-review <level> <target>" command, where claude parses flags anywhere in the string: ` +
+        `"main --fix" would enable fix mode and "main --comment" would post to the PR instead of naming a base ref. ` +
+        `Pass just the branch/tag, e.g. "main".`,
+    };
+  }
+  if (!/^[A-Za-z0-9._/@^~-]+$/.test(s)) {
+    return {
+      ok: false,
+      error:
+        `baseRef must be a plain git ref — letters, digits, ".", "_", "/", "@", "^", "~", "-" (got ${JSON.stringify(ref)}). ` +
+        `It is interpolated into claude's /code-review command and into the reviewer's suggested git commands, so any other ` +
+        `character (shell metacharacters, quotes, "{}", ":") is refused. Use the ref as git spells it, e.g. "main", "origin/release-1.2", "v1.2.3", "HEAD~1".`,
     };
   }
   return { ok: true, ref: s };
@@ -496,7 +545,7 @@ function failureBanner(j, run) {
   }
   if (/ECONNREFUSED|connection refused|fetch failed|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket hang up|api_error/i.test(blob)) {
     const t = gatewayTarget();
-    hints.push(`The API endpoint is unreachable${t ? ` (ANTHROPIC_BASE_URL=${t.url})` : ""} — if you use CC Switch / claude-code-router / a local gateway, make sure it is running and healthy.`);
+    hints.push(`The API endpoint is unreachable${t ? ` (ANTHROPIC_BASE_URL=${gatewayDisplay(t)})` : ""} — if you use CC Switch / claude-code-router / a local gateway, make sure it is running and healthy.`);
   }
   if (j.subtype === "error_max_budget_usd" || /max.?budget|budget.*(exceed|reached|limit)/i.test(blob)) {
     hints.push("The run hit the --max-budget-usd cap: retry with a larger maxBudgetUsd, or 0 to disable the cap. (Third-party gateways report usage differently, so the cap can trigger early there.)");
@@ -516,6 +565,29 @@ function failureBanner(j, run) {
   ].join("\n");
 }
 
+/**
+ * A run that exits "successfully" with no result text is a failed run, not a
+ * clean one. That distinction is the product promise: callers filter findings,
+ * so "no output" must never read as "no findings". Shared by the review and the
+ * followup path (kind="reply"); the banner also names what survived (log file,
+ * subagent reports) instead of burying paid-for work.
+ */
+function emptyReportBanner(j, kind = "review") {
+  const isReply = kind === "reply";
+  return [
+    `⚠️ ${isReply ? "FOLLOWUP" : "REVIEW"} FAILED — the reviewer produced no ${isReply ? "reply" : "report"}.`,
+    "",
+    `claude's result was empty: no ${isReply ? "answer" : "findings"} and no summary, so there is nothing this run can vouch for. ` +
+      `Treat it as a FAILED ${isReply ? "followup" : "review"} (not a clean one) and retry.`,
+    ...(j.subtype && j.subtype !== "success" ? [`(subtype: ${j.subtype})`] : []),
+    "",
+    "Hints:",
+    "- Check the full log (below): an empty result usually means a gateway/wrapper returned no text, or this CLI does not advertise --output-format stream-json, so a forked slash command's answer could not be recovered from the event stream.",
+    "- Reviewer subagent reports that did arrive are still included below (and in partial_reports_file when present) — only the parent's summary is missing.",
+    "- Re-run; claude_review_env shows which CLI/auth setup was resolved if the same wrapper keeps returning nothing.",
+  ].join("\n");
+}
+
 const server = new McpServer(
   { name: "cc-code-review", version: SERVER_VERSION },
   {
@@ -529,6 +601,57 @@ const server = new McpServer(
 /* ------------------------------------------------------------------ */
 /* Shared pre-run hardening gate                                       */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Credential-safe rendering of an env value for a diagnostic line.
+ *
+ * The note this feeds is returned to the MCP client and quoted into the report
+ * (and into meta.warning, which the model reads) — a full AUTH_TOKEN/API_KEY
+ * there is a live credential leak with a very long reach: chat transcript, logs,
+ * screenshots. A 6-char prefix still says which key/provider it is, and the
+ * length disambiguates two values that share a prefix. Very short values show
+ * no prefix at all: half of a short secret is still too much of it.
+ */
+function maskCredentialValue(v) {
+  const s = String(v ?? "");
+  return s.length < 12 ? `… (len ${s.length})` : `${s.slice(0, 6)}… (len ${s.length})`;
+}
+
+/**
+ * URL rendering for the same diagnostic: the origin names the endpoint the run
+ * would bill against, while userinfo / path / query / fragment are the parts a
+ * URL can carry a credential in — so they are dropped. An unparseable value is
+ * treated as a credential, because a malformed URL is often a pasted token.
+ */
+function redactBaseUrlValue(v) {
+  const s = String(v ?? "");
+  try {
+    const u = new URL(s);
+    const hidden = [];
+    if (u.username || u.password) hidden.push("userinfo");
+    if (u.pathname && u.pathname !== "/") hidden.push("path");
+    if (u.search) hidden.push("query");
+    if (u.hash) hidden.push("fragment");
+    return u.origin + (hidden.length ? ` (${hidden.join("/")} hidden)` : "");
+  } catch {
+    return maskCredentialValue(s);
+  }
+}
+
+/** One value → its safe form for its own key (origin for BASE_URL, mask otherwise). */
+function redactSettingValue(key, v) {
+  return key === "ANTHROPIC_BASE_URL" ? redactBaseUrlValue(v) : maskCredentialValue(v);
+}
+
+/**
+ * Display form of a resolved gateway target. Every place that reports the
+ * configured ANTHROPIC_BASE_URL (env tool, failure hints, gateway-changed
+ * warnings) must go through here: those strings are returned to the MCP client
+ * and end up in the report, and a URL can carry userinfo/query credentials.
+ */
+function gatewayDisplay(target) {
+  return target ? redactBaseUrlValue(String(target.url)) : "(not configured)";
+}
 
 /**
  * Verify the shell guard and resolve the permission-mode flags for one run.
@@ -598,6 +721,21 @@ async function prepareRunHardening(cli, { ultracode = false } = {}) {
   // hooks; older CLIs strip the unknown key, so requesting it there degrades to
   // a normal run — workflowRuns in the result shows whether it took effect.
   const guardSettings = writeGuardSettings(ultracode ? { ultracode: true } : {});
+  // writeGuardSettings() returns null both when the guard is deliberately off and
+  // when the file could not be written. Reaching here means guardState() said "on",
+  // so a null is a write failure (full disk, unwritable temp dir, a cleaner racing
+  // the directory) — and running on would silently drop the ONLY per-segment
+  // enforcement while the result still advertises "PreToolUse hook". Refuse instead.
+  if (guard.state === "on" && !guardSettings) {
+    cleanupGuardSettings();
+    return {
+      ok: false,
+      error:
+        "Refusing to run unguarded: the PreToolUse hook settings file could not be written (the guard is installed, but this run could not pass it to claude). " +
+        "Check that " + path.join(os.tmpdir(), "cc-code-review") + " is writable and has free space, then retry. " +
+        "Set CLAUDE_REVIEW_ALLOW_UNGUARDED=1 only if you accept a run with no per-command guard.",
+    };
+  }
   markGuardSettingsInFlight(guardSettings, true); // held until the claude spawn returns
 
   let semver = null;
@@ -653,9 +791,14 @@ async function prepareRunHardening(cli, { ultracode = false } = {}) {
       const fromProcess = process.env[key];
       const fromSettings = s?.[key];
       if (fromProcess && fromSettings && fromProcess !== fromSettings) {
+        // Report the KEY and the fact of the mismatch only: this note is returned
+        // to the MCP client and quoted into the report, so printing either value
+        // verbatim handed the caller a live credential (and logged it).
         notes.push(
-          `⚠ ${key} is set to ${JSON.stringify(fromProcess)} in this server's environment but to ${JSON.stringify(fromSettings)} ` +
-          `in ~/.claude/settings.json — claude applies the settings value, so the run uses ${JSON.stringify(fromSettings)}.`
+          `⚠ ${key} differs between this server's environment (${redactSettingValue(key, fromProcess)}) and ` +
+          `~/.claude/settings.json (${redactSettingValue(key, fromSettings)}) — claude applies the settings value, so the run uses ` +
+          `the settings ${key === "ANTHROPIC_BASE_URL" ? "endpoint" : "credential"}, not the one in this server's environment. ` +
+          `Align the two (or unset one) if that is not what you configured. (Values are masked here: this note travels to the MCP client and must never carry a credential.)`
         );
       }
     }
@@ -733,7 +876,7 @@ server.tool(
     const t = gatewayTarget();
     if (t) {
       const gw = await probeGateway();
-      lines.push(`gateway (ANTHROPIC_BASE_URL): ${t.url}` + (gw.skipped ? " (probe skipped)" : gw.ok ? " — reachable ✓" : ` — NOT reachable (${gw.reason}) ✗`));
+      lines.push(`gateway (ANTHROPIC_BASE_URL): ${gatewayDisplay(t)}` + (gw.skipped ? " (probe skipped)" : gw.ok ? " — reachable ✓" : ` — NOT reachable (${gw.reason}) ✗`));
     } else {
       lines.push("gateway: none configured (direct Anthropic / OAuth login)");
     }
@@ -747,14 +890,14 @@ server.tool(
       const baseIsGateway = t && process.env.ANTHROPIC_BASE_URL && t.url.href === new URL(process.env.ANTHROPIC_BASE_URL).href;
       const realResidue = baseIsGateway ? residue.filter((k) => k !== "ANTHROPIC_BASE_URL") : residue;
       if (baseIsGateway) {
-        lines.push(`note: the gateway is configured via the host environment (ANTHROPIC_BASE_URL=${t.url}), not ~/.claude/settings.json — this works as-is.`);
+        lines.push(`note: the gateway is configured via the host environment (ANTHROPIC_BASE_URL=${gatewayDisplay(t)}), not ~/.claude/settings.json — this works as-is.`);
       }
       if (realResidue.length) {
         if (t) {
           // settings.json env beats process env inside claude, so an unmanaged
           // var can never override a key settings.json also sets — it only
           // matters for keys settings does NOT manage (like the note above).
-          lines.push(`⚠ auth env residue: ${realResidue.join(", ")} set in the host environment but not managed by ~/.claude/settings.json — for keys settings.json also sets, settings wins; these unmanaged ones are used as-is alongside the configured gateway (${t.url}).`);
+          lines.push(`⚠ auth env residue: ${realResidue.join(", ")} set in the host environment but not managed by ~/.claude/settings.json — for keys settings.json also sets, settings wins; these unmanaged ones are used as-is alongside the configured gateway (${gatewayDisplay(t)}).`);
         } else {
           lines.push(`note: auth env residue: ${realResidue.join(", ")} (no gateway configured, so these are used as-is for a direct login).`);
         }
@@ -1213,8 +1356,18 @@ server.tool(
     }
 
     const looksLikeApiError = /^API Error/i.test(String(j.result || ""));
-    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError;
-    const status2 = ok ? "success" : (j.subtype && j.subtype !== "success" ? j.subtype : "claude reported an error");
+    const reportText = String(j.result ?? "");
+    // An empty result is not "no findings": it means the reviewer produced
+    // nothing (a gateway/wrapper that returned no text, a CLI without
+    // stream-json whose forked-command answer cannot be recovered from the event
+    // stream, or a turn cap hit before writing). Returning that as success is
+    // how a caller concludes "clean review" from a run that never reviewed anything.
+    const emptyReport = reportText.trim().length === 0;
+    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !emptyReport;
+    // A non-success subtype is the more specific diagnosis (budget/turn cap);
+    // "empty_report" is used only when claude itself claimed success.
+    const status2 = ok ? "success"
+      : (j.subtype && j.subtype !== "success" ? j.subtype : (emptyReport ? "empty_report" : "claude reported an error"));
 
     // Under `--permission-mode manual` a missing allowlist entry shows up here
     // instead of aborting the run — surface it, or a silently degraded review
@@ -1287,9 +1440,9 @@ server.tool(
     const gwAfter = gatewayTarget();
     const gwChanged = gwBefore && gwAfter && gwBefore.url.href !== gwAfter.url.href;
     const gwNote = (gwBefore && !gwAfter)
-      ? `⚠ the gateway configuration disappeared during the run (ANTHROPIC_BASE_URL was ${gwBefore.url} when the run started and is not set any more) — CC Switch may have switched providers mid-review.`
+      ? `⚠ the gateway configuration disappeared during the run (ANTHROPIC_BASE_URL was ${gatewayDisplay(gwBefore)} when the run started and is not set any more) — CC Switch may have switched providers mid-review.`
       : (gwChanged
-        ? `⚠ the gateway endpoint changed during the run (${gwBefore.url} → ${gwAfter.url}) — CC Switch likely switched providers mid-review, so the report may mix two models.`
+        ? `⚠ the gateway endpoint changed during the run (${gatewayDisplay(gwBefore)} → ${gatewayDisplay(gwAfter)}) — CC Switch likely switched providers mid-review, so the report may mix two models.`
         : "");
 
     // An explicit spend cap the installed CLI cannot honour is silently dropped
@@ -1335,14 +1488,19 @@ server.tool(
       // failed review still sees the knobs this run used.
       const errMeta = ["_run metadata_", ...runMetaLines(meta)].join("\n");
       const errNote = [provenanceNote, errReports, errMeta].filter(Boolean).join("\n\n");
+      // An empty result has its own causes and next steps; the generic
+      // "did not complete" banner would print "(no message)" and bury them.
+      const errBanner = status2 === "empty_report" ? emptyReportBanner(j) : failureBanner(j, run);
       return {
         isError: true,
-        content: [{ type: "text", text: gitProgramNotes + failureBanner(j, run) + stderrTail(run.stderr) + logNote + (errNote ? `\n\n${errNote}` : "") }],
+        content: [{ type: "text", text: gitProgramNotes + errBanner + stderrTail(run.stderr) + logNote + (errNote ? `\n\n${errNote}` : "") }],
         structuredContent: {
           status: status2, sessionId: j.session_id, costUsd: meta.costUsd,
           numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, pipelineMode: pipeline, effort, fix, logFile,
           hardening,
-          error: String(j.result || ""),
+          error: status2 === "empty_report"
+            ? "empty report: claude's result was empty, so the reviewer produced no report (this is a failed review, not a clean one)"
+            : String(j.result || ""),
           subagents: subagentsView(run.agentReports),
           subagentsSpawned: meta.subagentsSpawned,
           ultracode: ultracode || undefined,
@@ -1416,8 +1574,8 @@ server.tool(
       else extra.signal.addEventListener("abort", () => jobAbort.abort(), { once: true });
     }
     void executeRun(jobAbort.signal, undefined)
-      .then((result) => { job.result = result; job.state = "done"; job.finishedAt = Date.now(); })
-      .catch((e) => { job.result = err(`review job crashed: ${e?.message || e}`); job.state = "done"; job.finishedAt = Date.now(); })
+      .then((result) => settleReviewJob(job, result))
+      .catch((e) => settleReviewJob(job, err(`review job crashed: ${e?.message || e}`)))
       .finally(() => pruneReviewJobs());
     return {
       content: [{
@@ -1492,7 +1650,9 @@ server.tool(
       };
     }
     if (cancel) return { content: [{ type: "text", text: `job ${jobId} already finished — nothing to cancel.` }] };
-    return job.result;
+    // Stamp the jobId onto the settled result (audit P-03): the final shape used
+    // to lose it, so a multi-job client could not tell which job it was reading.
+    return withJobId(job.result, jobId);
   }
 );
 
@@ -1677,14 +1837,27 @@ server.tool(
     if (!j) return err(`claude exited (code ${run.exitCode}) without a parseable result (bad session_id? gateway down?).${logNote}${stderrTail(run.stderr)}${carried}`);
 
     const looksLikeApiError = /^API Error/i.test(String(j.result || ""));
-    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError;
-    const status2 = ok ? "success" : (j.subtype && j.subtype !== "success" ? j.subtype : "claude reported an error");
+    const replyText = String(j.result ?? "");
+    // Same rule as a review: an empty reply is a failed turn, not a clean
+    // answer. A caller that trusts status/isError would otherwise read "the
+    // reviewer said nothing" as "there is nothing to say".
+    const emptyReply = replyText.trim().length === 0;
+    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !emptyReply;
+    const status2 = ok ? "success"
+      : (j.subtype && j.subtype !== "success" ? j.subtype : (emptyReply ? "empty_report" : "claude reported an error"));
     if (!ok) {
+      // The same empty-result treatment as a review (same status value, same
+      // actionable hints); logNote/carried keep the paid-for subagent reports
+      // reachable even when the parent turn produced nothing.
+      const errBanner = status2 === "empty_report" ? emptyReportBanner(j, "reply") : failureBanner(j, run);
       return {
         isError: true,
-        content: [{ type: "text", text: failureBanner(j, run) + stderrTail(run.stderr) + logNote + carried }],
+        content: [{ type: "text", text: errBanner + stderrTail(run.stderr) + logNote + carried }],
         structuredContent: {
-          status: status2, sessionId: j.session_id ?? sessionId, reply: String(j.result || ""),
+          status: status2, sessionId: j.session_id ?? sessionId, reply: replyText,
+          ...(status2 === "empty_report"
+            ? { error: "empty reply: claude's result was empty, so the reviewer produced no reply (this is a failed followup, not an empty answer)" }
+            : {}),
           subagents: subagentsView(followReports),
           subagentsSpawned: followReports.length || undefined,
           subagentsFile: followSubagentsFile || undefined,
@@ -1741,8 +1914,8 @@ server.tool(
       else extra.signal.addEventListener("abort", () => jobAbort.abort(), { once: true });
     }
     void executeFollowup(jobAbort.signal)
-      .then((result) => { job.result = result; job.state = "done"; job.finishedAt = Date.now(); })
-      .catch((e) => { job.result = err(`followup job crashed: ${e?.message || e}`); job.state = "done"; job.finishedAt = Date.now(); })
+      .then((result) => settleReviewJob(job, result))
+      .catch((e) => settleReviewJob(job, err(`followup job crashed: ${e?.message || e}`)))
       .finally(() => pruneReviewJobs());
     return {
       content: [{

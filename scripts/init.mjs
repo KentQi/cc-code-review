@@ -36,6 +36,28 @@ const SERVER = path.join(PKG_ROOT, "src", "index.js");
 const say = (s = "") => console.log(s);
 const ok = (label) => say(`  ✓ ${label}`);
 const bad = (label) => say(`  ✗ ${label}`);
+
+/**
+ * The registration entry carries the gateway credential (ANTHROPIC_AUTH_TOKEN /
+ * ANTHROPIC_API_KEY) in its env block, and this script prints the entry as the
+ * last thing the user sees — which then lands in terminal scrollback, CI logs and
+ * pasted issue reports. Print the shape, never the secret.
+ */
+const SECRET_KEY = /(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)/i;
+function redactEnvValue(key, value) {
+  const s = String(value ?? "");
+  if (SECRET_KEY.test(key)) return s.length < 12 ? "… (hidden)" : `${s.slice(0, 4)}… (hidden, len ${s.length})`;
+  if (/BASE_URL|_URL$/i.test(key)) {
+    try { return `${new URL(s).origin} (userinfo/path/query hidden)`; } catch { return "… (hidden)"; }
+  }
+  return s;
+}
+function redactEntry(entry) {
+  if (!entry || typeof entry !== "object" || !entry.env || typeof entry.env !== "object") return entry;
+  const env = {};
+  for (const [k, v] of Object.entries(entry.env)) env[k] = redactEnvValue(k, v);
+  return { ...entry, env };
+}
 let failures = 0;
 
 /* ---------------- 1. self-check ---------------- */
@@ -129,7 +151,7 @@ if (t) {
     if (merged[k]) envBlock[k] = merged[k];
   }
   const probe = await probeGateway();
-  ok(`gateway: ${t.url}${probe.skipped ? " (probe skipped)" : probe.ok ? " — reachable" : ` — NOT reachable (${probe.reason})`}`);
+  ok(`gateway: ${redactEnvValue("ANTHROPIC_BASE_URL", t.url)}${probe.skipped ? " (probe skipped)" : probe.ok ? " — reachable" : ` — NOT reachable (${probe.reason})`}`);
 }
 
 const entry = {
@@ -206,16 +228,22 @@ if (prevObj && prevObj.command === entry.command && JSON.stringify(prevObj.args)
 } else {
   config.mcp.servers["cc-code-review"] = finalEntry;
   const dir = path.dirname(zcodeConfigPath);
-  fs.mkdirSync(dir, { recursive: true });
+  // The file carries the gateway credential in mcp.servers[].env, so it must not
+  // be world-readable: 0600 for the file, 0700 for its directory (the default
+  // umask would leave a token in a 0644 file). chmod after the call because mode
+  // only applies when the file is CREATED.
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dir, 0o700); } catch { /* pre-existing dir we do not own */ }
   try {
-    fs.writeFileSync(zcodeConfigPath, JSON.stringify(config, null, 2) + "\n");
+    fs.writeFileSync(zcodeConfigPath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+    try { fs.chmodSync(zcodeConfigPath, 0o600); } catch { /* best effort */ }
   } catch (e) {
     bad(`cannot write ${zcodeConfigPath} (${e?.message || e}) — the file may be read-only or locked; nothing was written`);
     process.exit(1);
   }
   ok(prevObj ? `updated existing entry (was: ${prevObj.command} ${(prevObj.args || [])[0] ?? ""})` : "created new entry");
 }
-say(`  ${JSON.stringify({ "cc-code-review": config.mcp.servers["cc-code-review"] }, null, 2).split("\n").slice(1, -1).join("\n")}`);
+say(`  ${JSON.stringify({ "cc-code-review": redactEntry(config.mcp.servers["cc-code-review"]) }, null, 2).split("\n").slice(1, -1).join("\n")}`);
 say("");
 
 say(failures === 0

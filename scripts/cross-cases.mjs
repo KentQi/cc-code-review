@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * cc-loop cross-case suite — 19 MECE cases over the whole MCP surface.
- * C1-C8, C10-C19 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
+ * cc-loop cross-case suite — 21 MECE cases over the whole MCP surface.
+ * C1-C8 and C10-C22 are FREE (stub claude for the async lifecycle and the reviewer-report/provenance e2e); C9 is the real
  * paid end-to-end and only runs with --paid (CC_LOOP_PAID=1).
  * Exit 0 iff every executed case passes.
  */
@@ -26,6 +26,23 @@ const skip = (caseId, label) => {
 };
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ccloop-"));
+// P1-5: this tree holds real installer output — C4 runs init.mjs, which copies
+// ANTHROPIC_* credentials into ~/.zcode/cli/config.json. It is a throwaway
+// HOME, but leaving it behind parks those credentials in $TMPDIR. Remove the
+// whole tree on every exit path: `exit` covers the normal summary and
+// process.exit(), the monitor covers an uncaught throw (Node does NOT emit
+// `exit` for those), and the signals cover an interrupted run.
+const cleanupTmp = () => {
+  // Retries matter on Windows: a child that s.kill() only signalled may still
+  // hold a handle in the tree when this runs, and one EPERM would leave the
+  // whole installer HOME (with its credentials) behind.
+  try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best effort */ }
+};
+process.on("exit", cleanupTmp);
+process.on("uncaughtExceptionMonitor", cleanupTmp);
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => { cleanupTmp(); process.exit(128 + (sig === "SIGINT" ? 2 : 15)); });
+}
 const mkRepo = (name) => {
   const p = path.join(tmp, name);
   fs.mkdirSync(p, { recursive: true });
@@ -177,11 +194,31 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
 
 /* ================= C4 installer ================= */
 {
+  // init.mjs copies the effective ANTHROPIC_* credentials into the config it
+  // writes (init.mjs:149-152). This suite runs against a throwaway HOME, so
+  // inheriting the host env would park a LIVE token in $TMPDIR (audit P1-5).
+  // Strip the real values and pass a recognizable test token instead; cleanup
+  // removes the tree, and the first check proves only the test value was used.
+  const TEST_TOKEN = `sk-ant-test-${process.pid}-${Date.now()}`;
+  const hostAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+  const hostApiKey = process.env.ANTHROPIC_API_KEY;
+  const authFreeEnv = () => {
+    const env = { ...process.env };
+    for (const k of ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]) delete env[k];
+    return env;
+  };
   const runInit = (home, pre, extraEnv = {}) => {
     fs.mkdirSync(path.join(home, ".zcode", "cli"), { recursive: true });
     if (pre) fs.writeFileSync(path.join(home, ".zcode", "cli", "config.json"), pre);
     const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "init.mjs")], {
-      env: { ...process.env, USERPROFILE: home, HOME: home, CLAUDE_CODE_PATH: STUB, ...extraEnv },
+      env: {
+        ...authFreeEnv(), USERPROFILE: home, HOME: home, CLAUDE_CODE_PATH: STUB,
+        // A non-loopback fake gateway makes init exercise the credential-carry
+        // branch without a TCP probe; the token is the suite's, never the host's.
+        ANTHROPIC_BASE_URL: "https://gateway.invalid",
+        ANTHROPIC_AUTH_TOKEN: TEST_TOKEN,
+        ...extraEnv,
+      },
       encoding: "utf8", timeout: 120_000, windowsHide: true,
     });
     return { code: r.status, out: r.stdout + r.stderr };
@@ -191,6 +228,11 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
   const cfg1 = JSON.parse(fs.readFileSync(path.join(h1, ".zcode", "cli", "config.json"), "utf8"));
   const e1 = cfg1.mcp?.servers?.["cc-code-review"];
   check("C4", "fresh install: entry created with machine-derived paths + timeoutMs", r1.code === 0 && e1?.command === process.execPath && e1?.args?.[0]?.split(path.sep).join("/").endsWith("src/index.js") && e1?.timeoutMs === 1_800_000, r1.out.slice(0, 200) + JSON.stringify(e1));
+  check("C4", "fresh install carries the test credential, never the host's",
+    e1?.env?.ANTHROPIC_AUTH_TOKEN === TEST_TOKEN
+    && (!hostAuthToken || e1.env.ANTHROPIC_AUTH_TOKEN !== hostAuthToken)
+    && (!hostApiKey || e1.env.ANTHROPIC_API_KEY !== hostApiKey),
+    JSON.stringify(e1?.env || null));
   const h2 = fs.mkdtempSync(path.join(tmp, "c4b-"));
   const r2 = runInit(h2, "{ broken json");
   check("C4", "invalid config.json: refuses to write, exit != 0", r2.code !== 0);
@@ -313,7 +355,10 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
     const m = /^Bash\((.*)[:=]\*\)$/.exec(d);
     return m ? rule.startsWith(`Bash(${m[1]}`) && rule !== d : false;
   });
-  check("C7", "no allow rule prefix-shadowed by deny", allowed.filter(shadowed), []);
+  // The predicate must BE the check: passing the array as `cond` made this
+  // assertion true for any input, even a shadowed allow rule (audit P1-3).
+  const shadowedRules = allowed.filter(shadowed);
+  check("C7", "no allow rule prefix-shadowed by deny", shadowedRules.length === 0, JSON.stringify(shadowedRules));
   const cmdAllowed = (cmd) => allowed.some((r) => {
     const m = /^Bash\((.*)[:=]\*\)$/.exec(r);
     return m ? cmd.startsWith(m[1]) : r === `Bash(${cmd})`;
@@ -779,6 +824,30 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
     subs.every((a) => !/stream ended/.test(String(a.report || ""))), JSON.stringify(subs.map((a) => a.description)));
   check("C20", "every reviewer record is a real dispatch",
     subs.every((a) => a.subagentType === "general-purpose"), JSON.stringify(subs.map((a) => a.subagentType)));
+  s.kill();
+}
+
+/* ================= C22 CLI dies without a result ================= */
+{
+  // P2-7: the shipped stub always exits 0, so claude.js's "non-zero exit and no
+  // result JSON" branch (and the failure banner built from it) had no coverage.
+  // A disposable CLI in this run's tmp tree keeps the stub untouched and dies
+  // exactly where a real CLI does (auth failure, crash, killed wrapper).
+  const crashCli = path.join(tmp, `crash-claude-${process.pid}.mjs`);
+  fs.writeFileSync(crashCli, [
+    'const args = process.argv.slice(2);',
+    'if (args.includes("--version")) { console.log("2.1.300 (Claude Code)"); process.exit(0); }',
+    'if (args.includes("--help")) { console.log("Usage: claude [options]"); process.exit(0); }',
+    'console.error("simulated claude crash");',
+    'process.exit(7);',
+  ].join("\n") + "\n");
+  const s = startServer({ CLAUDE_CODE_PATH: crashCli });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c22"), scope: "last-commit", waitForResult: true });
+  const t = textOf(r);
+  check("C22", "a non-zero CLI exit is a failed review", r.result?.isError === true, t.slice(0, 200));
+  check("C22", "the failure names the exit code and the missing result",
+    /exited \(code 7\)/.test(t) && /without a parseable result/i.test(t), t.slice(0, 300));
   s.kill();
 }
 

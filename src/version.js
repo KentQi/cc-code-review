@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const SERVER_VERSION = "1.18.1";
+export const SERVER_VERSION = "1.18.2";
 
 /**
  * @param {number} [now] injectable clock (tests)
@@ -22,7 +22,11 @@ export const SERVER_VERSION = "1.18.1";
 export function codeDrift(now = Date.now()) {
   try {
     const here = path.dirname(fileURLToPath(import.meta.url));
-    const files = ["index.js", "claude.js", "shell-guard.js", "version.js"].map((f) => path.join(here, f));
+    // Every module that can change the review's behaviour or its prompt must be
+    // watched: prompt.js and skill.js were missing, so an upgrade that only touched
+    // the prompt never raised the "stale process" warning and the running server
+    // kept building reviews with the previous instructions.
+    const files = ["index.js", "claude.js", "shell-guard.js", "prompt.js", "skill.js", "version.js"].map((f) => path.join(here, f));
     files.push(path.join(here, "..", "scripts", "pre-tool-hook.js"));
     const started = now - process.uptime() * 1000;
     let newest = 0;

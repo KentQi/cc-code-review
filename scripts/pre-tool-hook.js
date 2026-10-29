@@ -36,6 +36,26 @@ const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 const READ_TOOLS = new Set(["Read"]);
 
 /**
+ * Info mode (CC_REVIEW_GUARD_INFO=1): print the policy fingerprint and exit.
+ *
+ * The server compares it with its own in-memory policy before every run, so an
+ * upgrade that did not restart the MCP host is detected and refused instead of
+ * silently running two different policies. Normal hook invocations never set this
+ * variable, so the decision channel (stdout) keeps its single-JSON-line contract.
+ */
+if (process.env.CC_REVIEW_GUARD_INFO === "1") {
+  try {
+    const { policyFingerprint } = await import(
+      pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "shell-guard.js")).href,
+    );
+    fs.writeSync(1, JSON.stringify({ fingerprint: policyFingerprint() }) + "\n");
+  } catch (e) {
+    fs.writeSync(1, JSON.stringify({ fingerprint: null, error: String(e?.message || e) }) + "\n");
+  }
+  process.exit(0);
+}
+
+/**
  * In-repo paths that are execution configuration rather than source: writing them
  * survives the run and fires later (a git hook on the next commit, a project
  * .claude/settings.json hook on the next session, direnv on the next cd, a CI
@@ -61,23 +81,38 @@ const PROTECTED_WRITE = [
 let raw = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (d) => { raw += d; });
-process.stdin.on("error", () => process.exit(0));
+
+/**
+ * Emit a PreToolUse deny and exit. `code` is 0 for a normal policy denial.
+ * The stdin-error path passes 1: if the CLI ignores our stdout on a failed
+ * hook, its `onFailure: "block"` (the launcher sets it) must still stop the
+ * call. Exiting 0 with no output means "no opinion" — the old handler did
+ * exactly that on a broken stdin and silently unguarded the tool call (P0-4).
+ */
+const emitDeny = (reason, code = 0) => {
+  // fs.writeSync, not process.stdout.write: a synchronous write to fd 1 cannot
+  // race process.exit(), which on a full pipe has dropped the decision JSON.
+  const line = JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason,
+    },
+  }) + "\n";
+  try { fs.writeSync(1, line); } catch { /* parent gone */ }
+  try { fs.writeSync(2, `[cc-code-review pre-tool hook] ${reason}\n`); } catch { /* ignore */ }
+  process.exit(code);
+};
+
+process.stdin.on("error", () => {
+  emitDeny(
+    "blocked: the PreToolUse hook could not read its stdin, so it cannot see which tool is being called. Refusing to run it (fail closed).",
+    1,
+  );
+});
 
 process.stdin.on("end", async () => {
-  const deny = (reason) => {
-    // fs.writeSync, not process.stdout.write: a synchronous write to fd 1 cannot
-    // race process.exit(), which on a full pipe has dropped the decision JSON.
-    const line = JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: reason,
-      },
-    }) + "\n";
-    try { fs.writeSync(1, line); } catch { /* parent gone */ }
-    try { fs.writeSync(2, `[cc-code-review pre-tool hook] ${reason}\n`); } catch { /* ignore */ }
-    process.exit(0);
-  };
+  const deny = (reason) => emitDeny(reason, 0);
 
   /**
    * Lexical containment (path.relative) can be escaped by a directory junction
@@ -159,14 +194,22 @@ process.stdin.on("end", async () => {
     const root = process.env.CLAUDE_REVIEW_REPO_ROOT;
     const target = String(payload?.tool_input?.file_path ?? payload?.tool_input?.path ?? "");
     if (!root) deny("Read blocked: no repository root was provided to the guard (fail closed)");
-    if (target) {
-      let rel;
-      try { rel = realContainment(root, target); } catch { rel = null; }
-      // Absolute paths that escape the repo are refused; relative ones are already
-      // resolved against the repo cwd by the tool itself, so they cannot escape.
-      if (rel && (rel.startsWith("..") || path.isAbsolute(rel))) {
-        deny(`Read blocked: the review may only read inside the reviewed repository (${root}), not ${target}`);
-      }
+    // Same fail-closed shape as the write branch above: a containment error means
+    // the boundary cannot be established (the root was deleted, renamed, or is
+    // unreadable), and the old `catch { rel = null }` let that through as ALLOW.
+    // Read is granted as a bare rule with no path constraint, so this hook is the
+    // only boundary — it must deny instead of passing the call (audit P0-3).
+    let rel;
+    try {
+      rel = realContainment(root, target);
+    } catch {
+      deny("Read blocked: cannot resolve the target path against the repository root (fail closed)");
+    }
+    if (rel === null) {
+      deny("Read blocked: cannot resolve the target path against the repository root (fail closed)");
+    }
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+      deny(`Read blocked: the review may only read inside the reviewed repository (${root}), not ${target}`);
     }
     process.exit(0);
   }

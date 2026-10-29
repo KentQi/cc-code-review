@@ -19,16 +19,30 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// Optional suites are skipped when absent instead of failing: p0-regression
-// ships together with the security fixes it locks, and `npm test` being red on
-// a branch that has not merged them yet would teach people to ignore the gate.
+// Every suite below is REQUIRED: a suite that vanishes is a failure, never a
+// skip (see the missing-suite branch). p0-regression was optional only while the
+// security fixes it locks were unmerged; it has shipped since 1.18.1, so
+// deleting it must turn the gate red — it is the only regression cover for the
+// ANSI-C / glued-short-option / repo-supplied git driver / execution-config P0s
+// (audit P1-4).
 const SUITES = [
   { name: "shell-guard", script: "scripts/shell-guard-test.mjs" },
   { name: "audit-fixes", script: "scripts/audit-fixes-test.mjs" },
-  { name: "p0-regression", script: "scripts/p0-regression-test.mjs", optional: true },
+  { name: "p0-regression", script: "scripts/p0-regression-test.mjs" },
   { name: "smoke", script: "scripts/smoke-test.mjs" },
   { name: "validation", script: "scripts/validation-test.mjs" },
   { name: "cross-cases", script: "scripts/cross-cases.mjs" },
+];
+
+// Paid / real-CLI suites: deliberately NOT run here — they spend Claude credits,
+// and cancel-test's process check is Windows-only (audit P2-5). Listing them
+// keeps this gate honest about what it does NOT cover and makes the opt-in
+// scripts discoverable; each is reachable through its own npm script.
+const PAID_SUITES = [
+  { name: "e2e (real)", script: "scripts/e2e-test.mjs", npm: "test:e2e:real", why: "real Claude review, billed" },
+  { name: "followup-e2e", script: "scripts/followup-e2e.mjs", npm: "test:followup", why: "real Claude followup, billed" },
+  { name: "cancel-test", script: "scripts/cancel-test.mjs", npm: "test:cancel", why: "real run + cancel, billed; Windows-only tasklist" },
+  { name: "paid-smoke", script: "scripts/paid-smoke.mjs", npm: "test:paid", why: "real CLI smoke, billed (~$0.5)" },
 ];
 
 const results = [];
@@ -37,13 +51,8 @@ const startedAt = Date.now();
 for (const suite of SUITES) {
   const scriptPath = path.join(ROOT, suite.script);
   if (!fs.existsSync(scriptPath)) {
-    if (suite.optional) {
-      console.log(`SKIP  ${suite.script} (not present yet — optional suite, skipped)`);
-      results.push({ ...suite, status: "SKIP", reason: "not present" });
-      continue;
-    }
-    // A required suite that vanished is a failure, not a skip: the gate would
-    // otherwise go green by deleting the thing that was supposed to protect it.
+    // A suite that vanished is a failure, not a skip: the gate would otherwise
+    // go green by deleting the thing that was supposed to protect it.
     console.log(`FAIL  ${suite.script} (missing)`);
     results.push({ ...suite, status: "FAIL", reason: "missing", ms: 0 });
     continue;
@@ -70,17 +79,18 @@ for (const suite of SUITES) {
 
 const passed = results.filter((r) => r.status === "PASS").length;
 const failed = results.filter((r) => r.status === "FAIL").length;
-const skipped = results.filter((r) => r.status === "SKIP").length;
 
 console.log("\n=== summary ===");
 for (const r of results) {
-  if (r.status === "SKIP") {
-    console.log(`SKIP  ${r.name.padEnd(16)} exit -   (${r.reason})`);
-    continue;
-  }
   const exit = r.exit === null || r.exit === undefined ? "-" : r.exit;
   const note = r.detail ? `  (${r.detail})` : "";
   console.log(`${r.status}  ${r.name.padEnd(16)} exit ${exit}  (${(r.ms / 1000).toFixed(1)}s)${note}`);
 }
-console.log(`\nTOTAL: ${passed} passed, ${failed} failed, ${skipped} skipped  [${((Date.now() - startedAt) / 1000).toFixed(1)}s]`);
+console.log(`\nTOTAL: ${passed} passed, ${failed} failed  [${((Date.now() - startedAt) / 1000).toFixed(1)}s]`);
+console.log(`${PAID_SUITES.length} paid suite(s) NOT run (opt-in; see below)`);
+
+console.log("\n=== paid suites (NOT run by npm test) ===");
+for (const s of PAID_SUITES) {
+  console.log(`SKIP  ${s.name.padEnd(16)} ${s.script} — ${s.why}; run: npm run ${s.npm}`);
+}
 process.exit(failed === 0 ? 0 : 1);

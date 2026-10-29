@@ -1,7 +1,7 @@
 {
   "name": "cc-code-review",
-  "version": "1.18.1",
-  "description": "MCP server (cc-code-review) that calls Claude Code's native /code-review (or a fleet pipeline mirroring its playbook: parallel finder subagents, one verifier per surviving candidate, sweep; 0-100 confidence scoring, >=80 filter) and returns the findings to ZCode or any other MCP client.",
+  "version": "1.18.2",
+  "description": "MCP server (cc-code-review) that calls Claude Code's native /code-review (or a fleet pipeline mirroring its playbook: parallel finder subagents, one verifier per surviving candidate, sweep; 0-100 confidence scoring, >=75 filter) and returns the findings to ZCode or any other MCP client.",
   "type": "module",
   "main": "src/index.js",
   "bin": {
@@ -48,16 +48,17 @@
     "test": "node scripts/run-tests.mjs",
     "test:all": "node scripts/run-tests.mjs",
     "test:e2e": "node scripts/cross-cases.mjs",
+    "test:e2e:real": "node scripts/e2e-test.mjs",
+    "test:followup": "node scripts/followup-e2e.mjs",
+    "test:cancel": "node scripts/cancel-test.mjs",
     "test:paid": "node scripts/paid-smoke.mjs"
   },
   "engines": {
     "node": ">=18.19"
   },
   "dependencies": {
+    "@hono/node-server": "1.19.9",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "zod": "^3.25.0"
-  },
-  "overrides": {
-    "@hono/node-server": "1.19.9"
   }
 }

@@ -92,7 +92,7 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `postToPR` | `false` | - | additionally post the summary back to the PR via `gh pr comment` (by default the report is only returned, nothing leaves the machine) |
 | `fix` | `false` | - | **fix mode**: after the report, edit repo files to fix the findings (only Edit/Write unlocked, **zero git write commands**, no commits; `.git/**`, `.env*` and secret files are all in the deny list — blocking verified on a real CLI) |
 | `effort` | `max` | low/medium/high/xhigh/max | **model reasoning effort**, same levels as Claude Code's native `--effort`; defaults to max (deepest, slowest, priciest) — pass low/medium explicitly for a fast, cheap pass; degrades to think/ultrathink keywords when the CLI lacks the flag (never both at once) |
-| `reviewLevel` | derived from `effort` | low/medium/high/max | **the review's own depth** — the same argument the native `/code-review low\|high\|max` takes. Sizes the finder fleet from the diff: about `max(2, min(8, ceil(lines/150)))` (low 2-3 / medium 3-5 / high 4-8 / max 5-8; a max run reaches 10-15+ agents with verification). A separate knob from `effort` and `ultracode` |
+| `reviewLevel` | derived from `effort` | low/medium/high/max | **the review's own depth** — the same argument the native `/code-review low\|high\|max` takes. The fleet mirrors the native playbooks verbatim: low = one pass, no subagents (≤4 findings); medium/high = **8 finders** (3+5 angles × 6 candidates); max = **10 finders** (5+5 angles × 8 candidates) + **one verifier per surviving candidate** (CONFIRMED/PLAUSIBLE/REFUTED) + **1 sweep finder**, findings capped at 15. A max run therefore exceeds 15 agents structurally (measured: 17), not by a hard-coded number |
 | `ultracode` | `false` | - | **Ultracode mode**: writes `ultracode: true` into the `--settings` file, enabling claude's standing dynamic-workflow orchestration (every substantive step via the Workflow tool, multi-agent, token cost no object). Orthogonal to effort; older CLIs ignore the key (`workflow_runs` in the result shows whether it took effect) |
 | `model` | - | - | model override (`--model` passthrough) |
 | `maxTurns` | `80` | 4–200 | agentic turn cap |
@@ -163,7 +163,7 @@ It also closes the **write/execute forms that a prefix rule cannot express**: `f
 
 > ⚠️ **`--settings` replaces the entire `hooks` key**: the injected temp file contains only this MCP's hook — your own hooks from `~/.claude/settings.json` will **not** run inside this child process (other keys such as `env`, `model`, `permissions` are unaffected). This is CLI behavior, not an omission — if you rely on your own hooks during reviews, you currently need a different approach.
 
-**There is exactly one policy**: `src/shell-guard.js` exports `BASH_POLICY`, `prompt.js` renders the `Bash(...)` rules from it, and the hook judges segments against the same table — so "the hook allowed it" and "the engine allowed it" cannot drift. The contract is locked by `scripts/shell-guard-test.mjs` (203 checks: allowed chains must pass, bad chains must stop, `cd` outside the root must stop, writing sinks must stop, a real review's 17-command replay, and a hook-process denial for every dangerous form) — **run `npm test` before changing the policy**. Turn it off with `CLAUDE_REVIEW_SHELL_GUARD=0` (the whole thing then fails closed and refuses to run — see "Fail closed when a defense layer is missing").
+**There is exactly one policy**: `src/shell-guard.js` exports `BASH_POLICY`, `prompt.js` renders the `Bash(...)` rules from it, and the hook judges segments against the same table — so "the hook allowed it" and "the engine allowed it" cannot drift. The contract is locked by `scripts/shell-guard-test.mjs` (218 checks: allowed chains must pass, bad chains must stop, `cd` outside the root must stop, writing sinks must stop, a real review's 17-command replay, and a hook-process denial for every dangerous form) — **run `npm test` before changing the policy**. Turn it off with `CLAUDE_REVIEW_SHELL_GUARD=0` (the whole thing then fails closed and refuses to run — see "Fail closed when a defense layer is missing").
 
 Redirection (including `2>/dev/null`) stays fully refused: it is the read/write primitive that bypasses the allowlist, and allowing it would require proving every destination harmless. Let the command write to stdout instead.
 
@@ -233,7 +233,7 @@ Tip: if the host environment has leftover `ANTHROPIC_API_KEY` and friends that `
 
 ## Cost & duration
 
-- Every real review consumes Claude credits (through your subscription/gateway). With the default effort=max the diff-sized fleet is 2–8+ reviewers (a max run reaches 10-15+ with verification): typically $3–25 and 2–15 minutes; explicit `effort: "low"` drops it to roughly $0.3–3. The default is **no spend cap** (`maxBudgetUsd: 0`); `timeoutMinutes` is the guard.
+- Every real review consumes Claude credits (through your subscription/gateway). With the default effort=max the fleet is 10 finders + one verifier per surviving candidate + 1 sweep (measured: 17 subagents, $5.7, ~23 min; concurrency is bounded by your gateway — of 17 concurrent agents, 5 failed on a MiniMax gateway); explicit `effort: "low"` uses the built-in single pass at roughly $0.1–3. The default is **no spend cap** (`maxBudgetUsd: 0`); `timeoutMinutes` is the guard.
 - **Incremental capture**: each reviewer subagent's report is appended to `%TEMP%/cc-code-review/subagents-*.jsonl` (one line per subagent) the moment it lands, and is visible via `claude_review_status` while the run continues — the native skill only reports after the whole fleet finishes, but a 429 / timeout / cancel can interrupt it; finished reports come back with the error.
 - **429 recovery**: an agent killed by a rate limit / quota exhaustion is salvaged from the `output_file` transcript named in its launch acknowledgement (marked `partial (output_file)`), so tokens already spent are not wasted.
 - `claude_review_env` and version/flag probes are free (results are cached).
@@ -248,7 +248,7 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (203, free) + audit-fix unit tests (269, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (218, free) + audit-fix unit tests (272, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
 node scripts/cross-cases.mjs                    # 21 MECE cases (131 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)

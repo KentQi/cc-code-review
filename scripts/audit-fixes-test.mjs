@@ -19,7 +19,7 @@ import {
   guardState, gitWriteFlagReason, gitSpawnOpts, guardSelfTest,
   writeGuardSettings, removeGuardSettings,
   streamEventFacts, parseUnrecognizedModels, buildModelProvenance, resultFacts,
-  parseAgentLaunchAck, looksLikeLaunchAck, recoverReportFromTranscript,
+  parseAgentLaunchAck, looksLikeLaunchAck, recoverReportFromTranscript, analyseCommand,
 } from "../src/claude.js";
 import { codeDrift } from "../src/version.js";
 import { skillStatus, skillSync, installBundledSkill, bundledSkillFile } from "../src/skill.js";
@@ -119,7 +119,14 @@ check("anchored rule still matches the bare form", matchesDeny("git diff --outpu
 // deny rule matches them — they are refused by the allowlist instead, which is
 // the hard boundary. Assert that explicitly so it cannot silently become granted.
 check("bare `git tag v1` create is not granted", allowedByRule("git tag v1"), false);
-check("bare `git branch x` create is not granted", allowedByRule("git branch x"), false);
+// `git branch` shares a prefix between reads (-a/-v/-r/…) and writes (`git
+// branch <name>` creates, -d/-m delete/move). The permission engine cannot tell
+// them apart, so the rule grants the prefix and the HOOK refuses the write forms
+// (requireFlagsOnly + denyFlags) — the same design as `cd`. Assert the hook,
+// which is the deterministic control.
+check("bare `git branch x` create is refused by the guard", analyseCommand("git branch x", { repoRoot: os.tmpdir() }).ok, false);
+check("git branch -a is allowed", analyseCommand("git branch -a", { repoRoot: os.tmpdir() }).ok, true);
+check("git branch -a -vv (combined flags) is allowed", analyseCommand("git branch -a -vv", { repoRoot: os.tmpdir() }).ok, true);
 
 /* ---------------- allow/deny conflicts must not exist ---------------- */
 // A rule present in BOTH lists is dead code (deny wins), and the tool it covers
@@ -405,7 +412,9 @@ check("guard state is one of on/off/failed", ["on", "off", "failed"].includes(gu
   });
   check("the fleet prompt embeds the bundled pipeline", /## Pipeline \(bundled with this MCP/.test(fleet), true);
   check("the fleet prompt does not ask for the skill tool", /Use the `code-review` skill/.test(fleet), false);
-  check("the fleet prompt still states the fleet size rule", /dispatch about max\(5/.test(fleet), true);
+  check("the fleet prompt states the native three-phase fleet",
+    /PHASE 1 .*dispatch ALL 10 finder subagents in ONE message/.test(fleet) &&
+    /ONE verifier subagent per surviving candidate/.test(fleet) && /PHASE 3 .*sweep/.test(fleet), true);
 }
 
 /* ---------------- the installed skill is refreshed, not frozen ----------------
@@ -638,8 +647,10 @@ check("hook refuses Bash without a repo root",
   check("effort medium maps to review level medium", deriveReviewLevel("medium"), "medium");
   check("effort low maps to review level low", deriveReviewLevel("low"), "low");
   check("unknown effort defaults to high", deriveReviewLevel("bogus"), "high");
-  check("fleet rule is tighter at low", finderFleetRule("low"), { floor: 2, cap: 3 });
-  check("fleet rule at max keeps the native cap of 8", finderFleetRule("max"), { floor: 5, cap: 8 });
+  check("fleet rule: low has no fleet", finderFleetRule("low"), { finders: 0, candidates: 0, cap: 4 });
+  // Read out of claude 2.1.311: max = "5+5 angles x 8 candidates", i.e. 10 finders.
+check("fleet rule at max is the native 10 finders", finderFleetRule("max"), { finders: 10, candidates: 8, cap: 15 });
+check("fleet rule at high is the native 8 finders", finderFleetRule("high"), { finders: 8, candidates: 6, cap: 8 });
   // The prompt must carry the fleet rule and the level, so the model sizes the
   // fleet from the diff instead of always dispatching five.
   const prompt = buildReviewPrompt({
@@ -647,9 +658,9 @@ check("hook refuses Bash without a repo root",
     outputLanguage: "English", postToPR: false, fix: false, effort: "max",
     reviewLevel: "max", useEffortFlag: true, cwd: "C:/repo",
   });
-  check("prompt carries the reviewer fleet rule", /Reviewer fleet \(this run's level: max\)/.test(prompt), true);
-  check("prompt carries the diff-sized formula", /max\(5, min\(8, ceil\(lines\/150\)\)\)/.test(prompt), true);
-  check("prompt says five is not a cap", /10-15\+ subagents/.test(prompt), true);
+  check("prompt carries the native fleet structure", /Reviewer fleet \(level max, same structure as claude/.test(prompt), true);
+  check("prompt states the native finder count", /dispatch ALL 10 finder subagents in ONE message/.test(prompt), true);
+  check("prompt states one verifier per surviving candidate", /ONE verifier subagent per surviving candidate/.test(prompt), true);
 }
 
 /* ---------------- the review allowlist covers native workflow orchestration ---------------- */

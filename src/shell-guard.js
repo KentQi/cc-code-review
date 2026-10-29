@@ -61,10 +61,26 @@ export const BASH_POLICY = [
       { words: ["remote", "-v"], exact: true },
       { words: ["remote", "get-url"] }, { words: ["remote", "show"] },
       { words: ["stash", "list"] }, { words: ["stash", "show"] },
+      // Reviewer subagents explore with these; refusing them burned turns in a
+      // real max run (36 denials across the fleet). `git branch` also writes
+      // (-d/-D/-m/-f/…), so it is a prefix rule with a flag guard.
+      { words: ["ls-tree"] },
+      {
+        words: ["branch"],
+        // `git branch <name>` CREATES a branch (a write with no flag to match),
+        // so this prefix is only safe when it carries flags and nothing else.
+        requireFlagsOnly: true,
+        denyFlags: ["-d", "-D", "-m", "-M", "-c", "-C", "-f", "-t", "--delete", "--move", "--copy",
+          "--force", "--track", "--edit-description", "--set-upstream-to", "--unset-upstream-to"],
+      },
     ],
   },
   { prog: "find", prefixes: [{ words: [] }] },
   { prog: "rg", prefixes: [{ words: [] }] },
+  // Read-only explorers. Both carry the same in-repo path check as find/rg, and
+  // neither can write — `ls` lists, `grep` prints matches.
+  { prog: "ls", prefixes: [{ words: [] }] },
+  { prog: "grep", prefixes: [{ words: [] }] },
   // `echo` reads nothing and writes nothing: it only prints its arguments, so
   // it is the one harmless separator a reviewer reaches for in a compound call
   // (`git show HEAD && echo "=====" && git log`). Refusing it burned a turn in a
@@ -183,7 +199,7 @@ function matchPolicy(words) {
       if (p.words.length > words.length - 1) continue;
       if (!p.words.every((w, i) => words[i + 1] === w)) continue;
       if (p.exact && words.length !== p.words.length + 1) continue;
-      return rule;
+      return { rule, prefix: p };
     }
   }
   return null;
@@ -228,6 +244,7 @@ const FLAG_KINDS = {
     "-l": "skip", "--line-length": "skip",
   },
   cat: {},
+  ls: { "--block-size": "skip", "-I": "skip", "--ignore": "skip", "--time-style": "skip", "--format": "skip", "-w": "skip", "--width": "skip", "--color": "skip", "--quoting-style": "skip", "--sort": "skip" },
   head: { "-n": "skip", "--lines": "skip", "-c": "skip", "--bytes": "skip" },
   tail: {
     "-n": "skip", "--lines": "skip", "-c": "skip", "--bytes": "skip",
@@ -561,7 +578,32 @@ export function analyseCommand(cmd, opts = {}) {
       continue;
     }
 
-    if (matchPolicy(words)) {
+    const match = matchPolicy(words);
+    if (match) {
+      // A prefix rule can be read-only in most forms and a write in a few
+      // (`git branch`): the per-prefix flag guard is what makes the prefix safe.
+      // A bare positional after `git branch` creates a branch: every remaining
+      // token must be a flag.
+      if (match.prefix.requireFlagsOnly) {
+        const operand = words.slice(match.prefix.words.length + 1).find((w) => !w.startsWith("-"));
+        if (operand) {
+          return {
+            ok: false, kind: "dangerous",
+            reason: "blocked: `" + [words[0], ...match.prefix.words, operand].join(" ") +
+              "` creates a branch (a write). Review mode is read-only — list branches instead (`git branch -a`).",
+            chained, substituted: false, dangerous: true,
+          };
+        }
+      }
+      const banned = (match.prefix.denyFlags || []).find((flag) => words.some((w) => w === flag || w.startsWith(flag + "=")));
+      if (banned) {
+        return {
+          ok: false, kind: "dangerous",
+          reason: "blocked: `" + [words[0], ...match.prefix.words, banned].join(" ") +
+            "` writes (it changes branches or refs). Review mode is read-only — list branches instead (`git branch -a`).",
+          chained, substituted: false, dangerous: true,
+        };
+      }
       const why = segmentProblem(words, opts.repoRoot);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;

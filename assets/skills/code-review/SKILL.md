@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Comprehensive code review pipeline — a diff-sized fleet of parallel reviewer subagents (convention compliance, bug scan, git-blame history, previous PRs, in-code comments; about max(2, min(8, ceil(diff_lines/150))) finders, and a max-level review legitimately fans out 10-15+ agents with verification), 0-100 confidence scoring, keeps only findings >= 80, outputs a structured markdown report. Use when asked to review code changes, a pull request, a branch, or the working tree. Adapted from Anthropic's official code-review plugin.
+description: Comprehensive code review pipeline with the same three-phase fleet claude's own /code-review uses — parallel finder subagents (8 at medium/high, 10 at max), one verifier per surviving candidate, a sweep finder — then 0-100 confidence scoring, keeps only findings >= 80, outputs a structured markdown report. Use when asked to review code changes, a pull request, a branch, or the working tree. Adapted from Anthropic's official code-review plugin.
 ---
 
 # Code Review
@@ -32,14 +32,30 @@ branch, (3) the last commit.
 3. **Gather conventions**: find the CLAUDE.md / AGENTS.md files (repo root and
    the directories of changed files) that govern the changed code.
 
-4. **Reviewer fleet — size it from the diff, not a fixed count.** Run
-   `git diff --numstat <range>`, sum added+deleted lines, and dispatch about
-   `max(2, min(8, ceil(lines/150)))` finder subagents in ONE message so they run
-   in parallel. The five briefs below are the default set: on a large diff split
-   a brief across finders (per file / per concern) so every finder gets a
-   focused scope, and add verification subagents for step 5. A max-level review
-   legitimately runs 10-15+ subagents in total. Give each the diff (or the exact
-   commands to obtain it) plus its brief.
+4. **Reviewer fleet — the same three-phase structure claude's own
+   /code-review playbook uses.** The level sets the fleet, not the diff:
+   - **low**: one careful diff pass, no subagents, at most 4 findings.
+   - **medium / high**: 8 finder subagents (3+5 angles × 6 candidates).
+   - **max / xhigh**: 10 finder subagents (5+5 angles × 8 candidates).
+
+   Then, at every level with a fleet:
+   - **Phase 1 — find.** Dispatch the finders in ONE message (they run in
+     parallel). The briefs below are the default set; on a large diff split a
+     brief across files rather than inventing new angles. Each finder returns
+     candidates as `{file, line, summary, failure_scenario}`.
+   - **Phase 2 — verify (1 vote).** Dedup candidates that point at the same
+     line/mechanism, then run **one verifier subagent per surviving candidate**
+     (send each batch of verifiers in ONE message as well):
+     it gets the diff, the file and the claim, and answers CONFIRMED /
+     PLAUSIBLE / REFUTED with the evidence. Keep CONFIRMED and PLAUSIBLE.
+   - **Phase 3 — sweep.** One more finder, as a fresh reviewer that sees the
+     verified list, looks ONLY for gaps it does not already contain.
+
+   That is `finders + one-verifier-per-candidate + 1 sweep` subagents, so a
+   max-level review legitimately exceeds 15 in total. If the Agent tool is not
+   available, do every angle and every verification yourself, sequentially —
+   never skip an angle for lack of fan-out. Give each subagent the diff (or the
+   exact commands to obtain it) plus its brief.
 
    **Include this execution contract verbatim in EVERY subagent prompt** — a
    subagent does not see this file, and a subagent that guesses at its shell
@@ -80,8 +96,9 @@ branch, (3) the last commit.
      documented invariants). `reason` quotes the comment and explains the
      violation. category: `code-comment`
 
-5. **Confidence scoring** — score each finding 0-100 (you may dispatch
-   parallel small-model subagents with the rubric):
+5. **Confidence scoring** — each surviving candidate already carries its
+   verifier's vote (CONFIRMED / PLAUSIBLE / REFUTED) and the evidence it used;
+   turn that into the 0-100 score below (REFUTED = 0):
 
    ```
    0   : False positive that doesn't survive light scrutiny, or pre-existing.

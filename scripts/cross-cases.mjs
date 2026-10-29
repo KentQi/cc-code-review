@@ -716,7 +716,9 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   const maxAuto = await runCase({ effort: "max" });
   check("C21", "auto + max uses the fleet pipeline, not the native command", !/^\/code-review\b/.test(maxAuto.prompt), maxAuto.prompt.slice(0, 80));
   check("C21", "the fleet prompt carries the pipeline inline (no skill needed)", /## Pipeline \(bundled with this MCP/.test(maxAuto.prompt), maxAuto.prompt.slice(0, 120));
-  check("C21", "the fleet prompt still sizes itself from the diff", /dispatch about max\(5/.test(maxAuto.prompt), maxAuto.prompt.slice(0, 120));
+  check("C21", "the fleet prompt carries the native three-phase structure",
+    /PHASE 1 .*dispatch ALL 10 finder subagents in ONE message/.test(maxAuto.prompt) && /ONE verifier subagent per surviving candidate/.test(maxAuto.prompt),
+    maxAuto.prompt.slice(0, 160));
   check("C21", "the fleet prompt does not ask for the skill tool", !/Use the `code-review` skill/.test(maxAuto.prompt));
 
   const forcedNative = await runCase({ effort: "max", pipeline: "native" });

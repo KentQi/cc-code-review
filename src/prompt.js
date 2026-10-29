@@ -57,11 +57,29 @@ export function deriveReviewLevel(effort) {
   }
 }
 
-/** Finder-fleet sizing rule, mirrored from the native command. */
+/**
+ * The reviewer-fleet structure, read verbatim out of claude 2.1.311's own
+ * code-review playbooks (claude.exe: `ro("max")` for max/xhigh, `no()` for
+ * medium, `to()` for low):
+ *
+ *   medium/high : "3+5 angles x 6 candidates -> 1-vote verify"
+ *   max / xhigh : "5+5 angles x 8 candidates -> 1-vote verify -> sweep"
+ *   low         : one diff pass, no subagents
+ *
+ * `finders` is phase 1's finder count. Phase 2 runs ONE verifier per surviving
+ * candidate and phase 3 adds one sweep finder, so a max review legitimately
+ * exceeds 15 agents without any hard-coded total. (The separate "about
+ * clamp(2..8, lines/150) finders" string in the binary is a hint injected only
+ * for the claude-sonnet-5 family at high+, not a universal rule.)
+ */
 export function finderFleetRule(reviewLevel) {
-  const cap = { low: 3, medium: 5, high: 8, max: 8 }[reviewLevel] ?? 8;
-  const floor = { low: 2, medium: 3, high: 4, max: 5 }[reviewLevel] ?? 4;
-  return { floor, cap };
+  const table = {
+    low: { finders: 0, candidates: 0, cap: 4 },
+    medium: { finders: 8, candidates: 6, cap: 8 },
+    high: { finders: 8, candidates: 6, cap: 8 },
+    max: { finders: 10, candidates: 8, cap: 15 },
+  };
+  return table[reviewLevel] ?? table.max;
 }
 
 function sanitizeBaseRef(baseRef) {
@@ -144,8 +162,22 @@ export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, p
     lines.push(`- Review effort level: ${effort}${effort === "max" || effort === "xhigh" ? " — be exhaustive: re-read surrounding code for every finding, verify each claim against the actual diff, and actively hunt for the harder-to-spot issues (concurrency, error paths, resource leaks), not just the obvious ones." : ""}.`);
   }
   if (reviewLevel) {
-    const { floor, cap } = finderFleetRule(reviewLevel);
-    lines.push(`- Reviewer fleet (this run's level: ${reviewLevel}): size it from the diff, not a fixed count — run \`git diff --numstat <range>\`, sum added+deleted, and dispatch about max(${floor}, min(${cap}, ceil(lines/150))) finder subagents in ONE message. The five briefs below are the default set; on a large diff split a brief across finders (per file / per concern) and add verification subagents for scoring — a max-level review legitimately runs 10-15+ subagents in total. Do not shrink below ${floor}.`);
+    const { finders, candidates, cap } = finderFleetRule(reviewLevel);
+    if (finders === 0) {
+      lines.push(`- Reviewer fleet (level ${reviewLevel}): one careful diff pass, no subagents; report at most ${cap} findings.`);
+    } else {
+      // Mirrors claude's own playbook for this level: phase 1 finders, phase 2
+      // one verifier per surviving candidate, phase 3 a sweep finder.
+      lines.push(
+        `- Reviewer fleet (level ${reviewLevel}, same structure as claude's native playbook): ` +
+        `PHASE 1 — dispatch ALL ${finders} finder subagents in ONE message (that many Agent tool calls in the SAME reply) using the Agent tool's background/async mode (run_in_background: true — the 2.1.x default), so the whole fleet runs concurrently and you are not blocked; never one per turn, never a foreground agent that blocks the rest, covering 5 correctness angles + 3 cleanup + 1 altitude + 1 conventions; on a large diff split an angle across files instead of adding new ones; each returns up to ${candidates} candidates as {file, line, summary, failure_scenario}. ` +
+        `PHASE 2 — dedup candidates that point at the same line/mechanism, then run ONE verifier subagent per surviving candidate (give it the diff, the file, and the claim); send each batch of verifiers in ONE message too; a verifier answers CONFIRMED, PLAUSIBLE or REFUTED with the evidence; keep CONFIRMED and PLAUSIBLE. ` +
+        `PHASE 3 — one more finder subagent as a fresh reviewer that sees the verified list and looks ONLY for gaps. ` +
+        `That is ${finders} finders + one verifier per surviving candidate + 1 sweep, so a max-level review legitimately runs 15+ subagents in total. ` +
+        `If the Agent tool is unavailable, do every angle and every verification yourself, sequentially, instead of erroring. ` +
+        `Report at most ${cap} findings, most severe first.`,
+      );
+    }
   }
   if (fix) {
     lines.push(`- FIX MODE: after producing the report, apply fixes. Edit the repository files directly to fix every confirmed finding whose fix does not require a business decision. Keep diffs minimal and follow repo conventions. Do NOT run git commit, do NOT touch unrelated code, and never write inside .git/ or into .env / secret / key files. Then append a final "## Fixes Applied" section to your report listing, for each fix: file, what changed, which finding it addresses. If a finding needs a decision you cannot make (e.g. rounding policy), leave it unfixed and say so under Notes.`);

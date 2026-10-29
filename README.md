@@ -91,7 +91,7 @@ npm run init
 | `postToPR` | `false` | - | 额外用 `gh pr comment` 把摘要贴回 PR（默认只返回报告，不外发） |
 | `fix` | `false` | - | **修复模式**：报告后直接修改仓库文件修复 findings（只放开 Edit/Write，**无任何 git 写命令**，不 commit；`.git/**`、`.env*`、密钥文件均在 deny 列表，实测拦截有效） |
 | `effort` | `max` | low/medium/high/xhigh/max | **模型推理力度**，与 Claude Code 原生 `--effort` 同档位；默认 max（最深、最慢、最贵），想快想省就显式传 `low`/`medium`；CLI 不支持时自动退化为 think/ultrathink 关键词（两者不会叠加） |
-| `reviewLevel` | 由 `effort` 派生 | low/medium/high/max | **评审自身深度**（同原生 `/code-review low\|high\|max` 的参数）：按 diff 行数决定 finder 子代理数量，约 `max(2, min(8, ceil(行数/150)))`（low 2-3 / medium 3-5 / high 4-8 / max 5-8，max 加验证阶段实际 10-15+ 个）。与 `effort`、`ultracode` 是三个独立旋钮 |
+| `reviewLevel` | 由 `effort` 派生 | low/medium/high/max | **评审自身深度**（同原生 `/code-review low\|high\|max` 的参数）。舰队结构逐字对齐原生 playbook：low = 单遍无子代理（≤4 findings）；medium/high = **8 个 finder**（3+5 角度 × 6 候选）；max = **10 个 finder**（5+5 角度 × 8 候选）+ **每个存活候选 1 个 verifier**（CONFIRMED/PLAUSIBLE/REFUTED）+ **1 个 sweep finder**，findings 上限 15。max 的总代理数是结构性的 15+（实测 17），不是硬编码数字 |
 | `ultracode` | `false` | - | **Ultracode 模式**：通过 `--settings` 写入 `ultracode: true`，启用原生"常驻动态工作流编排"（每个实质任务走 Workflow 工具、多代理、不计 token 成本）；与 effort 正交；旧版 CLI 忽略该键（结果里的 `workflow_runs` 显示是否真正生效） |
 | `model` | - | - | 覆盖模型（`--model` 透传） |
 | `maxTurns` | `80` | 4–200 | agentic 轮数上限 |
@@ -162,7 +162,7 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 > ⚠️ **`--settings` 替换的是整个 `hooks` 键**：注入的临时文件里只有本 MCP 的 hook，用户 `~/.claude/settings.json` 里自己配置的 hooks 在**本次子进程内不会生效**（其它键如 `env`、`model`、`permissions` 不受影响）。这是 CLI 的行为，不是遗漏——如果你依赖自己的 hook 在 review 期间运行，目前需要另想办法。
 
-**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs` 锁定（203 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
+**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs` 锁定（218 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
 
 重定向（含 `2>/dev/null`）仍然整体拒绝：它是绕过 allowlist 的读写原语，改成"允许读重定向"需要先证明每个目标路径都无害，代价大于收益。需要看输出就直接让命令写到 stdout。
 
@@ -232,7 +232,7 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ## 成本与时长
 
-- 每次真实 review 消耗 Claude 额度（走你的订阅/网关）。默认 effort=max：按 diff 规模派 2–8+ 个评审代理（max 含验证阶段可达 10–15+），典型 $3–25、2–15 分钟；显式 `effort: "low"` 可降到约 $0.3–3。默认**不设费用上限**（`maxBudgetUsd: 0`），由 `timeoutMinutes` 兜底。
+- 每次真实 review 消耗 Claude 额度（走你的订阅/网关）。默认 effort=max：10 个 finder + 每个存活候选 1 个 verifier + 1 个 sweep（实测 17 个子代理、$5.7、约 23 分钟；并行度受网关并发上限影响，实测 17 个并发时 5 个失败）；显式 `effort: "low"` 走内置单遍，约 $0.1–3。默认**不设费用上限**（`maxBudgetUsd: 0`），由 `timeoutMinutes` 兜底。
 - **增量捕获**：每个评审子代理一完成就立刻追加进 `%TEMP%/cc-code-review/subagents-*.jsonl`（一行一个），并可通过 `claude_review_status` 在运行中轮询拿到——原生 skill 要等全部子代理跑完才出报告，而 429/超时/取消随时可能打断；被打断时已完成的报告随错误一起返回。
 - **429 抢救**：被限流/额度耗尽打死的子代理，其工作会从启动确认里的 `output_file` 转录尾部恢复（标记 `partial (output_file)`），已花的 token 不白扔。
 - `claude_review_env` 与版本/flag 探测免费（结果有缓存）。
@@ -247,7 +247,7 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（203 条，免费）+ 审计修复单测（269 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（218 条，免费）+ 审计修复单测（272 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
 node scripts/cross-cases.mjs                    # 21 个 MECE 用例（131 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）

@@ -47,6 +47,10 @@ const OK = [
   "git rev-parse HEAD",
   "git stash list",
   "git blame -L 10,20 src/index.js",
+  "git ls-tree -r HEAD",
+  "git branch -a -vv",
+  "ls -la src",
+  "grep -n foo src/index.js",
   'git log --grep="fix: something; else"',
   'git diff --unified=20 -- "src/a;b.js"',
   "find . -name '*.js' -type f",
@@ -86,7 +90,6 @@ const BAD = [
   ["git status && cat /etc/passwd", "unlisted"],
   ["cat /etc/passwd", "unlisted"],
   ["cat package.json", "unlisted"],
-  ["ls -la", "unlisted"],
   ["node -e 1", "unlisted"],
   ["xargs rm", "unlisted"],
   ["git -C . status", "unlisted"],
@@ -178,6 +181,14 @@ for (const c of SCOPE_BAD) {
   check(`block outside read: ${JSON.stringify(c)}`, [v.ok, /outside|repository|read-only/.test(String(v.reason))], [false, true]);
 }
 check("a path that does not exist yet is not an escape", analyseCommand("rg -n x src/new-file.js", OPTS).ok, true);
+
+/* ---- the widened read-only explorers keep their write forms closed ---- */
+for (const c of ["git branch -d feature", "git branch -D feature", "git branch -m old new", "git branch -f x HEAD", "git branch --delete x", "git branch --set-upstream-to=origin/x"]) {
+  check("block branch write: " + JSON.stringify(c), analyseCommand(c, OPTS).ok, false);
+}
+for (const c of ["ls /etc", "ls -la ../other"]) {
+  check("block ls outside: " + JSON.stringify(c), analyseCommand(c, OPTS).ok, false);
+}
 
 /* ---- cd is only a no-op to the reviewed root ---- */
 const CD_BAD = [

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.17.0 — 2026-10-29
+
+The fleet now mirrors claude's own review playbook, read out of the binary instead of guessed. No hard-coded "15".
+
+- **What the native code actually says** (claude.exe 2.1.311, `ro("max")` / `no()` / `to()`):
+  - low: `1 diff pass → no verify → ≤4 findings`, no subagents.
+  - medium/high: `3+5 angles × 6 candidates → 1-vote verify` — **8 finder subagents**.
+  - max/xhigh: `5+5 angles × 8 candidates → 1-vote verify → sweep` — **10 finder subagents**, then **one verifier per deduped candidate** (CONFIRMED / PLAUSIBLE / REFUTED, keep the first two), then **one sweep finder** for gaps; findings capped at 15.
+  - If the Agent tool is missing, the playbook says to do every angle and every verification inline instead of erroring — which is why the "do NOT spawn subagents" text appears in the fallback template, not the main path.
+  - The separate "spawn about `clamp(2..8, lines/150)` finders" string is a hint injected only for the claude-sonnet-5 family at high+; it is not a universal rule.
+- **The MCP now follows that structure.** The previous prompt invented level floors (5 at max) plus a diff-scaled formula, which is not what claude does; it produced 10 finders + 3 verifiers on a 672-line diff. The new prompt states phase 1 (all finders in ONE message, background agents), phase 2 (one verifier per surviving candidate, batched in one message), phase 3 (sweep), and the 15-finding cap. The bundled skill says the same thing, so the two cannot disagree.
+- **Measured on the same 672-line fixture, effort=max:**
+  - old prompt: 13 subagents (10 finders + 3 verifiers), background/parallel, $12, 10 min.
+  - native structure, foreground: 23 (10 + 13), sequential, $17, 17.5 min.
+  - native structure + background agents: **17 (10 finders + 6 verifiers + 1 sweep), all `started_in_background: 17`**, $5.7, 23 min, 12 completed / 5 failed. The failures are the gateway's concurrency ceiling (17 simultaneous agents through a MiniMax endpoint), not the pipeline: every report that arrived was captured.
+  - A variant that forced 10 foreground agents into one message never produced a report inside 20 minutes — concurrency mode matters more than the count.
+- **Read surface widened from that experiment.** The 36 denials in the first max run were subagents exploring with `ls`, `grep`, `git ls-tree` and `git branch -a -vv`. Those are now part of the policy (read-only, still path-scoped to the repo); `git branch` is a prefix rule with a flag guard because `git branch <name>` creates a branch — verified refused, along with `-d/-D/-m/-f/--delete/--set-upstream-to`.
+- Suites: shell-guard 218 (+15: `ls`/`grep`/`git ls-tree`, branch-write refusals, outside-path refusals), audit-fixes 272, validate 16, cross-cases 131/131.
+
 ## 1.16.0 — 2026-10-29
 
 A review no longer installs anything into Claude Code. It calls claude's own `/code-review` command where that command works, and carries this MCP's pipeline in the prompt where it does not.

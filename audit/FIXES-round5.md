@@ -3,6 +3,7 @@
 **基线**：v1.18.4（PR #1–#4 的第三轮审计：7 P0 / 14 P1 / 22 P2 / 8 P3）
 **结果**：v1.18.5（`npm test` 7 套件全绿：shell-guard 272 / audit-fixes 305 / p0-regression 163 / validation 30 / pack 43 / cross-cases 154 / smoke）
 **PR**：[#5](https://github.com/KentQi/cc-code-review/pull/5)（stacked on [#4](https://github.com/KentQi/cc-code-review/pull/4)）
+**CI**：ubuntu/macos/windows × node 18/22 **6/6 全绿**（run [40927081609](https://github.com/KentQi/cc-code-review/actions/runs/40927081609)）
 **方式**：5 个 subagent 并行（claude.js / shell-guard+hook / index.js / prompt+skill / scripts+package），Lead 做跨文件补丁、独立复现与验收。
 
 ## 7 条 P0（全部已修，Lead 独立复现过每一条）

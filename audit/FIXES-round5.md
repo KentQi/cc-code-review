@@ -49,3 +49,12 @@
 - 独立验收（Lead 自写）：`/tmp/verify-round5.mjs` **32/32**——缩写选项、`gh --body-file`、`find --`、`echo` 引号、`ext::` 环境中和、`config.worktree`、`node_modules` attributes、越界 include、hook 的 Grep/Glob/密钥/runner 配置。
 - 各 subagent 另有 before/after 自测：claude.js 10/30→30/30、index.js 9/30→30/30 与 4/10→10/10、prompt 25/96→96/96、scripts 逐项变异验证。
 - `npm test` 7 套件全绿（本机 + 克隆）。
+## 残余（本轮明确不修，需另立条目）
+
+- **P1-4 残余**：`grep -rn "" .` / `rg --hidden --no-ignore` 仍放行——文本级检查无法判定“是否读了密钥”，要闭需拒绝整类递归/隐藏扫描，代价明显，建议单独评审。
+- **P0-6 残余**：`gh --repo` 只做形状校验，未绑定到被审仓库（需要 remote/调用方信息）。
+- **package.json** 的 Edit 未被内容级拦截（权限引擎按文件名；hook 的 Write 内容检查已覆盖 install 钩子）。
+- **`.env.example` 写策略**：权限层 `**/.env.*` 拒绝，hook 允许模板——保守方向不一致（权限层更严）。
+- **P1-13 部分**：指纹覆盖 `PROTECTED_WRITE`/`SECRET_READ` 两张表，但内联 `segmentProblem`/`dotGlobProblem`/`isInsideRepo` 的代码逻辑仍未纳入哈希。
+
+- **扫描器的 git 失败路径**：仓库把 `.git/config` 写成不可解析（如非法转义）时，扫描器只记 note 并继续（git 命令随后也会失败，评审无产出）。fail-closed 化需要把“bad config”也当 refusal，本轮未改。

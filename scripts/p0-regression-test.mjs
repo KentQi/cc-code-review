@@ -544,6 +544,12 @@ try {
   fs.writeFileSync(path.join(nm, "node_modules", ".gitattributes"), "*.txt diff=evil\n");
   fs.writeFileSync(path.join(nm, "node_modules", "pkg", "a.txt"), "one\n");
   fs.appendFileSync(path.join(nm, ".git", "config"), '\n[diff "evil"]\n\ttextconv = ' + nmDrv + "\n");
+  // Commit it: a repository-delivered node_modules/.gitattributes is the threat
+  // model, and `git ls-files --cached` lists it on every platform (the untracked
+  // `--others` half is exercised by the other fixtures; on Windows Git does not
+  // list this untracked path the same way, which made the check fail there).
+  spawnSync("git", ["-C", nm, "add", "-A"], { stdio: "ignore" });
+  spawnSync("git", ["-C", nm, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "nm"], { stdio: "ignore" });
   check("refuses a driver activated by node_modules/.gitattributes", repoRunsGitPrograms(nm).refusals.length > 0, true);
   fs.rmSync(nm, { recursive: true, force: true });
 
@@ -604,6 +610,10 @@ console.log("-- P2-13 a changed hook policy is visible in the fingerprint");
   fs.cpSync(path.join(ROOT, "src"), path.join(dir, "src"), { recursive: true });
   fs.mkdirSync(path.join(dir, "scripts"), { recursive: true });
   fs.copyFileSync(HOOK, path.join(dir, "scripts", "pre-tool-hook.js"));
+  // The copied tree needs the package.json "type": "module" marker: without it
+  // Node 18 treats .js as CommonJS and the hook cannot even load (Node 22+
+  // auto-detects ESM, so this only failed on the 18.x CI jobs).
+  fs.copyFileSync(path.join(ROOT, "package.json"), path.join(dir, "package.json"));
   // The tables may live in the hook or (after a P1-13 refactor) in the shared
   // guard module; edit whichever copy carries the definition.
   let edited = false;

@@ -79,6 +79,19 @@ for (const cmd of [
 }
 
 /* ------------------------------------------------------------------ */
+/* P0-1b: credential exfiltration via echo. A bare $VAR is substitution */
+/* and unquoted globs/tilde expand before echo runs, but quoted literal */
+/* text must stay usable — the fix must not refuse echo 'price: $5'.    */
+/* ------------------------------------------------------------------ */
+console.log("-- P0-1b echo: expansion refused, quoted literals allowed");
+for (const cmd of ["echo $ANTHROPIC_API_KEY", "echo $HOME", "echo *", "echo ~/*", "echo ../*"]) {
+  check("bash DENY: " + JSON.stringify(cmd), bash(cmd), "DENY");
+}
+for (const cmd of ["echo hello", "echo 'price: $5'", "echo '$HOME'", "echo '*'", "echo \"=====\"", "git show HEAD && echo \"=====\" && git log --oneline -1"]) {
+  check("bash ALLOW: " + JSON.stringify(cmd), bash(cmd), "ALLOW");
+}
+
+/* ------------------------------------------------------------------ */
 /* P0-2: short options may glue their value (-o/tmp/x, -f/etc/passwd).  */
 /* A value-taking short option must reach both the path check and the  */
 /* flag deny table; treating "-xVALUE" as self-contained hid both.     */

@@ -178,22 +178,25 @@ function parseCommand(cmd) {
   const segs = [];
   const ops = [];
   let words = [];
+  let quoted = [];        // parallel to words: was any part of this word quote-protected?
   let word = "";
+  let wordQuoted = false;
   let inWord = false;
   let quote = null;
   let unsafe = null;
 
   const endWord = () => {
-    if (inWord) { words.push(word); word = ""; inWord = false; }
+    if (inWord) { words.push(word); quoted.push(wordQuoted); word = ""; inWord = false; wordQuoted = false; }
   };
   const endSeg = (op) => {
     endWord();
-    if (words.length) { segs.push({ words }); words = []; }
+    if (words.length) { segs.push({ words, quoted }); words = []; quoted = []; }
     if (op) ops.push(op);
   };
 
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
+    if (quote !== null) wordQuoted = true; // any character that arrives inside quotes is literal
     if (quote === "'") {
       if (c === "'") quote = null; else word += c;
       continue;
@@ -217,7 +220,7 @@ function parseCommand(cmd) {
       word += c;
       continue;
     }
-    if (c === "'" || c === '"') { quote = c; inWord = true; continue; }
+    if (c === "'" || c === '"') { quote = c; inWord = true; wordQuoted = true; continue; }
     if (c === "$" && (cmd[i + 1] === "'" || cmd[i + 1] === '"')) {
       // ANSI-C quoting ($'...') and locale quoting ($"...") are expanded by bash
       // BEFORE the command runs: $'-exec' is the argv word -exec. The parser only
@@ -239,7 +242,7 @@ function parseCommand(cmd) {
       // above, which is how the model writes them.
       const next = cmd[i + 1];
       if (next === "\n") { i++; continue; }          // line continuation: both gone
-      if (next !== undefined) { word += next; i++; inWord = true; }
+      if (next !== undefined) { word += next; i++; inWord = true; wordQuoted = true; }
       continue;
     }
     if (c === " " || c === "\t" || c === "\r") { endWord(); continue; }
@@ -413,7 +416,7 @@ function pathArgs(words) {
   // Programs whose arguments are never filesystem paths. git/gh report paths
   // from the repository itself; every other program (echo and tr included)
   // goes through FLAG_KINDS so its operands get the in-repo path check.
-  if (prog === "git" || prog === "gh") return [];
+  if (prog === "git" || prog === "gh" || prog === "echo") return [];
   const kinds = FLAG_KINDS[prog];
   if (!kinds) return [];
   const out = [];
@@ -558,7 +561,7 @@ function outrightDeny(words) {
  * positional). Applied to both policy commands and pipe sinks.
  * @returns {string | null}
  */
-function segmentProblem(words, repoRoot) {
+function segmentProblem(words, repoRoot, quoted = []) {
   const prog = words[0];
 
   const outright = outrightDeny(words);
@@ -582,7 +585,10 @@ function segmentProblem(words, repoRoot) {
     // operand the guard sees is not the one that executes. A review only
     // needs literal text; refuse the expansion instead of checking a pattern
     // that no longer describes the output (audit P0-1).
-    const expands = words.slice(1).find((w) => w.startsWith("~") || /[?*\[\]]/.test(w));
+    // Only UNQUOTED operands expand: `echo *` lists the cwd, but `echo "*"` prints
+    // a star and `echo 'price: $5'` prints text. The tokenizer records which words
+    // were quote-protected, so the legitimate literal form is not refused.
+    const expands = words.slice(1).find((w, i) => !quoted[i + 1] && (w.startsWith("~") || /[?*\[\]]/.test(w)));
     if (expands) {
       return `blocked: \`echo ${expands}\` is expanded by the shell before echo runs (a glob or ~ enumerates files the review must not list). Echo literal text without wildcards or ~; use the Read/Grep/Glob tools for file contents.`;
     }
@@ -752,14 +758,14 @@ export function analyseCommand(cmd, opts = {}) {
           chained, substituted: false, dangerous: true,
         };
       }
-      const why = segmentProblem(words, opts.repoRoot);
+      const why = segmentProblem(words, opts.repoRoot, segs[i].quoted);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }
 
     // A pipe sink consumes stdin only; it is never a valid first command.
     if (i > 0 && ops[i - 1] === "|" && PIPE_SINKS.has(words[0])) {
-      const why = segmentProblem(words, opts.repoRoot);
+      const why = segmentProblem(words, opts.repoRoot, segs[i].quoted);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }

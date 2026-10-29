@@ -10,6 +10,7 @@
 import {
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools,
   postPROnlyTools, buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
+  buildNativeCommand, buildNativeAppendix, bundledSkillBody,
   deriveReviewLevel, finderFleetRule,
 } from "../src/prompt.js";
 import {
@@ -381,6 +382,32 @@ check("guard state is one of on/off/failed", ["on", "off", "failed"].includes(gu
   check("codeDrift reports when the newest source changed", typeof codeDrift(now).newestSourceAt, "string");
 }
 
+/* ---------------- pipelines: native command vs inline fleet ----------------
+ * The user-visible contract: a review calls claude's own /code-review command
+ * where it can, and carries the fleet pipeline in the prompt where it cannot —
+ * neither path writes into ~/.claude. */
+{
+  check("native command carries level + target", buildNativeCommand({ reviewLevel: "low", target: "HEAD~1" }), "/code-review low HEAD~1");
+  check("native command omits an empty target", buildNativeCommand({ reviewLevel: "high" }), "/code-review high");
+  check("native command falls back to max for an unknown level", buildNativeCommand({ reviewLevel: "turbo" }), "/code-review max");
+  const appendix = buildNativeAppendix({ outputLanguage: "中文", focus: "并发", postToPR: false, cwd: "C:/repo", fix: false });
+  check("native appendix carries the report contract", /## Review Summary/.test(appendix), true);
+  check("native appendix carries the language", /中文/.test(appendix), true);
+  check("native appendix forbids posting", /Do not post/.test(appendix), true);
+
+  // The fleet pipeline is self-contained: the skill body travels in the prompt.
+  const body = bundledSkillBody();
+  check("the bundled pipeline body exists", body.length > 2000, true);
+  check("the bundled body has no YAML frontmatter", /^---/.test(body), false);
+  const fleet = buildReviewPrompt({
+    scope: "last-commit", focus: "", outputLanguage: "中文", postToPR: false, fix: false,
+    effort: "max", reviewLevel: "max", useEffortFlag: true, cwd: "C:/repo", useSkill: false,
+  });
+  check("the fleet prompt embeds the bundled pipeline", /## Pipeline \(bundled with this MCP/.test(fleet), true);
+  check("the fleet prompt does not ask for the skill tool", /Use the `code-review` skill/.test(fleet), false);
+  check("the fleet prompt still states the fleet size rule", /dispatch about max\(5/.test(fleet), true);
+}
+
 /* ---------------- the installed skill is refreshed, not frozen ----------------
  * The skill file IS the pipeline. A managed copy frozen at an older release kept
  * telling the model to dispatch exactly five reviewers long after the bundled
@@ -551,6 +578,13 @@ check("hook refuses Bash without a repo root",
     type: "assistant",
     message: { role: "assistant", content: [{ type: "tool_use", id: "a1", name: "Agent", input: {} }, { type: "tool_use", id: "m1", name: "Monitor", input: {} }] },
   }).toolUses, [{ id: "a1", name: "Agent" }, { id: "m1", name: "Monitor" }]);
+  // A forked slash command (/code-review) answers with model "<synthetic>" and
+  // an empty result event — the text is the only report that exists.
+  check("streamEventFacts keeps a synthetic assistant answer",
+    streamEventFacts({ type: "assistant", message: { role: "assistant", model: "<synthetic>", content: [{ type: "text", text: "src/a.js:3 — bug" }] } }).assistantText,
+    "src/a.js:3 — bug");
+  check("buildModelProvenance ignores the synthetic placeholder",
+    buildModelProvenance({ requestedModel: "claude-opus-5", mainModels: ["<synthetic>"], subagentModels: [], billedModels: [] }).substituted, false);
 
   const subMsg = streamEventFacts({
     type: "assistant",

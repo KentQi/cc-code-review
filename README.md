@@ -14,7 +14,7 @@ ZCode → MCP → `claude -p`（headless）→ code-review skill（按 diff 规�
 ```
 ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --output-format stream-json
                             │                              │  cwd = 目标仓库
-                            │                              └─ ~/.claude/skills/code-review（本 MCP 自动安装）
+                            │                              └─ 内置 /code-review（默认）或内联舰队提示词（不写任何文件）
                             ◀── result(报告 + session_id + 花费) ──┘
 ```
 
@@ -97,7 +97,8 @@ npm run init
 | `maxTurns` | `80` | 4–200 | agentic 轮数上限 |
 | `timeoutMinutes` | `30` | 1–60 | 硬超时——不设费用上限时它是唯一的总闸；触发时已完成的子代理报告照样返回 |
 | `maxBudgetUsd` | `0`（不设上限） | 0–50 | API 花费上限（`--max-budget-usd`）。**默认 0 = 任何 effort 级别都不设费用上限**：上限会在父代理综合前截停运行，而每个完成的子代理报告都已增量落盘、429 打断的子代理会从 output_file 转录抢救，设上限只会白扔已付费的工作；兜底 guards 是 `timeoutMinutes` 与 `maxTurns`。仍可显式设值；env `CLAUDE_REVIEW_MAX_BUDGET_USD` 只改默认值，显式传参优先 |
-| `installSkillIfMissing` | `true` | - | 缺失时自动安装；由本 MCP 管理的副本若与 bundled 版本不一致，会在每次 review 前自动刷新（用户自建的 skill 永不覆盖） |
+| `pipeline` | `auto` | auto / native / fleet / skill | 评审引擎。**auto**：level 为 low..xhigh 时直接用 claude 内置的 `/code-review`（无需任何文件）；max 与 fix 模式改用本 MCP 的舰队流水线（理由见下）。**native** 强制内置命令；**fleet** 强制内联舰队（指令写在 prompt 里）；**skill** 为兼容旧行为（唯一会往 `~/.claude` 写文件的模式） |
+| `installSkillIfMissing` | `false` | - | 仅在 `pipeline=skill` 时有意义：缺失时安装到 `~/.claude/skills`（默认不装——review 不写任何文件） |
 
 返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（Review Summary / Findings / Notes）+ 每个评审子代理各自的报告（`## Reviewer subagent reports`，数量随 diff 规模而定）+ 元数据（`session_id`、花费、轮数、日志路径、模型溯源）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
 
@@ -113,11 +114,21 @@ npm run init
 
 CLI 解析结果与来源、版本、`--effort`/`--max-budget-usd` 支持情况、skill 状态、网关连通性（回环网关 TCP 预检）、宿主环境中残留的认证变量告警、`git`/`gh` 可用性、`CLAUDE_CODE_EFFORT_LEVEL` 覆盖告警。首行输出机器可读的 `verdict: OK|NOT_FOUND|MISCONFIGURED`。`installSkill: true` 可手动（重）装 skill。
 
-## code-review skill 说明
+## 评审流水线：默认用 claude 内置的 `/code-review`，不写任何文件
 
-- `~/.claude/skills/code-review` 不存在时，首次调用自动安装本仓库自带版本（Anthropic 官方 code-review 管线改编），带 `installed-by-cc-code-review` 标记（旧版 `installed-by-claude-review-mcp` 标记仍被识别为"本 MCP 装的"，下次安装时自动迁移成新标记，不会被误判成你自己的 skill）。
-- 该目录已有你自己的 skill 时**原样使用、绝不覆盖**。
-- 不想自动安装：`installSkillIfMissing: false` 或 `CLAUDE_REVIEW_AUTO_INSTALL_SKILL=0`，退化为内置精简评审提示词。
+Claude Code 2.1.x **自带** `code-review` 技能（`/code-review [level] [target]`）。本 MCP 默认直接调它，**不再往 `~/.claude` 装任何东西**。
+
+| level | 默认走哪条 | 原因（实测 2.1.311） |
+|---|---|---|
+| low / medium / high / xhigh | **内置 `/code-review`** | 单上下文、按"角度"逐个精读，10 秒级完成，零安装 |
+| max | **内联舰队流水线** | 内置 max 会派子代理，而子代理爱写 `cd X && ls && git config …` 这类复合/越界命令，被 manual 模式成片拒绝（实测 100 次 denial、5 分钟不收敛）；舰队提示词则明确约束在只读面内 |
+| fix 模式 | 内联舰队流水线 | 内置命令没有修复阶段 |
+| `last-commit` 且 HEAD 是 root commit | 内联舰队流水线 | 内置命令的 target 是**基线 ref**（`HEAD~1`），root commit 没有父提交 |
+
+- **内联舰队 = 不装文件**：`assets/skills/code-review/SKILL.md` 的正文直接拼进 prompt（`## Pipeline (bundled with this MCP)`），模型照它执行；代价是每次 review 多约 4KB 输入。
+- **`pipeline` 参数**可显式指定：`auto`（默认）/ `native` / `fleet` / `skill`。`skill` 是唯一会写 `~/.claude` 的兼容模式，默认关闭。
+- **同名 skill 会遮挡内置命令**（实测：装了 `~/.claude/skills/code-review` 后，`/code-review` 变成 `Skill` 调用）。因此存在同名 skill 时 `auto` 自动改走 fleet 并在结果里说明；显式 `pipeline=native` 会直接拒绝，而不是悄悄跑成别的东西。之前装过的那份可用 `claude_review_env { uninstallSkill: true }` 移除。
+- 结果元数据带 `pipeline`（描述）与 `pipelineMode`（解析结果），`subagent_stats` 显示舰队规模。
 
 ## 安全模型（多轮独立审计后）
 
@@ -236,10 +247,10 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（203 条，免费）+ 审计修复单测（256 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（203 条，免费）+ 审计修复单测（269 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
-node scripts/cross-cases.mjs                    # 20 个 MECE 用例（118 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
+node scripts/cross-cases.mjs                    # 21 个 MECE 用例（131 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
 node scripts/paid-smoke.mjs [--cap=2]           # 真实 CLI 端到端 smoke：带三个已知 bug 的临时仓库，effort/reviewLevel=low，默认不设费用上限（计费，实测约 $0.5）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）

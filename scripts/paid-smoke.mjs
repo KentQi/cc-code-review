@@ -27,8 +27,11 @@ for (const a of process.argv.slice(2)) {
 
 /* ---------- a throwaway repo with three planted bugs ---------- */
 const repo = fs.mkdtempSync(path.join(os.tmpdir(), "cc-paid-smoke-"));
+// The reviewed files are staged here and copied in AFTER the base commit, so the
+// commit under review is not a root commit (the native command targets HEAD~1).
+const staged = fs.mkdtempSync(path.join(os.tmpdir(), "cc-paid-smoke-src-"));
 const write = (rel, body) => {
-  const p = path.join(repo, rel);
+  const p = path.join(staged, rel);
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, body);
 };
@@ -79,6 +82,18 @@ write("src/retry.js", [
 
 const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "smoke", GIT_AUTHOR_EMAIL: "s@s", GIT_COMMITTER_NAME: "smoke", GIT_COMMITTER_EMAIL: "s@s" };
 execFileSync("git", ["init", "-q", repo]);
+// Base commit FIRST (docs only), then the reviewed files: "last-commit" needs a
+// parent, and the native command targets a BASE ref (HEAD~1), which does not
+// exist in a root-commit repository.
+fs.mkdirSync(path.join(repo, "docs"), { recursive: true });
+fs.writeFileSync(path.join(repo, "docs", "README.md"), "base" + String.fromCharCode(10));
+execFileSync("git", ["-C", repo, "add", "-A"]);
+execFileSync("git", ["-C", repo, "commit", "-q", "-m", "base"], { env: gitEnv });
+for (const rel of ["package.json", "src/db.js", "src/auth.js", "src/retry.js"]) {
+  const from = path.join(staged, rel);
+  fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+  fs.cpSync(from, path.join(repo, rel));
+}
 execFileSync("git", ["-C", repo, "add", "-A"]);
 execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add auth/config/paging helpers"], { env: gitEnv });
 console.log("fixture repo:", repo);
@@ -156,8 +171,14 @@ const jsonl = sc.subagentsFile;
 let lines = 0;
 try { lines = fs.readFileSync(jsonl, "utf8").trim().split(String.fromCharCode(10)).length; } catch { /* none */ }
 
-const hasReport = /Review Summary|Findings|结论|发现|summary/i.test(text);
-const ok = final && final.isError !== true && hasReport && subs.length >= 1;
+// The native pipeline answers in claude's own terse format (file:line findings),
+// the fleet pipeline in our headings — accept either.
+const FILE_LINE = /[A-Za-z0-9_./\\-]+\.(js|ts|jsx|tsx|py|go|java|rb|cs|rs|php|c|h|cpp):[0-9]+/;
+const hasReport = /Review Summary|Findings|结论|发现|summary/i.test(text) || FILE_LINE.test(text);
+// The native pipeline is single-context by design (0 subagents); the fleet
+// pipeline must show at least one captured reviewer report.
+const nativeRun = /native/i.test(String(sc.pipeline || ""));
+const ok = final && final.isError !== true && hasReport && (nativeRun || subs.length >= 1);
 console.log("\n===== result =====");
 console.log("status      :", sc.status, final?.isError === true ? "(isError)" : "");
 console.log("elapsed     :", sc.elapsedSec ?? "?", "s");

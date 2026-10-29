@@ -42,6 +42,14 @@ const gitRepo = (name) => {
   execFileSync("git", ["-C", p, "commit", "--allow-empty", "-q", "-m", "x"], { env });
   return p;
 };
+// A repo whose HEAD has a parent: the native /code-review command targets a BASE
+// ref (`HEAD~1`), so a root-commit repo cannot use it for scope=last-commit.
+const gitRepo2 = (name) => {
+  const p = gitRepo(name);
+  const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+  execFileSync("git", ["-C", p, "commit", "--allow-empty", "-q", "-m", "y"], { env });
+  return p;
+};
 
 /* ---------- server harness ---------- */
 function startServer(envExtra = {}) {
@@ -667,6 +675,66 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   const finalText = final?.content?.[0]?.text || "";
   check("C19", "the text still shows the reports", /## Reviewer subagent reports/.test(finalText), finalText.slice(0, 200));
   s.kill();
+}
+
+/* ================= C21 pipeline selection: native by default, nothing installed ================= */
+{
+  // The user-visible contract: a review never has to write into ~/.claude.
+  //   auto + low..xhigh -> claude's built-in /code-review command
+  //   auto + max        -> the fleet pipeline, carried in the prompt
+  //   explicit          -> either, plus legacy "skill"
+  const promptOf = (name) => path.join(tmp, `prompt-${name}-${process.pid}.txt`);
+
+  // Point the skill lookup at a throwaway dir so the result does not depend on
+  // whatever is installed in the developer's own ~/.claude.
+  const emptySkills = path.join(tmp, "c21-skills-empty");
+  fs.mkdirSync(emptySkills, { recursive: true });
+  const shadowSkills = path.join(tmp, "c21-skills-shadow");
+  fs.mkdirSync(shadowSkills, { recursive: true });
+  fs.writeFileSync(path.join(shadowSkills, "SKILL.md"), "---\nname: code-review\n---\nold\n");
+  fs.writeFileSync(path.join(shadowSkills, "installed-by-cc-code-review"), "t\n");
+
+  const runCase = async (extra, env = {}) => {
+    const file = promptOf("case" + Math.random().toString(36).slice(2, 7));
+    const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_ECHO_PROMPT: file, CLAUDE_REVIEW_SKILL_DIR: emptySkills, ...env });
+    await s.ready;
+    const r = await s.call("claude_code_review", { repoPath: gitRepo2("c21" + Math.random().toString(36).slice(2, 6)), scope: "last-commit", waitForResult: true, ...extra });
+    let prompt = "";
+    try { prompt = fs.readFileSync(file, "utf8"); } catch { /* missing */ }
+    const sc = r.result?.structuredContent || {};
+    s.kill();
+    return { prompt, pipeline: sc.pipeline || sc.skillMode || "", text: textOf(r) };
+  };
+
+  const native = await runCase({ effort: "low" });
+  check("C21", "auto + low runs the built-in /code-review", /^\/code-review low/.test(native.prompt), native.prompt.slice(0, 80));
+  check("C21", "the native run reports the pipeline", /native/.test(native.pipeline), native.pipeline);
+
+  const nativeTarget = await runCase({ effort: "medium", reviewLevel: "high" });
+  check("C21", "the native command carries the review level", /^\/code-review high/.test(nativeTarget.prompt), nativeTarget.prompt.slice(0, 80));
+
+  const maxAuto = await runCase({ effort: "max" });
+  check("C21", "auto + max uses the fleet pipeline, not the native command", !/^\/code-review\b/.test(maxAuto.prompt), maxAuto.prompt.slice(0, 80));
+  check("C21", "the fleet prompt carries the pipeline inline (no skill needed)", /## Pipeline \(bundled with this MCP/.test(maxAuto.prompt), maxAuto.prompt.slice(0, 120));
+  check("C21", "the fleet prompt still sizes itself from the diff", /dispatch about max\(5/.test(maxAuto.prompt), maxAuto.prompt.slice(0, 120));
+  check("C21", "the fleet prompt does not ask for the skill tool", !/Use the `code-review` skill/.test(maxAuto.prompt));
+
+  const forcedNative = await runCase({ effort: "max", pipeline: "native" });
+  check("C21", "pipeline=native overrides the auto rule", /^\/code-review max/.test(forcedNative.prompt), forcedNative.prompt.slice(0, 80));
+
+  const forcedFleet = await runCase({ effort: "low", pipeline: "fleet" });
+  check("C21", "pipeline=fleet overrides the auto rule", !/^\/code-review\b/.test(forcedFleet.prompt) && /## Pipeline \(bundled/.test(forcedFleet.prompt), forcedFleet.prompt.slice(0, 80));
+
+  const fixAuto = await runCase({ effort: "low", fix: true });
+  check("C21", "fix mode never uses the native command (it has no fix phase)", !/^\/code-review\b/.test(fixAuto.prompt) && /FIX MODE/.test(fixAuto.prompt), fixAuto.prompt.slice(0, 120));
+
+  // A same-named skill shadows the built-in command, so auto must not claim
+  // "native" while the skill would answer — and pipeline=native must refuse.
+  const shadowed = await runCase({ effort: "low" }, { CLAUDE_REVIEW_SKILL_DIR: shadowSkills });
+  check("C21", "a shadowing skill switches auto to the fleet pipeline", !/^\/code-review\b/.test(shadowed.prompt), shadowed.prompt.slice(0, 80));
+  check("C21", "the result explains the shadow", /shadow/i.test(shadowed.text), shadowed.text.slice(0, 200));
+  const forced = await runCase({ effort: "low", pipeline: "native" }, { CLAUDE_REVIEW_SKILL_DIR: shadowSkills });
+  check("C21", "pipeline=native refuses to run behind a shadowing skill", /cannot be honoured/i.test(forced.text), forced.text.slice(0, 200));
 }
 
 /* ================= C20 a Monitor task is not a reviewer subagent ================= */

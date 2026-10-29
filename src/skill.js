@@ -10,8 +10,17 @@ import { fileURLToPath } from "node:url";
 const MARKER = "installed-by-cc-code-review";
 const LEGACY_MARKERS = ["installed-by-claude-review-mcp"];
 
+/**
+ * Where a `code-review` skill would live. Honours CLAUDE_CONFIG_DIR (the CLI
+ * reads skills from <config>/skills, so installing into ~/.claude when the user
+ * has moved their config would put the file where nothing reads it) and a test
+ * override.
+ */
 export function userSkillDir() {
-  return path.join(os.homedir(), ".claude", "skills", "code-review");
+  if (process.env.CLAUDE_REVIEW_SKILL_DIR) return path.resolve(process.env.CLAUDE_REVIEW_SKILL_DIR);
+  const cfg = process.env.CLAUDE_CONFIG_DIR;
+  const base = cfg ? path.resolve(cfg) : path.join(os.homedir(), ".claude");
+  return path.join(base, "skills", "code-review");
 }
 
 export function bundledSkillFile() {

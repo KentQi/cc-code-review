@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.16.0 — 2026-10-29
+
+A review no longer installs anything into Claude Code. It calls claude's own `/code-review` command where that command works, and carries this MCP's pipeline in the prompt where it does not.
+
+- **Default: the built-in command.** `pipeline=auto` (new) picks claude's own `/code-review <level> [target]` for levels low..xhigh — verified headless (`-p "/code-review low HEAD~1"` expands and runs), zero files on disk, ~10s at low. The scope is mapped to the command's `[target]`: `pr` → the PR, `branch` → the base ref, `last-commit` → `HEAD~1`, `working-dir`/`auto` → none.
+- **Why the fleet pipeline survives at max/fix.** Measured on 2.1.311: the built-in's max level spawns subagents whose exploration (`cd X && ls … && git config …`) the locked-down `--permission-mode manual` denies wholesale — 100 denials, no convergence in five minutes — and it has no fix phase. Those two cases (plus `last-commit` on a root commit, where a BASE ref cannot express "the only commit") use the fleet prompt instead, with the reason recorded in the result.
+- **The fleet pipeline no longer needs a skill file either.** The body of the bundled `SKILL.md` is appended to the prompt (`## Pipeline (bundled with this MCP)`), so the same instructions arrive without writing to `~/.claude`. Cost: ~4KB more input per fleet run.
+- **`pipeline` argument** (`auto|native|fleet|skill`), `pipelineMode` in structuredContent, and the resolved label in the text metadata. `skill` is now the legacy opt-in — the only mode that installs — and `installSkillIfMissing` defaults to **false** (`CLAUDE_REVIEW_AUTO_INSTALL_SKILL` now means "=1 turns it on").
+- **A same-named skill shadows the built-in command** — measured: with `~/.claude/skills/code-review` present, `/code-review` becomes a `Skill` call. `auto` therefore detects it and switches to the fleet pipeline with a note; an explicit `pipeline=native` is refused instead of silently running the skill. `claude_review_env` reports which pipeline is available and gained `uninstallSkill: true`; the install path now honours `CLAUDE_CONFIG_DIR` (and `CLAUDE_REVIEW_SKILL_DIR` for tests).
+- **The native pipeline's answer is captured.** A forked slash command returns `num_turns: 0`, an empty `result` and its answer as an assistant message with `model: "<synthetic>"`; the parser now keeps that text as the report and stops treating `<synthetic>` as a substituted model (which had produced a bogus MODEL SUBSTITUTION warning).
+- **Slash commands must travel in argv.** `-p <command>` expands the command; the same text piped through stdin is passed to the model literally (observed: a run that finished in 0 turns with no report). The native pipeline therefore passes its one-line command as an argument, while the long fleet prompt keeps using stdin.
+- Suites: shell-guard 203, audit-fixes 269 (+13: native command/appendix rendering, inline pipeline body, synthetic text, synthetic model), validate 16, cross-cases 131/131 (new C21: auto→native at low, auto→fleet at max/fix/root-commit, explicit overrides, the shadow rule, and `pipeline=native` refusing a shadowed environment). Real-CLI smoke: native run $0.08 with the correct finding, fleet run $0.81 with 3 captured subagent reports.
+
 ## 1.15.2 — 2026-10-29
 
 Reported from a live run: "why does it still dispatch exactly five subagents?" — because the *installed* skill had not changed since October 16.

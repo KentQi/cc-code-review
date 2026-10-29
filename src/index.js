@@ -34,10 +34,25 @@ import {
   buildModelProvenance, resultFacts,
 } from "./claude.js";
 import {
-  buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt,
+  buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt, buildNativeCommand, buildNativeAppendix,
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools, postPROnlyTools,
   deriveReviewLevel,
 } from "./prompt.js";
+
+/**
+ * Our scopes, expressed as the native command's [target] argument.
+ * - pr        → the PR number/URL
+ * - branch    → the base branch (the built-in diffs <base>...HEAD)
+ * - last-commit → HEAD~1
+ * - working-dir / auto → no target (the built-in includes uncommitted changes
+ *   and infers the upstream range by itself)
+ */
+function nativeTarget({ scope, pr, baseRef }) {
+  if (scope === "pr" && pr) return String(pr);
+  if (scope === "branch") return baseRef || undefined;
+  if (scope === "last-commit") return "HEAD~1";
+  return undefined;
+}
 import { skillStatus, skillSync, installBundledSkill, userSkillDir } from "./skill.js";
 import { SERVER_VERSION, codeDrift } from "./version.js";
 
@@ -54,7 +69,7 @@ const ENV = {
   // the finished work. Set CLAUDE_REVIEW_MAX_BUDGET_USD to re-arm a cap.
   maxBudgetUsd: Math.min(50, nonNegative(process.env.CLAUDE_REVIEW_MAX_BUDGET_USD, 0)),
   model: process.env.CLAUDE_REVIEW_MODEL || undefined,
-  autoInstallSkill: process.env.CLAUDE_REVIEW_AUTO_INSTALL_SKILL !== "0",
+  autoInstallSkill: process.env.CLAUDE_REVIEW_AUTO_INSTALL_SKILL === "1",
 };
 
 function positive(v, d) {
@@ -661,8 +676,8 @@ server.tool(
   "Check the Claude Code CLI installation, the code-review skill, the auth/gateway setup, and helper tools (git/gh). " +
   "Set installSkill=true to (re)install the bundled code-review skill into ~/.claude/skills/code-review " +
   "(never overwrites a user-managed skill there).",
-  { installSkill: z.boolean().default(false) },
-  async ({ installSkill }) => {
+  { installSkill: z.boolean().default(false), uninstallSkill: z.boolean().default(false) },
+  async ({ installSkill, uninstallSkill }) => {
     const drift = codeDrift();
     const lines = [`cc-code-review server: v${SERVER_VERSION}${drift.stale ? " — ⚠ STALE PROCESS" : ""}`];
     if (drift.stale) {
@@ -708,7 +723,8 @@ server.tool(
       cliState = "OK";
     }
 
-    lines.push("code-review skill (~/.claude/skills/code-review): " + describeSkill(skillSync()));
+    lines.push(describePipelineAvailability());
+    lines.push("code-review skill: " + describeSkill(skillSync()));
 
     const t = gatewayTarget();
     if (t) {
@@ -775,6 +791,12 @@ server.tool(
       const r = installBundledSkill();
       lines.push(r.installed ? `installSkill: installed -> ${r.dir}` : `installSkill: skipped — ${r.reason}`);
     }
+    if (uninstallSkill) {
+      const r = uninstallBundledSkill();
+      lines.push(r.uninstalled
+        ? `uninstallSkill: removed ${r.dir} — claude's built-in /code-review command is no longer shadowed`
+        : `uninstallSkill: skipped — ${r.reason}`);
+    }
     lines.unshift(`verdict: ${cliState}`);
     return {
       content: [{ type: "text", text: lines.join("\n") }],
@@ -798,6 +820,16 @@ function describeSkill(sync) {
       "a stale copy keeps running the old pipeline (e.g. a fixed five reviewers after the fleet became diff-sized).";
   }
   return `user-managed skill present at ${userSkillDir()} — it will be used as-is (never refreshed by this MCP)`;
+}
+
+/** The line that explains the native/skill interaction in claude_review_env. */
+function describePipelineAvailability() {
+  const shadow = skillStatus() !== "missing";
+  if (!shadow) {
+    return "review pipeline: native — claude's built-in /code-review command is used for levels low..xhigh; the fleet pipeline (carried in the prompt, nothing installed) is used for max and fix mode";
+  }
+  return `review pipeline: fleet — a skill named \`code-review\` at ${userSkillDir()} shadows claude's built-in /code-review command, so the native pipeline is unavailable ` +
+    "(remove it with uninstallSkill=true if this MCP installed it)";
 }
 
 /* ------------------------------------------------------------------ */
@@ -832,15 +864,22 @@ server.tool(
     timeoutMinutes: z.number().int().min(1).max(60).default(ENV.timeoutMinutes).describe("Hard wall-clock timeout for the run — with no spend cap by default this is the guard; every finished subagent report is kept even when it fires"),
     maxBudgetUsd: z.number().min(0).max(50).optional()
       .describe(`API spend cap via --max-budget-usd. DEFAULT 0 = NO CAP at any effort level: a cap stops the parent before it synthesizes, and every finished subagent report is already captured incrementally (and recovered from output_file), so a 429/token exhaustion no longer wastes it. The wall-clock timeout (timeoutMinutes) is the guard. Set a number only if you want a hard spend stop; env CLAUDE_REVIEW_MAX_BUDGET_USD sets the DEFAULT for this argument (an explicit value here always wins). On third-party gateways this depends on usage data the gateway returns.`),
-    installSkillIfMissing: z.boolean().default(ENV.autoInstallSkill)
-      .describe("Auto-install the bundled code-review skill into ~/.claude/skills when missing (default true)"),
+    pipeline: z.enum(["auto", "native", "fleet", "skill"]).default("auto")
+      .describe(
+        "Which review engine runs. auto (default): claude's built-in /code-review command for levels low..xhigh — it needs no file on disk — " +
+        "and the MCP's own fleet pipeline for max/fix, because the built-in hands max to subagents whose exploration commands the locked-down permission mode denies. " +
+        "native: force the built-in command. fleet: force the fleet pipeline (its instructions travel in the prompt; nothing is installed). " +
+        "skill: legacy — use/install the bundled skill into ~/.claude/skills (the only mode that writes to disk).",
+      ),
+    installSkillIfMissing: z.boolean().default(false)
+      .describe("Only meaningful with pipeline=skill: install the bundled skill into ~/.claude/skills when missing (default false — reviews install nothing)"),
     waitForResult: z.boolean().default(false)
       .describe("Block until the review finishes and return the report synchronously (2-15 min). Default false: returns a jobId at once — poll claude_review_status(jobId). Only set true if your MCP client has no ~30s tool-call timeout."),
   },
   async (args, extra) => {
     const {
       scope, baseRef, focus, postToPR, fix, effort, ultracode, reviewLevel,
-      model, maxTurns, timeoutMinutes, installSkillIfMissing,
+      model, maxTurns, timeoutMinutes, installSkillIfMissing, pipeline: pipelineArg,
     } = args;
     const maxBudgetUsd = args.maxBudgetUsd ?? ENV.maxBudgetUsd;
 
@@ -929,34 +968,81 @@ server.tool(
       return preflightFail(`Local gateway not reachable: ${gw.host} (${gw.reason}). If you use CC Switch / claude-code-router / a local proxy, start it first, then retry.`);
     }
 
-    // Skill: use user-managed > bundled(auto-install) > embedded fallback prompt.
-    // A MANAGED copy is refreshed too: the skill file IS the pipeline, so a copy
-    // frozen at an older release keeps driving the old procedure (a stale
-    // "dispatch five reviewers" copy did exactly that long after the fleet
-    // started sizing itself from the diff). A user-managed copy is never touched.
-    let skillMode;
-    let skillRefreshNote = "";
-    const status = skillStatus();
-    if (status === "user") {
-      skillMode = "code-review skill (user-managed)";
-    } else if (status === "bundled") {
-      skillMode = "code-review skill (bundled)";
-      const before = skillSync();
-      if (!before.upToDate) {
-        const r = installBundledSkill();
-        if (r.installed && r.changed) {
-          skillRefreshNote =
-            `the installed code-review skill was out of date (${before.installedBytes ?? "?"} bytes vs ${before.bundledBytes ?? "?"} in this build) and has been refreshed for this run — ` +
-            `a stale copy keeps driving the old pipeline (e.g. a fixed five reviewers after the fleet became diff-sized)`;
-        }
+    // The review's own depth level (third knob): defaults to a mapping of the
+    // CLI effort; it sizes the reviewer fleet from the diff.
+    const effectiveReviewLevel = reviewLevel || deriveReviewLevel(effort);
+
+    // --- which pipeline runs -------------------------------------------------
+    // claude ships its own /code-review command, so a review never has to write
+    // anything into ~/.claude. Measured on 2.1.311: the built-in is
+    // single-context at low..xhigh (fast, no subagents) and switches to
+    // subagents at max, whose compound exploration commands the CLI's manual
+    // permission mode denies outright — so at max (and in fix mode, which the
+    // built-in has no notion of) the fleet pipeline travels inside the prompt
+    // instead. Both paths install nothing.
+    let pipeline = pipelineArg || "auto";
+    let pipelineNote = "";
+    // A skill named `code-review` in ~/.claude/skills SHADOWS claude's built-in
+    // command of the same name (verified: the run opens with a Skill tool call
+    // instead of the built-in pipeline). An earlier version of this MCP
+    // installed exactly that, so the native path must check — promising "native"
+    // while a local skill answers is the silent-substitution bug this project
+    // exists to prevent.
+    const shadow = skillStatus() !== "missing";
+    if (pipeline === "auto") {
+      if (fix) { pipeline = "fleet"; pipelineNote = "auto chose the fleet pipeline: fix mode has no native equivalent"; }
+      else if (effectiveReviewLevel === "max") { pipeline = "fleet"; pipelineNote = "auto chose the fleet pipeline: the native /code-review command hands max to subagents whose exploration commands the locked-down permission mode denies"; }
+      else if (scope === "last-commit" && pre.hasParent === false) {
+        pipeline = "fleet";
+        pipelineNote = "auto chose the fleet pipeline: HEAD is a root commit, and the native command targets a BASE ref (`HEAD~1` does not exist here)";
       }
-    } else if (installSkillIfMissing) {
-      const r = installBundledSkill();
-      skillMode = r.installed ? "code-review skill (bundled, auto-installed this run)" : `fallback inline pipeline (${r.reason})`;
-    } else {
-      skillMode = "fallback inline pipeline (skill missing, auto-install disabled)";
+      else if (shadow) {
+        pipeline = "fleet";
+        pipelineNote = "auto chose the fleet pipeline: a code-review skill exists at ~/.claude/skills and would shadow claude's built-in /code-review command (remove it — claude_review_env with uninstallSkill=true — to use the native pipeline)";
+      } else pipeline = "native";
     }
-    const useSkill = skillMode.startsWith("code-review skill");
+    if (pipeline === "native" && shadow) {
+      return err(
+        `pipeline=native cannot be honoured: a skill named \`code-review\` exists at ${userSkillDir()} and shadows claude's built-in /code-review command, so the run would execute that skill instead. ` +
+        `Remove it (claude_review_env with uninstallSkill=true, when this MCP installed it) or choose pipeline=fleet.`,
+      );
+    }
+    // pipeline=skill is the one mode that may install: it is explicitly chosen.
+    // (installSkillIfMissing only gates the missing case; a managed copy is
+    // refreshed because it is about to be used.)
+
+    // --- skill handling (only for pipeline=skill) ----------------------------
+    // Nothing is installed for native or fleet: the native command is built in,
+    // and the fleet pipeline travels in the prompt. A legacy skill copy is
+    // refreshed only when it is actually about to be used.
+    let skillMode = "";
+    let skillRefreshNote = "";
+    let useSkill = false;
+    if (pipeline === "skill") {
+      const status = skillStatus();
+      if (status === "user") {
+        skillMode = "code-review skill (user-managed)";
+        useSkill = true;
+      } else if (status === "bundled") {
+        skillMode = "code-review skill (bundled)";
+        useSkill = true;
+        const before = skillSync();
+        if (!before.upToDate) {
+          const r = installBundledSkill();
+          if (r.installed && r.changed) {
+            skillRefreshNote =
+              `the installed code-review skill was out of date (${before.installedBytes ?? "?"} bytes vs ${before.bundledBytes ?? "?"} in this build) and has been refreshed for this run`;
+          }
+        }
+      } else {
+        const r = installBundledSkill();
+        skillMode = r.installed ? "code-review skill (bundled, installed for this run)" : `fleet pipeline (skill install failed: ${r.reason})`;
+        useSkill = r.installed;
+      }
+    }
+    if (pipeline === "fleet" && useSkill === false) {
+      skillMode = skillMode || "fleet pipeline (inline, nothing installed)";
+    }
 
     // Only inject thinking keywords when the CLI lacks --effort (never both).
     const [effortFlagSupported, budgetFlagSupported, streamJsonSupported] = await Promise.all([
@@ -967,12 +1053,19 @@ server.tool(
     // --- shell guard + permission-mode version floors (H4, D1) ---------------
     // (already resolved above, before the repo checks)
 
-    // The review's own depth level (third knob): defaults to a mapping of the
-    // CLI effort; it sizes the reviewer fleet from the diff.
-    const effectiveReviewLevel = reviewLevel || deriveReviewLevel(effort);
-    const prompt = useSkill
-      ? buildReviewPrompt({ scope, pr, baseRef: baseRefCheck.ref, focus: focusCheck.focus, outputLanguage, postToPR, fix, effort, reviewLevel: effectiveReviewLevel, useEffortFlag: effortFlagSupported, cwd: repoPath })
-      : buildFallbackPrompt({ scope, pr, baseRef: baseRefCheck.ref, focus: focusCheck.focus, outputLanguage, fix, effort, useEffortFlag: effortFlagSupported, cwd: repoPath });
+    let prompt;
+    let appendSystemPrompt;
+    if (pipeline === "native") {
+      prompt = buildNativeCommand({ reviewLevel: effectiveReviewLevel, target: nativeTarget({ scope, pr, baseRef: baseRefCheck.ref }) });
+      appendSystemPrompt = buildNativeAppendix({ outputLanguage, focus: focusCheck.focus, postToPR, cwd: repoPath, fix });
+      skillMode = "native /code-review (built into claude; nothing installed)";
+    } else {
+      prompt = buildReviewPrompt({
+        scope, pr, baseRef: baseRefCheck.ref, focus: focusCheck.focus, outputLanguage, postToPR, fix,
+        effort, reviewLevel: effectiveReviewLevel, useEffortFlag: effortFlagSupported, cwd: repoPath,
+        useSkill,
+      });
+    }
 
     const allowedTools = [...reviewAllowedTools(), ...(fix ? fixAllowedTools() : []), ...(postToPR ? postPROnlyTools() : [])];
     // fix mode MUST keep Edit/Write available: deny beats allow, so the review
@@ -1043,6 +1136,8 @@ server.tool(
       cli,
       repoPath,
       prompt,
+      promptViaArgv: pipeline === "native",
+      appendSystemPrompt,
       allowedTools,
       disallowedTools,
       model: modelCheck.model || ENV.model,
@@ -1179,7 +1274,7 @@ server.tool(
     const budgetUnsupportedNote = typeof maxBudgetUsd === "number" && maxBudgetUsd > 0 && !budgetFlagSupported
       ? `⚠ maxBudgetUsd=${maxBudgetUsd} was requested but this claude CLI does not advertise --max-budget-usd, so NO spend cap is enforced for this run. Upgrade claude or rely on timeoutMinutes/maxTurns.`
       : "";
-    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote, provenanceNote, budgetUnsupportedNote, skillRefreshNote].filter(Boolean).join("\n\n");
+    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote, provenanceNote, budgetUnsupportedNote, skillRefreshNote, pipelineNote].filter(Boolean).join("\n\n");
 
     const meta = {
       status: status2,
@@ -1222,7 +1317,7 @@ server.tool(
         content: [{ type: "text", text: gitProgramNotes + failureBanner(j, run) + stderrTail(run.stderr) + logNote + (errNote ? `\n\n${errNote}` : "") }],
         structuredContent: {
           status: status2, sessionId: j.session_id, costUsd: meta.costUsd,
-          numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, effort, fix, logFile,
+          numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, pipelineMode: pipeline, effort, fix, logFile,
           hardening,
           error: String(j.result || ""),
           subagents: subagentsView(run.agentReports),
@@ -1251,7 +1346,7 @@ server.tool(
       content: [{ type: "text", text: (warnings ? warnings + "\n\n" : "") + runResultText(j.result, meta) + (reportsSection ? `\n\n${reportsSection}` : "") }],
       structuredContent: {
         status: "success", sessionId: j.session_id, costUsd: meta.costUsd,
-        numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, effort, fix, logFile,
+        numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, pipelineMode: pipeline, effort, fix, logFile,
         hardening,
         report: j.result,
         subagents: subagentsView(run.agentReports),

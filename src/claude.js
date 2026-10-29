@@ -577,6 +577,14 @@ export function streamEventFacts(obj) {
   }
   const content = obj?.message?.content;
   if (!Array.isArray(content)) return facts;
+  if (obj?.message?.role === "assistant") {
+    // A slash command (/code-review) runs as a forked command and delivers its
+    // answer as an assistant message with model "<synthetic>", while the result
+    // event carries an empty result and num_turns 0. Keep the last text so a
+    // run whose result is empty still has a report.
+    const text = content.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text).join(String.fromCharCode(10)).trim();
+    if (text) facts.assistantText = text;
+  }
   const bashCommands = [];
   const agentDispatches = [];
   const agentResults = [];
@@ -765,10 +773,15 @@ function sameModelFamily(effective, requested) {
  * to the same prompt in a direct Claude Code session, and the caller must be
  * told rather than left to diff two incomparable reports.
  */
+// "<synthetic>" is a placeholder for messages the CLI renders itself (a forked
+// slash command's answer). It is not a model and must never be reported as a
+// substituted one.
+const isSyntheticModel = (m) => typeof m === "string" && /^<[^>]*>$/.test(m);
+
 export function buildModelProvenance({ requestedModel, mainModels = [], subagentModels = [], unrecognized = [], billedModels = [] } = {}) {
-  const main = [...new Set(mainModels.filter(Boolean))];
-  const billed = [...new Set(billedModels.filter(Boolean))];
-  const subagents = [...new Set([...subagentModels, ...unrecognized.map((u) => u.model)].filter(Boolean))];
+  const main = [...new Set(mainModels.filter((m) => m && !isSyntheticModel(m)))];
+  const billed = [...new Set(billedModels.filter((m) => m && !isSyntheticModel(m)))];
+  const subagents = [...new Set([...subagentModels, ...unrecognized.map((u) => u.model)].filter((m) => m && !isSyntheticModel(m)))];
   const requested = requestedModel ? String(requestedModel) : null;
   const foreignMain = main.filter((m) => !sameModelFamily(m, requested));
   const foreignSub = subagents.filter((m) => !sameModelFamily(m, requested));
@@ -1197,6 +1210,16 @@ export function runClaude({
   cli,
   repoPath,
   prompt,
+  // Appended to claude's own system prompt. Used by the native pipeline: the
+  // built-in /code-review command owns the procedure, so our output contract and
+  // scope notes must travel beside it instead of being glued onto the command
+  // line (where the command would read them as its target argument).
+  appendSystemPrompt,
+  // Slash commands (e.g. the built-in /code-review) are expanded only from the
+  // prompt passed as an ARGUMENT; a prompt piped through stdin is treated as
+  // literal text. The native pipeline therefore passes its one-line command in
+  // argv, and the long fleet prompt keeps using stdin (no quoting limits).
+  promptViaArgv = false,
   allowedTools = [],
   disallowedTools = [],
   model,
@@ -1227,13 +1250,16 @@ export function runClaude({
     }
 
     const { cmd, baseArgs } = execTarget(cli);
-    const args = [...baseArgs, "-p", "--max-turns", String(maxTurns)];
+    const args = [...baseArgs, "-p"];
+    if (promptViaArgv) args.push(prompt);
+    args.push("--max-turns", String(maxTurns));
     // stream-json is the only output that shows which tools actually ran. It
     // costs nothing extra and lets us report shell-chained commands that the
     // permission rules could not block, instead of hoping none happened.
     if (flags.streamJson) args.push("--output-format", "stream-json", "--verbose");
     else args.push("--output-format", "json");
     if (effort && flags.effort) args.push("--effort", effort);
+    if (appendSystemPrompt) args.push("--append-system-prompt", appendSystemPrompt);
     if (allowedTools.length) args.push("--allowedTools", allowedTools.join(" "));
     if (disallowedTools.length) args.push("--disallowedTools", disallowedTools.join(" "));
     if (model) args.push("--model", model);
@@ -1361,12 +1387,16 @@ export function runClaude({
       try { onSubagentReport?.(record, subagentsFile); } catch { /* a throwing listener must not kill the run */ }
     };
     let soPartial = Buffer.alloc(0);
+    let lastAssistantText = "";
     const ingest = (line) => {
       if (!line.startsWith("{")) return;
       let obj;
       try { obj = JSON.parse(line); } catch { return; }
       const facts = streamEventFacts(obj);
       if (facts.result) { resultEvent = facts.result; return; }
+      // A forked slash command answers with model "<synthetic>" and leaves the
+      // result event empty: keep the text so the report is not lost.
+      if (facts.assistantText) lastAssistantText = facts.assistantText;
       if (facts.bashCommands) bashCommands.push(...facts.bashCommands);
       if (facts.toolUses) for (const t of facts.toolUses) toolNames.set(t.id, t.name);
       if (facts.agentDispatches) agentDispatches.push(...facts.agentDispatches);
@@ -1524,6 +1554,10 @@ export function runClaude({
         }
       }
       const json = resultEvent || parseResultJson(stdout);
+      // A forked slash command (/code-review) reports num_turns 0 and an empty
+      // result — its answer arrives as a synthetic assistant message. Without
+      // this the native pipeline would return a successful run with no report.
+      if (json && !json.result && lastAssistantText) json.result = lastAssistantText;
       resolve({
         ok: !wasCancelled && !timedOut && code === 0 && !!json,
         json,
@@ -1567,8 +1601,10 @@ export function runClaude({
     child.on("close", (code, signalName) => finish(code, signalName));
 
     child.stdin.on("error", () => { /* EPIPE if claude dies early; close handler reports it */ });
-    child.stdin.write(prompt, "utf8");
-    child.stdin.end();
+    // With promptViaArgv the prompt already travelled in argv; closing stdin
+    // immediately keeps the CLI from waiting on a prompt it will not read.
+    if (promptViaArgv) child.stdin.end();
+    else { child.stdin.write(prompt, "utf8"); child.stdin.end(); }
   });
 }
 
@@ -1907,7 +1943,13 @@ export async function gitPreflight(repoPath) {
     .then((r) => ({ ok: true, out: r.stdout }))
     .catch((e) => ({ ok: false, err: e }));
   const head = await run(["rev-parse", "--verify", "HEAD"]);
-  if (head.ok) return { hasCommits: true, dirty: null };
+  if (head.ok) {
+    // A root commit has no parent: a "review the last commit" target cannot be
+    // expressed as a base ref for claude's built-in command, so the caller
+    // needs to know.
+    const parent = await run(["rev-parse", "--verify", "--quiet", "HEAD~1"]);
+    return { hasCommits: true, hasParent: parent.ok, dirty: null };
+  }
   const status = await run(["status", "--porcelain"]);
   const dirty = status.ok && status.out.trim().length > 0;
   // status failing (not "empty") must surface its own error, not rev-parse's

@@ -98,7 +98,8 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `maxTurns` | `80` | 4–200 | agentic turn cap |
 | `timeoutMinutes` | `30` | 1–60 | hard timeout — with no spend cap this is the master guard; when it fires, the finished subagent reports are still returned |
 | `maxBudgetUsd` | `0` (no cap) | 0–50 | API spend cap (`--max-budget-usd`). **The default 0 sets NO cap at any effort level**: a cap stops the parent before it synthesizes, while every finished subagent report is already captured incrementally and a 429-killed agent is recovered from its output_file transcript — a cap only throws away paid work. `timeoutMinutes` and `maxTurns` are the guards. Set a number to opt into a hard stop; env `CLAUDE_REVIEW_MAX_BUDGET_USD` changes the default only — an explicit argument wins |
-| `installSkillIfMissing` | `true` | - | auto-install when missing; a copy managed by this MCP is refreshed before every review when it differs from the bundled one (a user-managed skill is never touched) |
+| `pipeline` | `auto` | auto / native / fleet / skill | review engine. **auto**: claude's built-in `/code-review` for low..xhigh (needs no file on disk); max and fix mode use this MCP's fleet pipeline (reasons below). **native** forces the built-in; **fleet** forces the inline fleet; **skill** is the legacy mode — the only one that writes to `~/.claude` |
+| `installSkillIfMissing` | `false` | - | only meaningful with `pipeline=skill`: install the bundled skill when missing (default false — a review installs nothing) |
 
 Returns (async by default: a jobId (<1s) plus the preflight verdict, with the report fetched via claude_review_status(jobId); with waitForResult: true the synchronous form below applies): a markdown report (Review Summary / Findings / Notes) + each reviewer subagent's own report (`## Reviewer subagent reports`, sized from the diff) + metadata (`session_id`, spend, turns, log path, model provenance). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
 
@@ -114,11 +115,21 @@ Continue the conversation using the `session_id` returned by the previous run (`
 
 CLI resolution result and its source, version, `--effort`/`--max-budget-usd` support, skill status, gateway reachability (loopback TCP preflight), leftover auth-variable warnings, `git`/`gh` availability, `CLAUDE_CODE_EFFORT_LEVEL` override warnings. The first line is a machine-readable `verdict: OK|NOT_FOUND|MISCONFIGURED`. `installSkill: true` manually (re)installs the skill.
 
-## About the bundled code-review skill
+## Review pipeline: claude's built-in `/code-review` by default, nothing written to disk
 
-- When `~/.claude/skills/code-review` does not exist, the first call auto-installs the bundled version (adapted from Anthropic's official code-review pipeline), marked `installed-by-cc-code-review`. The legacy `installed-by-claude-review-mcp` marker is still recognized as "installed by this MCP" and is migrated to the new marker on the next install, so an existing install will not be misjudged as your own skill.
-- If you already keep your own skill in that directory, it is **used as-is and never overwritten**.
-- To opt out of auto-install: `installSkillIfMissing: false` or `CLAUDE_REVIEW_AUTO_INSTALL_SKILL=0` — it degrades to a built-in minimal review prompt.
+Claude Code 2.1.x **ships** a `code-review` skill (`/code-review [level] [target]`). This MCP calls it directly and no longer installs anything into `~/.claude`.
+
+| level | Default engine | Why (measured on 2.1.311) |
+|---|---|---|
+| low / medium / high / xhigh | **built-in `/code-review`** | single-context, angle-by-angle reading, finishes in ~10s, zero installs |
+| max | **inline fleet pipeline** | the built-in max spawns subagents whose `cd X && ls && git config …` exploration is denied wholesale by manual mode (measured: 100 denials, no convergence in 5 minutes); the fleet prompt keeps them inside the read-only surface |
+| fix mode | inline fleet pipeline | the built-in has no fix phase |
+| `last-commit` on a root commit | inline fleet pipeline | the built-in's target is a BASE ref (`HEAD~1`); a root commit has no parent |
+
+- **Inline fleet = no files**: the body of `assets/skills/code-review/SKILL.md` is appended to the prompt (`## Pipeline (bundled with this MCP)`); the cost is ~4KB of extra input per review.
+- **`pipeline` argument**: `auto` (default) / `native` / `fleet` / `skill`. `skill` is the only mode that writes to `~/.claude`, and it is off by default.
+- **A same-named skill shadows the built-in command** (measured: with `~/.claude/skills/code-review` present, `/code-review` becomes a `Skill` call). So `auto` switches to the fleet pipeline and says so; an explicit `pipeline=native` is refused rather than silently running something else. Remove an old copy with `claude_review_env { uninstallSkill: true }`.
+- Results carry `pipeline` (description) and `pipelineMode` (resolved value); `subagent_stats` shows the fleet size.
 
 ## Security model (after multiple independent audits)
 
@@ -237,10 +248,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (203, free) + audit-fix unit tests (256, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (203, free) + audit-fix unit tests (269, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 20 MECE cases (118 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 21 MECE cases (131 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
 node scripts/paid-smoke.mjs [--cap=2]           # REAL CLI end-to-end smoke: throwaway repo with three planted bugs, effort/reviewLevel=low, no spend cap by default (billed, ~$0.5 observed)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)

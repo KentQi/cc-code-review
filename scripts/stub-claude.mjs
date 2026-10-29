@@ -52,9 +52,21 @@ if (process.env.STUB_ECHO_SETTINGS) {
 // CI jobs sharing one tmpdir cannot read (or delete) each other's pid.
 const pidFile = process.env.STUB_PID_FILE?.trim() || path.join(os.tmpdir(), "stub-claude-test.pid");
 try { fs.writeFileSync(pidFile, String(process.pid)); } catch { /* best effort */ }
+let promptIn = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (d) => { promptIn += d; });
 process.stdin.resume();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 await sleep(4000);
+// STUB_ECHO_PROMPT=<file>: the prompt the MCP piped in, so a test can assert
+// which pipeline it chose (native command vs inline fleet).
+if (process.env.STUB_ECHO_PROMPT) {
+  // The prompt normally arrives on stdin; a slash command (the native pipeline)
+  // is passed as the -p argument instead.
+  const pi = args.indexOf("-p");
+  const argvPrompt = pi >= 0 && args[pi + 1] && !args[pi + 1].startsWith("-") ? args[pi + 1] : "";
+  try { fs.writeFileSync(process.env.STUB_ECHO_PROMPT, argvPrompt || promptIn); } catch { /* best effort */ }
+}
 // The result event carries claude's own accounting: modelUsage (per-model
 // totals across main loop + subagents), subagent_stats (spawned/completed/
 // failed/killed/started_in_background/by_type), usage. STUB_RESULT_SUBTYPE

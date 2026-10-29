@@ -26,7 +26,7 @@ A second atomic audit (ten P0, ten P1) was run against 1.18.1 with every finding
 - **[P1] `pipeline=native` + shadowed skill** returned through `err()` instead of `preflightFail()`, leaking the guard settings file and its in-flight mark on every such call.
 - **Stale-process detection now has teeth.** The hook exposes a hash of the policy tables (`CC_REVIEW_GUARD_INFO=1`) and the pre-run self-test compares it with the server's in-memory policy; an upgrade without a host restart is refused instead of running two different policies — the "the guard self-test refuses to run" promise README/SECURITY made is finally true.
 - **Audit corrections recorded** (so the next pass does not re-chase them): `tr` has no FILE operand in BSD/GNU coreutils (the guard change is defense in depth, not an arbitrary-read fix); the 4100-file `MAX_ATTR_FILES` repro was invalid; `echo /etc/passwd` prints a literal, not file contents — the real leak was wildcard/`$VAR` expansion.
-- Suites: shell-guard 238, audit-fixes 272, p0-regression 80, validation 16, cross-cases 139/139 (C1–C22), smoke PASS — `npm test` green.
+- Suites: shell-guard 238, audit-fixes 272, p0-regression 95, validation 16, cross-cases 139/139 (C1–C22), smoke PASS — `npm test` green.
 
 ## 1.18.1 — 2026-10-29
 

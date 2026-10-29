@@ -627,8 +627,13 @@ const server = new McpServer(
   {
     instructions:
       "Run Claude Code's code-review skill on a repository and get structured findings back. " +
-      "Typical flow: claude_code_review(repoPath, scope) -> fix code in ZCode -> claude_code_review again, " +
-      "or claude_review_followup(sessionId) to ask the reviewer something.",
+      // The default is async (a real review takes 2-15 min, longer than most clients
+      // hold a tool call), so the flow the model follows MUST include the poll step —
+      // the previous text described a synchronous call and models never polled.
+      "Typical flow: claude_code_review(repoPath, scope) returns a jobId immediately -> " +
+      "poll claude_review_status(jobId) until it returns the report -> fix the code -> run claude_code_review again to verify, " +
+      "or claude_review_followup(sessionId, message) to ask the reviewer something. " +
+      "Pass waitForResult=true only when the client can hold the call for the whole review.",
   }
 );
 

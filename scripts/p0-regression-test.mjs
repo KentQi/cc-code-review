@@ -16,9 +16,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { analyseCommand, bashAllowRules } from "../src/shell-guard.js";
+import { analyseCommand, bashAllowRules, policyFingerprint } from "../src/shell-guard.js";
 import { postPROnlyTools } from "../src/prompt.js";
-import { repoRunsGitPrograms } from "../src/claude.js";
+import { repoRunsGitPrograms, writeGuardSettings } from "../src/claude.js";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const HOOK = path.join(ROOT, "scripts", "pre-tool-hook.js");
@@ -318,6 +318,50 @@ try {
   }
 } finally {
   try { fs.rmSync(PWN, { force: true }); } catch { /* ignore */ }
+}
+
+/* ------------------------------------------------------------------ */
+/* Stale-process detection: the hook must expose the same policy hash  */
+/* the server computes. Without this the self-test compares nothing and */
+/* an upgrade that did not restart the host runs two different policies.*/
+/* ------------------------------------------------------------------ */
+console.log("-- stale-process detection: hook exposes this process's policy fingerprint");
+{
+  const info = spawnSync(process.execPath, [HOOK], {
+    env: { ...process.env, CC_REVIEW_GUARD_INFO: "1" },
+    encoding: "utf8",
+    timeout: 20000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let reported = null;
+  try { reported = JSON.parse(String(info.stdout || "").trim()).fingerprint; } catch { /* unreadable */ }
+  const local = policyFingerprint();
+  check("hook reports the server's policy fingerprint", reported, local);
+  check("fingerprint looks like a hash", /^[0-9a-f]{16}$/.test(String(local)), true);
+}
+
+/* ------------------------------------------------------------------ */
+/* P1-6: the guard-settings directory is created in a shared temp dir  */
+/* on Linux; a pre-created symlink there would receive the settings    */
+/* file claude reads at spawn time (a hook-injection point).           */
+/* ------------------------------------------------------------------ */
+console.log("-- P1-6 a symlinked guard directory is refused");
+if (process.platform !== "win32") {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "p0-guarddir-"));
+  const attacker = fs.mkdtempSync(path.join(os.tmpdir(), "p0-attacker-"));
+  fs.symlinkSync(attacker, path.join(tmpBase, "cc-code-review"));
+  const prevTmp = process.env.TMPDIR;
+  process.env.TMPDIR = tmpBase;
+  try {
+    const written = writeGuardSettings();
+    check("writeGuardSettings refuses a symlinked dir", written, null);
+    const leaked = fs.readdirSync(attacker).filter((f) => f.startsWith("guard-settings-"));
+    check("nothing was written through the symlink", leaked.length, 0);
+  } finally {
+    if (prevTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = prevTmp;
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+    fs.rmSync(attacker, { recursive: true, force: true });
+  }
 }
 
 /* ------------------------------------------------------------------ */

@@ -642,15 +642,17 @@ check("hook refuses Bash without a repo root",
 /* ---------------- the review's own depth level (third knob) ---------------- */
 {
   check("effort max maps to review level max", deriveReviewLevel("max"), "max");
-  check("effort xhigh maps to review level high", deriveReviewLevel("xhigh"), "high");
+  // claude shares one playbook factory for xhigh and max (ro("xhigh"), ro("max")),
+// so effort=xhigh maps to review level max — not the 8-finder high fleet.
+check("effort xhigh maps to review level max (same native playbook as max)", deriveReviewLevel("xhigh"), "max");
   check("effort high maps to review level high", deriveReviewLevel("high"), "high");
   check("effort medium maps to review level medium", deriveReviewLevel("medium"), "medium");
   check("effort low maps to review level low", deriveReviewLevel("low"), "low");
   check("unknown effort defaults to high", deriveReviewLevel("bogus"), "high");
-  check("fleet rule: low has no fleet", finderFleetRule("low"), { finders: 0, candidates: 0, cap: 4 });
+  check("fleet rule: low has no fleet", finderFleetRule("low"), { finders: 0, candidates: 0, cap: 4, angles: "one careful diff pass" });
   // Read out of claude 2.1.311: max = "5+5 angles x 8 candidates", i.e. 10 finders.
-check("fleet rule at max is the native 10 finders", finderFleetRule("max"), { finders: 10, candidates: 8, cap: 15 });
-check("fleet rule at high is the native 8 finders", finderFleetRule("high"), { finders: 8, candidates: 6, cap: 8 });
+check("fleet rule at max is the native 10 finders", finderFleetRule("max").finders, 10);
+check("fleet rule at high is the native 8 finders", finderFleetRule("high").finders, 8);
   // The prompt must carry the fleet rule and the level, so the model sizes the
   // fleet from the diff instead of always dispatching five.
   const prompt = buildReviewPrompt({

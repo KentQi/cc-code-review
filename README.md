@@ -6,10 +6,10 @@
 
 [English](README.en.md) | 简体中文
 
-**EN**: An MCP server that wraps Claude Code's code-review skill (a diff-sized fleet of parallel reviewer subagents — 2–8+ by diff size — 0–100 confidence scoring, keeps findings ≥ 80). Run reviews — PR / branch / working dir / last commit, effort `low→max`, optional fix mode — from ZCode or any MCP client and get the full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI.
+**EN**: An MCP server that calls Claude Code's own `/code-review` (low..xhigh, including `--fix`) or runs a fleet pipeline with the same three-phase structure claude's playbook uses (8/10 parallel finder subagents, one verifier per surviving candidate, one sweep finder; findings ≥ 80 of 0–100). Reviews — PR / branch / working dir / last commit, effort `low→max` — from ZCode or any MCP client, full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI. Nothing is installed into Claude Code.
 
 把 **Claude Code 的 code review 能力**封装成 MCP server，让 ZCode（或任何 MCP 客户端）直接调用：
-ZCode → MCP → `claude -p`（headless）→ code-review skill（按 diff 规模派出的并行评审 subagent 舰队 + 0-100 置信度打分 + ≥80 过滤）→ 审查报告原样返回给 ZCode → ZCode 根据报告改代码 → 再次调用复核。
+ZCode → MCP → `claude -p`（headless）→ claude 内置 /code-review（low..xhigh，含 --fix）或内联舰队流水线（max：10 finder + 每候选 verifier + sweep）→ 审查报告原样返回给 ZCode → ZCode 根据报告改代码 → 再次调用复核。
 
 ```
 ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --output-format stream-json
@@ -97,8 +97,8 @@ npm run init
 | `maxTurns` | `80` | 4–200 | agentic 轮数上限 |
 | `timeoutMinutes` | `30` | 1–60 | 硬超时——不设费用上限时它是唯一的总闸；触发时已完成的子代理报告照样返回 |
 | `maxBudgetUsd` | `0`（不设上限） | 0–50 | API 花费上限（`--max-budget-usd`）。**默认 0 = 任何 effort 级别都不设费用上限**：上限会在父代理综合前截停运行，而每个完成的子代理报告都已增量落盘、429 打断的子代理会从 output_file 转录抢救，设上限只会白扔已付费的工作；兜底 guards 是 `timeoutMinutes` 与 `maxTurns`。仍可显式设值；env `CLAUDE_REVIEW_MAX_BUDGET_USD` 只改默认值，显式传参优先 |
-| `pipeline` | `auto` | auto / native / fleet / skill | 评审引擎。**auto**：level 为 low..xhigh 时直接用 claude 内置的 `/code-review`（无需任何文件）；max 与 fix 模式改用本 MCP 的舰队流水线（理由见下）。**native** 强制内置命令；**fleet** 强制内联舰队（指令写在 prompt 里）；**skill** 为兼容旧行为（唯一会往 `~/.claude` 写文件的模式） |
-| `installSkillIfMissing` | `false` | - | 仅在 `pipeline=skill` 时有意义：缺失时安装到 `~/.claude/skills`（默认不装——review 不写任何文件） |
+| `pipeline` | `auto` | auto / native / fleet / skill | 评审引擎。**auto**：level 为 low..xhigh（含 fix——走命令自带 `--fix`）时直接用 claude 内置的 `/code-review`（无需任何文件）；仅 max 改用本 MCP 的舰队流水线（理由见下）。**native** 强制内置命令；**fleet** 强制内联舰队（指令写在 prompt 里）；**skill** 为兼容旧行为（唯一会往 `~/.claude` 写文件的模式） |
+| `installSkillIfMissing` | `false` | - | 仅在 `pipeline=skill` 时有意义：skill **缺失**时安装（默认不装——缺失时退化走内联舰队流水线；已存在且由本 MCP 管理的副本在实际使用前自动刷新；用户自建的副本永不触碰） |
 
 返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（Review Summary / Findings / Notes）+ 每个评审子代理各自的报告（`## Reviewer subagent reports`，数量随 diff 规模而定）+ 元数据（`session_id`、花费、轮数、日志路径、模型溯源）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
 
@@ -120,12 +120,11 @@ Claude Code 2.1.x **自带** `code-review` 技能（`/code-review [level] [targe
 
 | level | 默认走哪条 | 原因（实测 2.1.311） |
 |---|---|---|
-| low / medium / high / xhigh | **内置 `/code-review`** | 单上下文、按"角度"逐个精读，10 秒级完成，零安装 |
+| low / medium / high / xhigh | **内置 `/code-review`** | 单上下文、按"角度"逐个精读，10 秒级完成，零安装；fix 模式走命令自带的 `--fix`（二进制实测） |
 | max | **内联舰队流水线** | 内置 max 会派子代理，而子代理爱写 `cd X && ls && git config …` 这类复合/越界命令，被 manual 模式成片拒绝（实测 100 次 denial、5 分钟不收敛）；舰队提示词则明确约束在只读面内 |
-| fix 模式 | 内联舰队流水线 | 内置命令没有修复阶段 |
-| `last-commit` 且 HEAD 是 root commit | 内联舰队流水线 | 内置命令的 target 是**基线 ref**（`HEAD~1`），root commit 没有父提交 |
+| `last-commit` 且 HEAD 无父提交 | 内联舰队流水线 | 内置命令的 target 是**基线 ref**（`HEAD~1`），root commit 或空仓库没有父提交 |
 
-- **内联舰队 = 不装文件**：`assets/skills/code-review/SKILL.md` 的正文直接拼进 prompt（`## Pipeline (bundled with this MCP)`），模型照它执行；代价是每次 review 多约 4KB 输入。
+- **内联舰队 = 不装文件**：`assets/skills/code-review/SKILL.md` 的正文直接拼进 prompt（`## Pipeline (bundled with this MCP)`），模型照它执行；代价是每次 fleet review 多约 8KB 输入。
 - **`pipeline` 参数**可显式指定：`auto`（默认）/ `native` / `fleet` / `skill`。`skill` 是唯一会写 `~/.claude` 的兼容模式，默认关闭。
 - **同名 skill 会遮挡内置命令**（实测：装了 `~/.claude/skills/code-review` 后，`/code-review` 变成 `Skill` 调用）。因此存在同名 skill 时 `auto` 自动改走 fleet 并在结果里说明；显式 `pipeline=native` 会直接拒绝，而不是悄悄跑成别的东西。之前装过的那份可用 `claude_review_env { uninstallSkill: true }` 移除。
 - 结果元数据带 `pipeline`（描述）与 `pipelineMode`（解析结果），`subagent_stats` 显示舰队规模。
@@ -156,9 +155,9 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 **hook 只能做减法（二进制实证）**：claude 2.1.311 的输出清洗器只透传 `permissionDecision: "deny" | "ask"`，`"allow"` 被显式丢弃（`permissionDecision==="deny"||==="ask"?…:void 0`），`updatedInput` 在这条路径上也没有落地。所以 hook 永远无法绕过权限引擎——这正是 allowlist 里必须有 `Bash(cd:*)` 的原因：让"形状"过引擎的闸，再由 hook 判定 `cd` 到底落在哪。任何 hook 放行、引擎拒绝的组合只会浪费一个 turn，不会削弱安全。
 
-**读取同样被限制在仓库内（v1.15.0）**：`find`/`rg` 的路径参数、管道 sink（cat/head/tail/grep/sed -n/…）的文件参数都做仓库范围校验——`~`、`$VAR`、`..`、绝对路径、以及仓库内软链接/junction 指到外面，全部拒绝（用 realpath 判定，与 Edit/Write 的边界同一套规则）。另外一次性拒绝 `git diff --no-index`、`git blame --contents`、`sed -f`、`wc/sort --files0-from` 和 `uniq` 的第二个位置参数（写文件）。hook 拿不到仓库根时对 Bash 直接 fail-closed。
+**读取同样被限制在仓库内（v1.15.0）**：`find`/`rg` 与管道 sink（cat/head/tail/wc/uniq/cut/tr/grep）的路径参数都做仓库范围校验——`~`、`$VAR`、`..`、花括号扩展、绝对路径、以及仓库内软链接/junction 指到外面，全部拒绝（用 realpath 判定，与 Edit/Write 的边界同一套规则）。Git 的 pathspec 不做路径校验（git 自己限制在树内），但逃逸口全部一次性拒绝：`git diff --no-index`、`git blame --contents`、`--output=` 写形态、`sed -f`、`wc/sort --files0-from`、`uniq` 的第二个位置参数（写文件）；`sed` 不在许可的 sink 之列（其脚本语言的"执行/写/读"形态无法被可靠解析，实测 `s/.*/命令/e` 执行过）。hook 拿不到仓库根时对 Bash 直接 fail-closed。
 
-它同时补上了**前缀规则本身堵不住的写/执行形态**：`find` 与 `rg` 是通过前缀规则放行的只读工具，但 `find -delete / -exec / -execdir / -ok / -okdir / -fprint / -fprintf / -fls` 会写文件或执行程序，`rg --pre / --pre-glob` 会对每个文件跑任意程序；同理 `sed -i`、`sed` 脚本里的 `w`/`W`/`e`、`sort -o` 都会写文件。这些形态在 hook 里按段直接拒绝（allowlist 里也加了对应 deny 规则，但确定性控制是 hook），普通读取不受影响。
+它同时补上了**前缀规则本身堵不住的写/执行形态**：`find` 与 `rg` 是通过前缀规则放行的只读工具，但 `find -delete / -exec / -execdir / -ok / -okdir / -fprint / -fprintf / -fls` 会写文件或执行程序，`rg --pre / --pre-glob` 会对每个文件跑任意程序，`sort -o / --compress-program / -T` 会写文件或执行程序，`git branch <name>` 会建分支（flag 守卫拦截写形态）。这些在 hook 里按段直接拒绝（allowlist 里也加了对应 deny 规则，但确定性控制是 hook），普通读取不受影响。
 
 > ⚠️ **`--settings` 替换的是整个 `hooks` 键**：注入的临时文件里只有本 MCP 的 hook，用户 `~/.claude/settings.json` 里自己配置的 hooks 在**本次子进程内不会生效**（其它键如 `env`、`model`、`permissions` 不受影响）。这是 CLI 的行为，不是遗漏——如果你依赖自己的 hook 在 review 期间运行，目前需要另想办法。
 
@@ -223,7 +222,9 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 | `CLAUDE_REVIEW_TIMEOUT_MIN` | `30` | 默认超时（分钟）；仅改默认值，显式 `timeoutMinutes` 优先 |
 | `CLAUDE_REVIEW_MAX_BUDGET_USD` | `0` | 默认花费上限，`0` = 不设上限；仅改默认值，显式 `maxBudgetUsd` 优先 |
 | `CLAUDE_REVIEW_MODEL` | - | 默认模型 |
-| `CLAUDE_REVIEW_AUTO_INSTALL_SKILL` | `1` | 是否自动安装 skill |
+| `CLAUDE_REVIEW_AUTO_INSTALL_SKILL` | 关闭 | 设 `1` 时 `installSkillIfMissing` 默认变 true（仅 pipeline=skill 有意义；即便如此也只在 skill 缺失时安装） |
+| `CLAUDE_CONFIG_DIR` | ~/.claude | skill 的安装/查找根（进程环境与 `~/.claude/settings.json` 的 env 块都会读，与 claude 子进程一致） |
+| `CLAUDE_REVIEW_SKILL_DIR` | - | 测试覆盖：直接指定 skill 目录，优先于上者 |
 | `CLAUDE_REVIEW_SHELL_GUARD` | `1` | `0` 关闭 PreToolUse 的 Bash 分段守卫（仅用于排查误报，不推荐；单独设它不会放行，还会连带拒跑） |
 | `CLAUDE_REVIEW_ALLOW_UNGUARDED` | - | 设 `1` 才允许"hook 未生效/自检失败"时仍然开跑。默认拒跑 |
 | `CLAUDE_REVIEW_LOG_DIR` | `%TEMP%/cc-code-review` | 运行日志目录（日志含被审代码引用；Windows 上无 POSIX 权限位，可指向自有 ACL 的目录） |

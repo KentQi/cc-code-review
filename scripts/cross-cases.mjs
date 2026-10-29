@@ -694,21 +694,29 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   fs.writeFileSync(path.join(shadowSkills, "SKILL.md"), "---\nname: code-review\n---\nold\n");
   fs.writeFileSync(path.join(shadowSkills, "installed-by-cc-code-review"), "t\n");
 
-  const runCase = async (extra, env = {}) => {
+  const runCase = async (extra, env = {}, repoFactory = gitRepo2) => {
     const file = promptOf("case" + Math.random().toString(36).slice(2, 7));
-    const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_ECHO_PROMPT: file, CLAUDE_REVIEW_SKILL_DIR: emptySkills, ...env });
+    const argsFile = promptOf("argv" + Math.random().toString(36).slice(2, 7));
+    const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_ECHO_PROMPT: file, STUB_ECHO_ARGS: argsFile, CLAUDE_REVIEW_SKILL_DIR: emptySkills, ...env });
     await s.ready;
-    const r = await s.call("claude_code_review", { repoPath: gitRepo2("c21" + Math.random().toString(36).slice(2, 6)), scope: "last-commit", waitForResult: true, ...extra });
-    let prompt = "";
+    const r = await s.call("claude_code_review", { repoPath: repoFactory("c21" + Math.random().toString(36).slice(2, 6)), scope: "last-commit", waitForResult: true, ...extra });
+    let prompt = ""; let argv = [];
     try { prompt = fs.readFileSync(file, "utf8"); } catch { /* missing */ }
+    try { argv = JSON.parse(fs.readFileSync(argsFile, "utf8")); } catch { /* missing */ }
     const sc = r.result?.structuredContent || {};
     s.kill();
-    return { prompt, pipeline: sc.pipeline || sc.skillMode || "", text: textOf(r) };
+    return { prompt, argv, pipeline: sc.pipeline || sc.skillMode || "", text: textOf(r) };
   };
 
   const native = await runCase({ effort: "low" });
   check("C21", "auto + low runs the built-in /code-review", /^\/code-review low/.test(native.prompt), native.prompt.slice(0, 80));
   check("C21", "the native run reports the pipeline", /native/.test(native.pipeline), native.pipeline);
+  // 1.16.0's "slash commands travel in argv" claim needs a locking assertion:
+  // the command must appear in argv right after -p (promptViaArgv), stdin must
+  // not carry it.
+  const pIdx = native.argv.indexOf("-p");
+  check("C21", "the native command is passed in argv (after -p)",
+    pIdx >= 0 && native.argv[pIdx + 1] === native.prompt.trim(), JSON.stringify(native.argv.slice(0, 4)));
 
   const nativeTarget = await runCase({ effort: "medium", reviewLevel: "high" });
   check("C21", "the native command carries the review level", /^\/code-review high/.test(nativeTarget.prompt), nativeTarget.prompt.slice(0, 80));
@@ -727,8 +735,11 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   const forcedFleet = await runCase({ effort: "low", pipeline: "fleet" });
   check("C21", "pipeline=fleet overrides the auto rule", !/^\/code-review\b/.test(forcedFleet.prompt) && /## Pipeline \(bundled/.test(forcedFleet.prompt), forcedFleet.prompt.slice(0, 80));
 
+  // Fix rides the built-in command's own --fix flag (verified in the binary).
   const fixAuto = await runCase({ effort: "low", fix: true });
-  check("C21", "fix mode never uses the native command (it has no fix phase)", !/^\/code-review\b/.test(fixAuto.prompt) && /FIX MODE/.test(fixAuto.prompt), fixAuto.prompt.slice(0, 120));
+  check("C21", "fix mode rides the native command's --fix flag",
+    /^\/code-review low HEAD~1 --fix$/.test(fixAuto.prompt.trim()), fixAuto.prompt.slice(0, 140));
+  check("C21", "the native fix run does not forbid edits in the appendix", !/Do not modify any file/.test(fixAuto.prompt), fixAuto.prompt.slice(0, 140));
 
   // A same-named skill shadows the built-in command, so auto must not claim
   // "native" while the skill would answer — and pipeline=native must refuse.
@@ -737,6 +748,16 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   check("C21", "the result explains the shadow", /shadow/i.test(shadowed.text), shadowed.text.slice(0, 200));
   const forced = await runCase({ effort: "low", pipeline: "native" }, { CLAUDE_REVIEW_SKILL_DIR: shadowSkills });
   check("C21", "pipeline=native refuses to run behind a shadowing skill", /cannot be honoured/i.test(forced.text), forced.text.slice(0, 200));
+
+  // scope=auto with a pr must forward the pr as the native target (audit: the
+  // tool advertises "auto: PR if pr given" — the old code silently dropped it).
+  const autoPr = await runCase({ effort: "medium", pr: "123", scope: "auto" });
+  check("C21", "scope=auto forwards pr as the native target", /^\/code-review medium 123/.test(autoPr.prompt.trim()), autoPr.prompt.slice(0, 100));
+
+  // Root-commit repo (single empty commit): no HEAD~1 exists — fleet, not native.
+  const rootCommit = await runCase({ effort: "medium" }, {}, gitRepo);
+  check("C21", "root-commit last-commit switches auto to the fleet pipeline", !/^\/code-review\b/.test(rootCommit.prompt), rootCommit.prompt.slice(0, 90));
+  check("C21", "the result explains the missing parent commit", /no parent commit/i.test(rootCommit.text), rootCommit.text.slice(0, 220));
 }
 
 /* ================= C20 a Monitor task is not a reviewer subagent ================= */

@@ -41,14 +41,15 @@ import {
 
 /**
  * Our scopes, expressed as the native command's [target] argument.
- * - pr        → the PR number/URL
+ * - pr        → the PR number/URL (also when scope=auto was given a pr, which
+ *   the tool documents as "auto: PR if pr given")
  * - branch    → the base branch (the built-in diffs <base>...HEAD)
  * - last-commit → HEAD~1
- * - working-dir / auto → no target (the built-in includes uncommitted changes
- *   and infers the upstream range by itself)
+ * - working-dir / auto without pr → no target (the built-in includes
+ *   uncommitted changes and infers the upstream range by itself)
  */
 function nativeTarget({ scope, pr, baseRef }) {
-  if (scope === "pr" && pr) return String(pr);
+  if (pr && (scope === "pr" || scope === "auto")) return String(pr);
   if (scope === "branch") return baseRef || undefined;
   if (scope === "last-commit") return "HEAD~1";
   return undefined;
@@ -188,17 +189,20 @@ function requireAbsoluteRepoPath(p) {
   return { ok: true, path: path.resolve(expanded) };
 }
 
-/** Accepts "123", "#123", "owner/repo#123", or a github.com PR URL. */
+/** Accepts "123", "#123", "owner/repo#123", or a plain github.com PR URL.
+ *  The URL form must END at the number: the value becomes the native
+ *  command's target argument, and claude parses its own flags anywhere in
+ *  that string, so a trailing "/ low --fix" would reconfigure the review. */
 function validatePr(pr) {
   if (!pr) return { ok: true, pr: undefined };
   const s = String(pr).trim();
   if (/^#?\d{1,10}$/.test(s)) return { ok: true, pr: s.replace(/^#/, "") };
-  if (/^[\w.-]+\/[\w.-]+#\d{1,10}$/.test(s)) return { ok: true, pr: s };
-  if (/^https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d{1,10}(\/.*)?$/.test(s)) return { ok: true, pr: s };
+  if (/^[\w.-]{1,100}\/[\w.-]{1,100}#\d{1,10}$/.test(s)) return { ok: true, pr: s };
+  if (/^https?:\/\/github\.com\/[\w.-]{1,100}\/[\w.-]{1,100}\/pull\/\d{1,10}$/.test(s)) return { ok: true, pr: s };
   return {
     ok: false,
-    error: `pr must be a PR number ("123"), "owner/repo#123", or a GitHub PR URL — got ${JSON.stringify(pr)}. ` +
-      `The value is interpolated into the reviewer prompt, so arbitrary strings are rejected.`,
+    error: `pr must be a PR number ("123"), "owner/repo#123", or a plain GitHub PR URL ending at the number — got ${JSON.stringify(pr)}. ` +
+      `Trailing text is rejected because the value becomes the /code-review command's target argument and the command parses its own flags anywhere in it.`,
   };
 }
 
@@ -856,7 +860,7 @@ server.tool(
     effort: z.enum(["low", "medium", "high", "xhigh", "max"]).default("max")
       .describe("Review effort / reasoning level, same scale as Claude Code (--effort): low..max. Default max = exhaustive deep review (slower and pricier). Omit for the deepest default; pass low/medium for a fast, cheap pass."),
     reviewLevel: z.enum(["low", "medium", "high", "max"]).optional()
-      .describe("The REVIEW's own depth level — the same argument claude's native /code-review command takes. It sizes the reviewer fleet from the diff (about max(2, min(8, ceil(diff_lines/150))) finder subagents; max legitimately fans out 10-15+ with verification agents). Defaults to a mapping of effort (max→max, xhigh/high→high, medium→medium, low→low). Separate knob from the CLI reasoning effort and from ultracode."),
+      .describe("The REVIEW's own depth level — the same argument claude's native /code-review command takes. The fleet structure mirrors the native playbooks verbatim: low = one pass, no subagents (<=4 findings); medium/high = 8 finder subagents (3+5 angles x 6 candidates); max = 10 finder subagents (5+5 angles x 8 candidates) + one verifier per surviving candidate + 1 sweep finder, findings capped at 15 — so max exceeds 15 subagents structurally. Defaults to a mapping of effort (max/xhigh->max, high->high, medium->medium, low->low). Separate knob from the CLI reasoning effort and from ultracode."),
     ultracode: z.boolean().default(false)
       .describe("Enable claude's Ultracode mode for this run (the `ultracode` settings key): standing dynamic-workflow orchestration — every substantive step goes through the native Workflow tool, multi-agent and token-cost-no-object. Orthogonal to effort (any effort level). Requires a claude CLI that supports the key; older builds ignore it (see workflowRuns in the result)."),
     model: z.string().optional().describe("Claude model override (passed as --model)"),
@@ -866,13 +870,13 @@ server.tool(
       .describe(`API spend cap via --max-budget-usd. DEFAULT 0 = NO CAP at any effort level: a cap stops the parent before it synthesizes, and every finished subagent report is already captured incrementally (and recovered from output_file), so a 429/token exhaustion no longer wastes it. The wall-clock timeout (timeoutMinutes) is the guard. Set a number only if you want a hard spend stop; env CLAUDE_REVIEW_MAX_BUDGET_USD sets the DEFAULT for this argument (an explicit value here always wins). On third-party gateways this depends on usage data the gateway returns.`),
     pipeline: z.enum(["auto", "native", "fleet", "skill"]).default("auto")
       .describe(
-        "Which review engine runs. auto (default): claude's built-in /code-review command for levels low..xhigh — it needs no file on disk — " +
-        "and the MCP's own fleet pipeline for max/fix, because the built-in hands max to subagents whose exploration commands the locked-down permission mode denies. " +
-        "native: force the built-in command. fleet: force the fleet pipeline (its instructions travel in the prompt; nothing is installed). " +
-        "skill: legacy — use/install the bundled skill into ~/.claude/skills (the only mode that writes to disk).",
+        "Which review engine runs. auto (default): claude's built-in /code-review command for levels low..xhigh — it needs no file on disk; fix runs ride its own --fix flag. " +
+        "Only max uses the MCP's own fleet pipeline, because the built-in hands max to subagents whose exploration commands the locked-down permission mode denies. " +
+        "native: force the built-in command (refused when a same-named skill in the Claude config dir shadows it). fleet: force the fleet pipeline (its instructions travel in the prompt; nothing is installed). " +
+        "skill: legacy — use/optionally install the bundled skill (the only mode that may write to disk).",
       ),
-    installSkillIfMissing: z.boolean().default(false)
-      .describe("Only meaningful with pipeline=skill: install the bundled skill into ~/.claude/skills when missing (default false — reviews install nothing)"),
+    installSkillIfMissing: z.boolean().default(ENV.autoInstallSkill)
+      .describe("Only meaningful with pipeline=skill: when the bundled skill is MISSING, install it into the Claude config dir (default false — a missing skill degrades to the inline fleet pipeline instead; a MANAGED existing copy is refreshed whenever it is about to be used; a user-managed copy is never touched). env CLAUDE_REVIEW_AUTO_INSTALL_SKILL=1 sets the default"),
     waitForResult: z.boolean().default(false)
       .describe("Block until the review finishes and return the report synchronously (2-15 min). Default false: returns a jobId at once — poll claude_review_status(jobId). Only set true if your MCP client has no ~30s tool-call timeout."),
   },
@@ -975,11 +979,11 @@ server.tool(
     // --- which pipeline runs -------------------------------------------------
     // claude ships its own /code-review command, so a review never has to write
     // anything into ~/.claude. Measured on 2.1.311: the built-in is
-    // single-context at low..xhigh (fast, no subagents) and switches to
-    // subagents at max, whose compound exploration commands the CLI's manual
-    // permission mode denies outright — so at max (and in fix mode, which the
-    // built-in has no notion of) the fleet pipeline travels inside the prompt
-    // instead. Both paths install nothing.
+    // single-context at low..xhigh — including fix runs, which ride its own
+    // `--fix` flag — and switches to subagents at max, whose compound
+    // exploration commands the CLI's manual permission mode denies outright, so
+    // max uses the fleet pipeline (whose instructions travel in the prompt).
+    // Both paths install nothing.
     let pipeline = pipelineArg || "auto";
     let pipelineNote = "";
     // A skill named `code-review` in ~/.claude/skills SHADOWS claude's built-in
@@ -990,16 +994,24 @@ server.tool(
     // exists to prevent.
     const shadow = skillStatus() !== "missing";
     if (pipeline === "auto") {
-      if (fix) { pipeline = "fleet"; pipelineNote = "auto chose the fleet pipeline: fix mode has no native equivalent"; }
-      else if (effectiveReviewLevel === "max") { pipeline = "fleet"; pipelineNote = "auto chose the fleet pipeline: the native /code-review command hands max to subagents whose exploration commands the locked-down permission mode denies"; }
+      if (effectiveReviewLevel === "max") {
+        pipeline = "fleet";
+        pipelineNote = "auto chose the fleet pipeline: at max the native /code-review command hands off to subagents whose exploration commands the locked-down permission mode denies";
+      }
       else if (scope === "last-commit" && pre.hasParent === false) {
         pipeline = "fleet";
-        pipelineNote = "auto chose the fleet pipeline: HEAD is a root commit, and the native command targets a BASE ref (`HEAD~1` does not exist here)";
+        pipelineNote = "auto chose the fleet pipeline: HEAD has no parent commit (or no commits at all), and the native command targets a BASE ref (`HEAD~1` does not exist here)";
       }
       else if (shadow) {
         pipeline = "fleet";
         pipelineNote = "auto chose the fleet pipeline: a code-review skill exists at ~/.claude/skills and would shadow claude's built-in /code-review command (remove it — claude_review_env with uninstallSkill=true — to use the native pipeline)";
       } else pipeline = "native";
+      // fix rides the built-in command's own --fix flag (verified in the
+      // binary: the usage line is `[levels] [--fix] [--comment] [<target>]`),
+      // so it no longer forces the fleet at low..xhigh.
+      if (fix && pipeline === "native") {
+        pipelineNote = (pipelineNote ? pipelineNote + " " : "") + "fix mode rides the native command's --fix flag";
+      }
     }
     if (pipeline === "native" && shadow) {
       return err(
@@ -1035,9 +1047,20 @@ server.tool(
           }
         }
       } else {
-        const r = installBundledSkill();
-        skillMode = r.installed ? "code-review skill (bundled, installed for this run)" : `fleet pipeline (skill install failed: ${r.reason})`;
-        useSkill = r.installed;
+        // Audit: installSkillIfMissing gates the MISSING case — with it false
+        // (the default) and the skill absent, the fleet pipeline runs instead of
+        // writing ~/.claude. A managed copy is refreshed because it is about to
+        // be used; a user-managed copy is never touched.
+        if (!installSkillIfMissing) {
+          pipeline = "fleet";
+          pipelineNote = (pipelineNote ? pipelineNote + " " : "") + "pipeline=skill requested but installSkillIfMissing=false and no skill is installed — running the inline fleet pipeline instead (nothing was installed)";
+          skillMode = "fleet pipeline (inline, nothing installed)";
+        } else {
+          const r = installBundledSkill();
+          skillMode = r.installed ? "code-review skill (bundled, installed for this run)" : `fleet pipeline (skill install failed: ${r.reason})`;
+          useSkill = r.installed;
+          if (!useSkill) pipeline = "fleet";
+        }
       }
     }
     if (pipeline === "fleet" && useSkill === false) {
@@ -1056,7 +1079,7 @@ server.tool(
     let prompt;
     let appendSystemPrompt;
     if (pipeline === "native") {
-      prompt = buildNativeCommand({ reviewLevel: effectiveReviewLevel, target: nativeTarget({ scope, pr, baseRef: baseRefCheck.ref }) });
+      prompt = buildNativeCommand({ reviewLevel: effectiveReviewLevel, target: nativeTarget({ scope, pr, baseRef: baseRefCheck.ref }), fix });
       appendSystemPrompt = buildNativeAppendix({ outputLanguage, focus: focusCheck.focus, postToPR, cwd: repoPath, fix });
       skillMode = "native /code-review (built into claude; nothing installed)";
     } else {
@@ -1602,6 +1625,11 @@ server.tool(
         params: { progressToken: token, progress: mins, total: timeoutMinutes, message: `claude followup in progress (${mins}min elapsed)` },
       }).catch(() => {});
     }, 60_000);
+    // The followup grants Agent/Task, so subagents can run here — capture their
+    // reports exactly like the review tool does (audit F2: they used to be
+    // dropped, although the JSONL was already on disk).
+    const followReports = [];
+    let followSubagentsFile = null;
     const run = await runClaude({
       cli,
       repoPath,
@@ -1622,6 +1650,10 @@ server.tool(
       },
       guardSettings,
       subagentsDir: logsDir(),
+      onSubagentReport: (rec, file) => {
+        followReports.push(rec);
+        if (typeof file === "string") followSubagentsFile = file;
+      },
       timeoutMs: timeoutMinutes * 60_000,
       signal,
     });
@@ -1629,11 +1661,20 @@ server.tool(
 
     const logFile = writeLogFile(run.stdout, run.stderr);
     const logNote = logNoteOf(logFile);
+    // Audit F2: the same "never lose paid-for work" contract as the review tool
+    // — any interruption or failure still carries the finished subagent reports.
+    const followNote = [
+      subagentReportsText(followReports),
+      typeof followSubagentsFile === "string"
+        ? `_partial reports file: ${followSubagentsFile} (one JSONL line per finished subagent)_`
+        : "",
+    ].filter(Boolean).join("\n\n");
+    const carried = followNote ? `\n\n${followNote}` : "";
     const j = run.json;
 
-    if (run.cancelled) return err(`followup cancelled by the client.${logNote}`);
-    if (run.timedOut) return err(`followup timed out after ${timeoutMinutes} minutes.${logNote}${stderrTail(run.stderr)}`);
-    if (!j) return err(`claude exited (code ${run.exitCode}) without a parseable result (bad session_id? gateway down?).${logNote}${stderrTail(run.stderr)}`);
+    if (run.cancelled) return err(`followup cancelled by the client.${logNote}${carried}`);
+    if (run.timedOut) return err(`followup timed out after ${timeoutMinutes} minutes.${logNote}${stderrTail(run.stderr)}${carried}`);
+    if (!j) return err(`claude exited (code ${run.exitCode}) without a parseable result (bad session_id? gateway down?).${logNote}${stderrTail(run.stderr)}${carried}`);
 
     const looksLikeApiError = /^API Error/i.test(String(j.result || ""));
     const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError;
@@ -1641,8 +1682,13 @@ server.tool(
     if (!ok) {
       return {
         isError: true,
-        content: [{ type: "text", text: failureBanner(j, run) + stderrTail(run.stderr) + logNote }],
-        structuredContent: { status: status2, sessionId: j.session_id ?? sessionId, reply: String(j.result || "") },
+        content: [{ type: "text", text: failureBanner(j, run) + stderrTail(run.stderr) + logNote + carried }],
+        structuredContent: {
+          status: status2, sessionId: j.session_id ?? sessionId, reply: String(j.result || ""),
+          subagents: subagentsView(followReports),
+          subagentsSpawned: followReports.length || undefined,
+          subagentsFile: followSubagentsFile || undefined,
+        },
       };
     }
     const chainNote = shellChainingNote(run.bashCommands, [], { repoRoot: repoPath });

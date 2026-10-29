@@ -41,8 +41,11 @@
 import fs from "node:fs";
 import path from "node:path";
 
-/** Tools that only read their stdin: allowed after a pipe, never as command 1. */
-const PIPE_SINKS = new Set(["head", "tail", "cat", "wc", "uniq", "cut", "tr", "grep", "sort", "sed"]);
+/** Tools that only read their stdin: allowed after a pipe, never as command 1.
+ *  No sed: its script language writes (w/W), executes (e) and reads (r) files in
+ *  forms no parser caught in audit (a sed "execute" command ran on this machine).
+ *  head/tail cover the line-range need; the rest goes through Read. */
+const PIPE_SINKS = new Set(["head", "tail", "cat", "wc", "uniq", "cut", "tr", "grep", "sort"]);
 
 /**
  * The Bash surface of a review. `exact` entries must match word-for-word (the
@@ -71,7 +74,7 @@ export const BASH_POLICY = [
         // so this prefix is only safe when it carries flags and nothing else.
         requireFlagsOnly: true,
         denyFlags: ["-d", "-D", "-m", "-M", "-c", "-C", "-f", "-t", "--delete", "--move", "--copy",
-          "--force", "--track", "--edit-description", "--set-upstream-to", "--unset-upstream-to"],
+          "--force", "--track", "--edit-description", "--set-upstream-to", "--unset-upstream-to", "--unset-upstream"],
       },
     ],
   },
@@ -145,9 +148,11 @@ function parseCommand(cmd) {
     if (quote === '"') {
       if (c === "\\") {
         // Inside double quotes POSIX only removes the backslash before these
-        // four characters. That matters on Windows: "C:\Users\x" keeps its
+        // four characters — and before a newline, which it deletes entirely
+        // (line continuation). That matters on Windows: "C:\Users\x" keeps its
         // backslashes, so `cd` can be resolved for real.
         const next = cmd[i + 1];
+        if (next === "\n") { i++; continue; }
         if (next === '"' || next === "\\" || next === "$" || next === "`") { word += next; i++; continue; }
         word += c;
         continue;
@@ -159,13 +164,14 @@ function parseCommand(cmd) {
     }
     if (c === "'" || c === '"') { quote = c; inWord = true; continue; }
     if (c === "\\") {
-      // A POSIX shell drops the backslash for any escaped character, but on
-      // Windows that turns `C:\Users\x` into `C:Usersx` — a token we could then
-      // no longer recognise as an absolute path, which is exactly what a path
-      // escape looks like. Keep the backslash when it precedes a path-ish
-      // character; treat it as an escape before whitespace and metacharacters,
-      // which is what matters for splitting.
+      // Outside quotes, bash deletes a backslash before a newline outright (line
+      // continuation) — `find . \<LF>-delete` runs `find . -delete`. Keeping the
+      // pair as word content hid the flag from every deny check, so this is a
+      // security-critical join, not cosmetics. For any other character, keep the
+      // backslash when it precedes a path-ish one (Windows paths must stay
+      // recognisable) and treat it as a plain escape otherwise.
       const next = cmd[i + 1];
+      if (next === "\n") { i++; continue; }
       if (next !== undefined && /[A-Za-z0-9._\-/@:]/.test(next)) { word += "\\" + next; i++; inWord = true; continue; }
       if (next !== undefined) { word += next; i++; inWord = true; }
       continue;
@@ -376,6 +382,9 @@ export function isInsideRepo(root, token) {
   if (typeof token !== "string" || !token) return true;
   if (token.startsWith("~")) return false;           // shell expands to $HOME
   if (token.includes("$")) return false;             // cannot be resolved statically
+  // Brace expansion turns one lexically-safe token into several paths
+  // ({..,/etc}, {~/x,y}) — the shell resolves them before the command runs.
+  if (token.includes("{") || token.includes("}")) return false;
   const realRoot = repoRealpath(root);
   if (!realRoot) return false;
   const target = path.resolve(realRoot, token);
@@ -448,8 +457,8 @@ function segmentProblem(words, repoRoot) {
       return `blocked: \`${write}\` makes git write a file, and a read-only review must not write anything (an allowlisted \`git diff\`/\`git show\`/\`git log\` call with --output= would otherwise be a file-write primitive for repo-controlled content). Drop the flag.`;
     }
   }
-  if (prog === "sort" && words.some((w) => w === "-o" || w.startsWith("--output"))) {
-    return "blocked: `sort -o` writes a file. Review mode is read-only — drop the flag.";
+  if (prog === "sort" && words.some((w) => w === "-o" || w.startsWith("--output") || w.startsWith("--compress-program") || w === "-T" || w.startsWith("--temporary-directory"))) {
+    return "blocked: sort -o/--compress-program/--temporary-directory write files or run a program outside the reviewed repository. Review mode is read-only.";
   }
   if (prog === "sed") {
     if (words.some((w) => w === "-i" || w.startsWith("-i.") || w.startsWith("--in-place"))) {

@@ -22,7 +22,9 @@ branch, (3) the last commit.
 
 2. **Establish the diff**
    - PR: `gh pr view <N> --json state,title,body` and `gh pr diff <N>`
-   - Branch range: `git merge-base <base> HEAD`, then `git diff <base>...HEAD`
+   - Branch range: `git log --oneline <base>..HEAD`, then `git diff <base>...HEAD`
+     (`git merge-base <base> HEAD` is NOT in this run's Bash allowlist — the
+     two-dot/dot-dot forms express the same base without it)
    - Working tree: `git status --porcelain`, `git diff`, `git diff --cached`,
      plus the full content of new untracked files
    - Last commit: `git show --stat HEAD`, `git show HEAD`
@@ -74,12 +76,13 @@ branch, (3) the last commit.
    > elsewhere) is refused, so search from `.`. For file contents prefer the
    > Read/Grep/Glob tools.
 
-   Every subagent returns ONLY a JSON list of issues:
-   `{"file": "...", "line_range": "12-18", "reason": "...", "category": "..."}`.
+   Every subagent returns ONLY a JSON list of candidate issues — the same shape
+   claude's own playbook uses:
+   `{"file": "src/auth.js", "line": 12, "summary": "one sentence", "failure_scenario": "the concrete scenario in which the code misbehaves", "category": "bug|conventions|historical|prev-pr|code-comment"}`.
 
    - **#1 Conventions** — audit the changes against the CLAUDE.md / AGENTS.md
      files found in step 3. Those files guide code *writing*, so not every
-     instruction applies to review. `reason` must quote the exact instruction.
+     instruction applies to review. `summary` must quote the exact instruction.
      category: `conventions`
    - **#2 Bug scan** — shallow scan of the diff itself. Focus on LARGE bugs;
      avoid small issues and nitpicks; do not read context beyond the changes;

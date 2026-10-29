@@ -11,16 +11,21 @@ const MARKER = "installed-by-cc-code-review";
 const LEGACY_MARKERS = ["installed-by-claude-review-mcp"];
 
 /**
- * Where a `code-review` skill would live. Honours CLAUDE_CONFIG_DIR (the CLI
- * reads skills from <config>/skills, so installing into ~/.claude when the user
- * has moved their config would put the file where nothing reads it) and a test
- * override.
+ * Where a `code-review` skill would live. Honours CLAUDE_CONFIG_DIR — from the
+ * process env AND from ~/.claude/settings.json's env block (the same two
+ * sources claude.js resolves for the child, audit F7: disagreeing resolutions
+ * made the shadow check blind) — plus a test override.
  */
 export function userSkillDir() {
   if (process.env.CLAUDE_REVIEW_SKILL_DIR) return path.resolve(process.env.CLAUDE_REVIEW_SKILL_DIR);
-  const cfg = process.env.CLAUDE_CONFIG_DIR;
-  const base = cfg ? path.resolve(cfg) : path.join(os.homedir(), ".claude");
-  return path.join(base, "skills", "code-review");
+  const expand = (p) => (p.startsWith("~/") || p.startsWith("~\\") ? path.join(os.homedir(), p.slice(2)) : p);
+  if (process.env.CLAUDE_CONFIG_DIR) return path.join(expand(process.env.CLAUDE_CONFIG_DIR), "skills", "code-review");
+  try {
+    const f = path.join(os.homedir(), ".claude", "settings.json");
+    const j = JSON.parse(fs.readFileSync(f, "utf8"));
+    if (j?.env?.CLAUDE_CONFIG_DIR) return path.join(expand(j.env.CLAUDE_CONFIG_DIR), "skills", "code-review");
+  } catch { /* no user settings */ }
+  return path.join(os.homedir(), ".claude", "skills", "code-review");
 }
 
 export function bundledSkillFile() {

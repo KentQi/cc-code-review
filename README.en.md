@@ -7,12 +7,13 @@
 English | [简体中文](README.md)
 
 An MCP server that wraps **Claude Code's code-review capability** so ZCode (or any MCP client) can call it directly:
-ZCode → MCP → `claude -p` (headless) → code-review skill (a diff-sized fleet of parallel reviewer subagents + 0–100 confidence scoring + ≥80 filter) → the report comes back to ZCode as-is → ZCode fixes the code based on the findings → call again to re-verify.
+ZCode → MCP → `claude -p` (headless) → claude's built-in `/code-review` (low..xhigh, including `--fix`) or the inline fleet pipeline (max: 10 finders + one verifier per surviving candidate + sweep) → the report comes back to ZCode as-is → ZCode fixes the code based on the findings → call again to re-verify.
 
 ```
 ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --output-format stream-json
                             │                              │  cwd = the repo under review
-                            │                              └─ ~/.claude/skills/code-review (auto-installed by this MCP)
+                            │                              └─ built-in /code-review (default) or the inline
+                            │                                 fleet prompt — nothing is written to ~/.claude
                             ◀── result(report + session_id + spend) ──┘
 ```
 
@@ -99,7 +100,7 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `timeoutMinutes` | `30` | 1–60 | hard timeout — with no spend cap this is the master guard; when it fires, the finished subagent reports are still returned |
 | `maxBudgetUsd` | `0` (no cap) | 0–50 | API spend cap (`--max-budget-usd`). **The default 0 sets NO cap at any effort level**: a cap stops the parent before it synthesizes, while every finished subagent report is already captured incrementally and a 429-killed agent is recovered from its output_file transcript — a cap only throws away paid work. `timeoutMinutes` and `maxTurns` are the guards. Set a number to opt into a hard stop; env `CLAUDE_REVIEW_MAX_BUDGET_USD` changes the default only — an explicit argument wins |
 | `pipeline` | `auto` | auto / native / fleet / skill | review engine. **auto**: claude's built-in `/code-review` for low..xhigh (needs no file on disk); max and fix mode use this MCP's fleet pipeline (reasons below). **native** forces the built-in; **fleet** forces the inline fleet; **skill** is the legacy mode — the only one that writes to `~/.claude` |
-| `installSkillIfMissing` | `false` | - | only meaningful with `pipeline=skill`: install the bundled skill when missing (default false — a review installs nothing) |
+| `installSkillIfMissing` | `false` | - | only meaningful with `pipeline=skill`: install the bundled skill when MISSING (default false — a missing skill degrades to the inline fleet pipeline; a managed existing copy is refreshed before use; a user-managed copy is never touched) |
 
 Returns (async by default: a jobId (<1s) plus the preflight verdict, with the report fetched via claude_review_status(jobId); with waitForResult: true the synchronous form below applies): a markdown report (Review Summary / Findings / Notes) + each reviewer subagent's own report (`## Reviewer subagent reports`, sized from the diff) + metadata (`session_id`, spend, turns, log path, model provenance). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
 
@@ -121,12 +122,11 @@ Claude Code 2.1.x **ships** a `code-review` skill (`/code-review [level] [target
 
 | level | Default engine | Why (measured on 2.1.311) |
 |---|---|---|
-| low / medium / high / xhigh | **built-in `/code-review`** | single-context, angle-by-angle reading, finishes in ~10s, zero installs |
+| low / medium / high / xhigh | **built-in `/code-review`** | single-context, angle-by-angle reading, finishes in ~10s, zero installs; fix mode rides the command's own `--fix` flag (verified in the binary) |
 | max | **inline fleet pipeline** | the built-in max spawns subagents whose `cd X && ls && git config …` exploration is denied wholesale by manual mode (measured: 100 denials, no convergence in 5 minutes); the fleet prompt keeps them inside the read-only surface |
-| fix mode | inline fleet pipeline | the built-in has no fix phase |
 | `last-commit` on a root commit | inline fleet pipeline | the built-in's target is a BASE ref (`HEAD~1`); a root commit has no parent |
 
-- **Inline fleet = no files**: the body of `assets/skills/code-review/SKILL.md` is appended to the prompt (`## Pipeline (bundled with this MCP)`); the cost is ~4KB of extra input per review.
+- **Inline fleet = no files**: the body of `assets/skills/code-review/SKILL.md` is appended to the prompt (`## Pipeline (bundled with this MCP)`); the cost is ~8KB of extra input per fleet review.
 - **`pipeline` argument**: `auto` (default) / `native` / `fleet` / `skill`. `skill` is the only mode that writes to `~/.claude`, and it is off by default.
 - **A same-named skill shadows the built-in command** (measured: with `~/.claude/skills/code-review` present, `/code-review` becomes a `Skill` call). So `auto` switches to the fleet pipeline and says so; an explicit `pipeline=native` is refused rather than silently running something else. Remove an old copy with `claude_review_env { uninstallSkill: true }`.
 - Results carry `pipeline` (description) and `pipelineMode` (resolved value); `subagent_stats` shows the fleet size.
@@ -157,9 +157,9 @@ Why not the stricter "never allow a compound command": that rejected the shape m
 
 **A PreToolUse hook can only subtract (verified in the binary).** claude 2.1.311's hook-output sanitizer passes `permissionDecision: "deny" | "ask"` through and drops `"allow"` (`permissionDecision==="deny"||==="ask"?…:void 0`); `updatedInput` does not land on that path either. That is exactly why `Bash(cd:*)` must be in the allowlist: it lets the shape through the engine's gate, and the hook then decides where the `cd` actually lands. A hook-allow + engine-deny combination only costs a turn; it never weakens security.
 
-**Reads are scoped to the repository too (v1.15.0).** The path arguments of `find`/`rg` and of every pipe sink (cat/head/tail/grep/sed -n/…), plus git's own path flags, are checked against the repo root — `~`, `$VAR`, `..`, absolute paths, and in-repo symlinks or junctions pointing outside are all refused (realpath, the same rule the Edit/Write boundary uses). `git diff --no-index`, `git blame --contents`, `sed -f`, `wc/sort --files0-from` and `uniq`'s second positional (an output file) are refused outright. A hook that is not given the repo root fails closed for Bash.
+**Reads are scoped to the repository too (v1.15.0).** The path arguments of `find`/`rg` and of every pipe sink (cat/head/tail/wc/uniq/cut/tr/grep) are checked against the repo root — `~`, `$VAR`, `..`, brace expansion, absolute paths, and in-repo symlinks or junctions pointing outside are all refused (realpath, the same rule the Edit/Write boundary uses). Git pathspecs are NOT path-scoped — git itself confines them to the tree — but the escape hatches are refused outright: `git diff --no-index`, `git blame --contents`, plus `--output=` writers. `sed -f`, `wc/sort --files0-from` and `uniq`'s second positional (an output file) are also refused outright, and `sed` is not a permitted pipe sink at all (its script language writes/executes/reads in forms no parser reliably catches). A hook that is not given the repo root fails closed for Bash.
 
-It also closes the **write/execute forms that a prefix rule cannot express**: `find` and `rg` are granted as read-only tools, but `find -delete / -exec / -execdir / -ok / -okdir / -fprint / -fprintf / -fls` write files or run programs, `rg --pre / --pre-glob` runs an arbitrary program per file, and `sed -i`, a `w`/`W`/`e` sed command or `sort -o` writes a file. The hook refuses those per segment (matching deny rules are in the allowlist too, but the hook is the deterministic control); plain reads are unaffected.
+It also closes the **write/execute forms that a prefix rule cannot express**: `find` and `rg` are granted as read-only tools, but `find -delete / -exec / -execdir / -ok / -okdir / -fprint / -fprintf / -fls` write files or run programs, `rg --pre / --pre-glob` runs an arbitrary program per file, `sort -o / --compress-program / -T` write or execute, and `git branch <name>` creates a branch (flag-guarded). The hook refuses those per segment (matching deny rules are in the allowlist too, but the hook is the deterministic control); plain reads are unaffected.
 
 > ⚠️ **`--settings` replaces the entire `hooks` key**: the injected temp file contains only this MCP's hook — your own hooks from `~/.claude/settings.json` will **not** run inside this child process (other keys such as `env`, `model`, `permissions` are unaffected). This is CLI behavior, not an omission — if you rely on your own hooks during reviews, you currently need a different approach.
 
@@ -224,7 +224,9 @@ Since v1.10.0 the result also carries **each reviewer subagent's own report** (a
 | `CLAUDE_REVIEW_TIMEOUT_MIN` | `30` | default timeout (minutes); changes the default only — an explicit `timeoutMinutes` wins |
 | `CLAUDE_REVIEW_MAX_BUDGET_USD` | `0` | default spend cap, `0` = no cap; changes the default only — an explicit `maxBudgetUsd` wins |
 | `CLAUDE_REVIEW_MODEL` | - | default model |
-| `CLAUDE_REVIEW_AUTO_INSTALL_SKILL` | `1` | whether to auto-install the skill |
+| `CLAUDE_REVIEW_AUTO_INSTALL_SKILL` | off | set `1` to make `installSkillIfMissing` default to true (only meaningful with pipeline=skill; even then nothing is installed unless the skill is missing) |
+| `CLAUDE_CONFIG_DIR` | ~/.claude | root for skill install/lookup (read from the process env and ~/.claude/settings.json env block, matching the claude child) |
+| `CLAUDE_REVIEW_SKILL_DIR` | - | test override: the skill directory, takes precedence over the above |
 | `CLAUDE_REVIEW_SHELL_GUARD` | `1` | `0` disables the PreToolUse Bash segment guard (troubleshooting only, not recommended; setting it alone unlocks nothing — the tools also refuse to run) |
 | `CLAUDE_REVIEW_ALLOW_UNGUARDED` | - | set `1` to allow runs when the hook did not apply / the self-test failed. Refuses by default |
 | `CLAUDE_REVIEW_LOG_DIR` | `%TEMP%/cc-code-review` | run-log directory (logs quote the code under review; Windows has no POSIX mode bits — point it at a directory your own ACLs protect) |

@@ -39,17 +39,17 @@ export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 
 /**
  * The review's OWN depth level — the third knob next to the CLI reasoning
- * effort and ultracode. claude's native /code-review command takes exactly
- * this argument (`/code-review low|medium|high|max`), and its pipeline sizes
- * the finder fleet from the diff: about max(2, min(8, ceil(lines/150)))
- * subagents, not a fixed five. Map the CLI effort onto it when the caller
- * does not pass one explicitly.
+ * effort and ultracode. claude's native /code-review command takes this
+ * argument (`/code-review low|medium|high|xhigh|max`), and each level selects
+ * one of its playbooks (verbatim from the binary, see finderFleetRule below).
+ * xhigh shares the max playbook in claude's code (`ao = ro("xhigh"),
+ * lo = ro("max")` — same factory), so effort=xhigh maps to reviewLevel max.
  */
 export const REVIEW_LEVELS = ["low", "medium", "high", "max"];
 export function deriveReviewLevel(effort) {
   switch (effort) {
-    case "max": return "max";
-    case "xhigh":
+    case "max":
+    case "xhigh": return "max";
     case "high": return "high";
     case "medium": return "medium";
     case "low": return "low";
@@ -73,11 +73,14 @@ export function deriveReviewLevel(effort) {
  * for the claude-sonnet-5 family at high+, not a universal rule.)
  */
 export function finderFleetRule(reviewLevel) {
+  // `angles` mirrors the native playbook's own composition header verbatim:
+  // medium/high "3+5" (correctness+cleanup+altitude+conventions = 8),
+  // max/xhigh "5+5" (same taxonomy at 5 correctness = 10).
   const table = {
-    low: { finders: 0, candidates: 0, cap: 4 },
-    medium: { finders: 8, candidates: 6, cap: 8 },
-    high: { finders: 8, candidates: 6, cap: 8 },
-    max: { finders: 10, candidates: 8, cap: 15 },
+    low: { finders: 0, candidates: 0, cap: 4, angles: "one careful diff pass" },
+    medium: { finders: 8, candidates: 6, cap: 8, angles: "3 correctness angles + 3 cleanup angles + 1 altitude angle + 1 conventions angle" },
+    high: { finders: 8, candidates: 6, cap: 8, angles: "3 correctness angles + 3 cleanup angles + 1 altitude angle + 1 conventions angle" },
+    max: { finders: 10, candidates: 8, cap: 15, angles: "5 correctness angles + 3 cleanup angles + 1 altitude angle + 1 conventions angle" },
   };
   return table[reviewLevel] ?? table.max;
 }
@@ -156,13 +159,13 @@ export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, p
   }
   lines.push(`- Tool constraints (enforced by the permission allowlist, not optional): read files with Read/Glob/Grep and ${fix ? "edit them with Edit/Write" : "do not edit anything"}. Shell redirection (\`cat > f\`, \`sed -i\`, \`tee\`, heredoc writes) and interpreters (\`node -e\`, \`python -c\`) are NOT permitted and every such call is denied — use the dedicated tools. Only the git/gh read commands listed above may be run through Bash.`);
   if (cwd) {
-    lines.push(`- Your working directory is already the repository root (${cwd}). Run git/gh commands directly — no \`cd\` prefixes, no \`git -C\`, and no \`;\`/\`&&\`/\`|\` command chains, redirections or \`$()\`/backtick substitution: each Bash call must be exactly one simple permitted command. Anything else is hard-denied before it runs (a hook blocks it), and a denied call costs you a turn for nothing.`);
+    lines.push(`- Your working directory is already the repository root (${cwd}). Run git/gh commands directly — no \`cd\` prefixes, no \`git -C\`, no redirection (\`> >> <\`) and no \`$()\`/backtick/\`\${}\` substitution: those are hard-denied before they run (a hook judges them). Chains of ALLOWED read-only commands (\`git status && git diff\`, \`git show x | head -50\`) do run — every part of a chain must itself be a permitted command, or the whole call is refused. A denied call costs you a turn for nothing.`);
   }
   if (effort) {
     lines.push(`- Review effort level: ${effort}${effort === "max" || effort === "xhigh" ? " — be exhaustive: re-read surrounding code for every finding, verify each claim against the actual diff, and actively hunt for the harder-to-spot issues (concurrency, error paths, resource leaks), not just the obvious ones." : ""}.`);
   }
   if (reviewLevel) {
-    const { finders, candidates, cap } = finderFleetRule(reviewLevel);
+    const { finders, candidates, cap, angles } = finderFleetRule(reviewLevel);
     if (finders === 0) {
       lines.push(`- Reviewer fleet (level ${reviewLevel}): one careful diff pass, no subagents; report at most ${cap} findings.`);
     } else {
@@ -170,7 +173,7 @@ export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, p
       // one verifier per surviving candidate, phase 3 a sweep finder.
       lines.push(
         `- Reviewer fleet (level ${reviewLevel}, same structure as claude's native playbook): ` +
-        `PHASE 1 — dispatch ALL ${finders} finder subagents in ONE message (that many Agent tool calls in the SAME reply) using the Agent tool's background/async mode (run_in_background: true — the 2.1.x default), so the whole fleet runs concurrently and you are not blocked; never one per turn, never a foreground agent that blocks the rest, covering 5 correctness angles + 3 cleanup + 1 altitude + 1 conventions; on a large diff split an angle across files instead of adding new ones; each returns up to ${candidates} candidates as {file, line, summary, failure_scenario}. ` +
+        `PHASE 1 — dispatch ALL ${finders} finder subagents in ONE message (that many Agent tool calls in the SAME reply) using the Agent tool's background/async mode (run_in_background: true — the 2.1.x default), so the whole fleet runs concurrently and you are not blocked; never one per turn, never a foreground agent that blocks the rest. The angle set is ${angles}; on a large diff split an angle across files instead of adding new ones; each finder returns up to ${candidates} candidates as {file, line, summary, failure_scenario}. ` +
         `PHASE 2 — dedup candidates that point at the same line/mechanism, then run ONE verifier subagent per surviving candidate (give it the diff, the file, and the claim); send each batch of verifiers in ONE message too; a verifier answers CONFIRMED, PLAUSIBLE or REFUTED with the evidence; keep CONFIRMED and PLAUSIBLE. ` +
         `PHASE 3 — one more finder subagent as a fresh reviewer that sees the verified list and looks ONLY for gaps. ` +
         `That is ${finders} finders + one verifier per surviving candidate + 1 sweep, so a max-level review legitimately runs 15+ subagents in total. ` +
@@ -224,15 +227,19 @@ export function bundledSkillBody() {
  * an optional target (PR number, base branch, ref), so a scope maps onto it
  * directly. Verified headless: `-p "/code-review low HEAD~1"` expands and runs.
  */
-export function buildNativeCommand({ reviewLevel, target }) {
+export function buildNativeCommand({ reviewLevel, target, fix }) {
   const level = ["low", "medium", "high", "xhigh", "max"].includes(reviewLevel) ? reviewLevel : "max";
   const t = typeof target === "string" ? target.trim() : "";
-  return `/code-review ${level}${t ? ` ${t}` : ""}`;
+  // The built-in command parses its own flags anywhere in the argument string
+  // (--fix / --comment / --max-findings), verified in the binary; --fix applies
+  // the findings to the working tree, exactly what fix mode asks for.
+  return `/code-review ${level}${t ? ` ${t}` : ""}${fix ? " --fix" : ""}`;
 }
 
 /**
  * What the native command cannot know: our output contract, the language, the
- * read-only rule and the caller's focus. Delivered via --append-system-prompt.
+ * caller's focus and the read-only/fix boundary. Delivered via
+ * --append-system-prompt.
  */
 export function buildNativeAppendix({ outputLanguage, focus, postToPR, cwd, fix }) {
   const lines = [
@@ -241,8 +248,11 @@ export function buildNativeAppendix({ outputLanguage, focus, postToPR, cwd, fix 
     `Write the report in this language: ${outputLanguage}.`,
   ];
   if (cwd) lines.push(`Your working directory is already the repository root (${cwd}); run git commands there directly.`);
-  if (fix) lines.push("Do not modify any file: this run is read-only.");
-  else lines.push("Do not modify any file: this run is read-only.");
+  if (fix) {
+    lines.push("Fix mode is active: apply the fixes the command's fix phase produces with the Edit/Write tools (never git commit, never .git/, .env or secret files) and keep the fixes listed under \"## Fixes Applied\" in the final report.");
+  } else {
+    lines.push("Do not modify any file: this run is read-only.");
+  }
   lines.push(postToPR
     ? "After printing the report you may post it once to the PR with `gh pr comment`; nothing else may be written to GitHub."
     : "Do not post anything to GitHub.");
@@ -300,8 +310,8 @@ export function buildFollowupPrompt(message, outputLanguage) {
  * Read-only (review) tool allowlist for the headless run.
  * Under `--permission-mode manual` this is the hard boundary, so it must cover
  * everything the code-review pipeline touches: file reads, subagent dispatch,
- * skill loading, todo bookkeeping, and the git/gh READ commands the pipeline
- * (and its 5 reviewer subagents) invoke.
+ * todo bookkeeping, and the git/gh READ commands the pipeline (and its
+ * reviewer subagents) invoke.
  */
 export function reviewAllowedTools() {
   return [

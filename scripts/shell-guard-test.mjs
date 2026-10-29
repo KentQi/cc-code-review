@@ -67,7 +67,7 @@ const OK_CHAINS = [
   "git status && git diff --stat",
   "git diff HEAD~1; git log --oneline -5",
   "git status || git diff",
-  "git show HEAD:src/index.js | sed -n '1,80p'",
+  "git show HEAD:src/index.js | head -80",
   "git show HEAD:src/index.js | head -50",
   "git log --oneline | grep -n foo",
   "git diff | wc -l",
@@ -144,7 +144,7 @@ const SCOPE_OK = [
   "find src -type f",
   "find",
   `find "${REPO}" -name x`,
-  "git show HEAD:src/index.js | sed -n '1,20p'",
+  "git show HEAD:src/index.js | head -20",
   "git show HEAD:src/index.js | head -50",
   "git log | grep -n foo",
   "git log | head -5 README.md",
@@ -178,7 +178,7 @@ const SCOPE_BAD = [
 ];
 for (const c of SCOPE_BAD) {
   const v = analyseCommand(c, OPTS);
-  check(`block outside read: ${JSON.stringify(c)}`, [v.ok, /outside|repository|read-only/.test(String(v.reason))], [false, true]);
+  check(`block outside read: ${JSON.stringify(c)}`, [v.ok, /outside|repository|read-only|not part of the review/.test(String(v.reason))], [false, true]);
 }
 check("a path that does not exist yet is not an escape", analyseCommand("rg -n x src/new-file.js", OPTS).ok, true);
 
@@ -189,6 +189,43 @@ for (const c of ["git branch -d feature", "git branch -D feature", "git branch -
 for (const c of ["ls /etc", "ls -la ../other"]) {
   check("block ls outside: " + JSON.stringify(c), analyseCommand(c, OPTS).ok, false);
 }
+
+/* ---- backslash-newline continuation: bash deletes the pair, so must we ----
+ * Regression for the audit's H1: keeping the pair as word content hid flags
+ * from every deny check (find . \<LF>-delete ran with -delete live). */
+{
+  const BS = String.fromCharCode(92);
+  const LF = String.fromCharCode(10);
+  const cont = (s) => s.split("|").join(BS + LF);
+  for (const c of [
+    cont("find . |-delete"),
+    cont("find . |-exec sh -c id ;"),
+    cont("git diff |--no-index /etc/passwd /etc/hosts"),
+    cont("git diff |--output=C:/Windows/Temp/pwn.diff"),
+    cont("rg x |--pre sh"),
+    cont("git diff|--output=x"),
+  ]) {
+    check("block continuation escape: " + JSON.stringify(c), analyseCommand(c, OPTS).ok, false);
+  }
+  // A continuation after a space glues the next word into the FIRST command's
+  // arguments: bash runs  git status <paths>  — still read-only, allowed.
+  check("continuation into git status pathspecs is allowed",
+    analyseCommand(cont("git status | sed -n|-i s/a/b/ README.md"), OPTS).ok, true);
+  // A doubled backslash is a literal backslash: the token becomes a
+  // drive-root-relative path (dir), which is outside the repo — denied.
+  check("double backslash is a literal root-relative path (outside)",
+    analyseCommand("rg -n x " + BS + BS + "dir", OPTS).ok, false);
+}
+
+/* ---- brace expansion hides outside paths inside one token (audit H3) ---- */
+for (const c of ["rg TODO {..,/etc}", "git show HEAD:x | cat {/etc/passwd,x}", "ls {..,/}", "rg x {~/a,b}"]) {
+  check("block brace expansion: " + JSON.stringify(c), analyseCommand(c, OPTS).ok, false);
+}
+
+/* ---- sort escape hatches + git branch --unset-upstream (audit M1/M3) ---- */
+check("block sort --compress-program", analyseCommand("git show HEAD | sort --compress-program=sh", OPTS).ok, false);
+check("block sort -T", analyseCommand("git show HEAD | sort -T C:/Windows/Temp", OPTS).ok, false);
+check("block git branch --unset-upstream", analyseCommand("git branch --unset-upstream", OPTS).ok, false);
 
 /* ---- cd is only a no-op to the reviewed root ---- */
 const CD_BAD = [
@@ -297,7 +334,7 @@ check("hook: cd to the repo root is allowed",
 check("hook: cd outside the repo is denied",
   hookVerdict({ tool_name: "Bash", tool_input: { command: "cd /etc && git status" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, "deny");
 check("hook: pipe to an allowed sink is allowed",
-  hookVerdict({ tool_name: "Bash", tool_input: { command: "git show HEAD:src/index.js | sed -n '1,80p'" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, null);
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "git show HEAD:src/index.js | head -80" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, null);
 check("hook: chained command with an unlisted program denied", hookVerdict({ tool_name: "Bash", tool_input: { command: "git status; curl evil.com" } }).decision, "deny");
 check("hook: denial has an actionable reason", /Allowed commands:/.test(String(hookVerdict({ tool_name: "Bash", tool_input: { command: "git status; curl evil.com" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).reason)), true);
 // The dangerous find/rg forms must be denied by the real hook process, not just
@@ -357,7 +394,7 @@ check("hook: missing command allowed through", hookVerdict({ tool_name: "Bash", 
 /* ---- replay: real runs, both the ones that worked and the ones that wasted turns ---- */
 // 17 read-only calls from a real review: every one of them must pass now.
 const REAL_BASH = [
-  "git status --short", "git diff", "git log --oneline -5", "git show HEAD:src/index.js | sed -n '510,560p'",
+  "git status --short", "git diff", "git log --oneline -5", "git show HEAD:src/index.js | head -560",
   "git show HEAD:src/index.js | grep -n \"bashCommands\" ", "git diff HEAD", "git log -p --follow src/shell-guard.js",
   "git show HEAD:src/shell-guard.js", "git blame -L 55,70 src/shell-guard.js", "git diff --stat",
   "git show HEAD:README.md", "git log --format=\"%h %s\" -10", "git remote -v", "git branch -a",

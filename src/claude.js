@@ -1353,6 +1353,7 @@ export function runClaude({
       const dir = subagentsDir || path.join(os.tmpdir(), "cc-code-review");
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       subagentsFile = path.join(dir, `subagents-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}.jsonl`);
+      activeSubagentFiles.add(subagentsFile);
       return subagentsFile;
     };
     const appendRecord = (record) => {
@@ -1428,8 +1429,10 @@ export function runClaude({
         // back to the tail of output_file instead of recording an empty report.
         let report = n.report;
         let partial, recovery;
-        if (!report && n.outputFile) {
-          const rec = recoverReportFromTranscript(n.outputFile);
+        if (!report) {
+          // An empty summary with no outputFile of its own still has the ack's
+          // transcript path — audit F1: both recovery sources must be tried.
+          const rec = recoverReportFromTranscript(n.outputFile || dispatchOutputFiles.get(n.toolUseId));
           if (rec) { report = rec.report; partial = true; recovery = "output_file"; }
         }
         emitSubagent({
@@ -1514,7 +1517,25 @@ export function runClaude({
       // still left its work in the transcript file named by its launch ack or
       // notification. Salvage the tail so the tokens it spent are not wasted.
       for (const d of agentDispatches) {
-        if (notifiedReports.has(d.id)) continue;
+        const recorded = notifiedReports.get(d.id);
+        if (recorded) {
+          // Audit F1: an agent that notified with an EMPTY summary and no
+          // outputFile of its own never reaches the transcript otherwise — the
+          // ack's transcript still holds its paid-for tail.
+          if (!recorded.report) {
+            const rec = recoverReportFromTranscript(recorded.outputFile || dispatchOutputFiles.get(d.id));
+            if (rec) {
+              Object.assign(recorded, {
+                report: rec.report, partial: true, recovery: "output_file",
+                status: recorded.status || "stopped",
+                outputFile: recorded.outputFile || dispatchOutputFiles.get(d.id),
+              });
+              // The JSONL is an append-only journal: the correction is its own line.
+              appendRecord({ ...recorded, supersedes: true });
+            }
+          }
+          continue;
+        }
         const recovered = recoverReportFromTranscript(dispatchOutputFiles.get(d.id));
         emitSubagent({
           id: d.id, description: d.description, subagentType: d.subagentType,
@@ -1938,6 +1959,10 @@ export function repoRunsGitPrograms(repoPath) {
 }
 
 /** Cheap async git preflight: does the repo have commits / uncommitted work? */
+/** JSONL journals a live/finished job still references — retention must not
+ *  delete these while their result can still be read. Process-lifetime. */
+export const activeSubagentFiles = new Set();
+
 export async function gitPreflight(repoPath) {
   const run = (args) => execFileAsync("git", [...GIT_HARDENING_ARGS, ...args], gitSpawnOpts(repoPath))
     .then((r) => ({ ok: true, out: r.stdout }))
@@ -1953,5 +1978,7 @@ export async function gitPreflight(repoPath) {
   const status = await run(["status", "--porcelain"]);
   const dirty = status.ok && status.out.trim().length > 0;
   // status failing (not "empty") must surface its own error, not rev-parse's
-  return { hasCommits: false, dirty, gitError: !status.ok ? (status.err ?? head.err) : null };
+  // No HEAD at all (fresh repo): the native command targets a BASE ref, so the
+  // caller must treat this exactly like a root commit.
+  return { hasCommits: false, hasParent: false, dirty, gitError: !status.ok ? (status.err ?? head.err) : null };
 }

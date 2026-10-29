@@ -982,7 +982,14 @@ check("effort xhigh maps to review level max (same native playbook as max)", der
   const entry = written?.mcp?.servers?.["cc-code-review"] ?? {};
   check("init.mjs exits cleanly (0 ok / 2 self-check failures, never a crash)", [0, 2].includes(r.status), true);
   check("init.mjs replaces config.json atomically (new inode)", fs.statSync(cfgPath).ino !== inoBefore, true);
-  check("init.mjs keeps the credential file at 0600", (fs.statSync(cfgPath).mode & 0o777).toString(8), "600");
+  // NTFS has no POSIX mode bits: Windows protects this file with ACLs, and the
+  // 0600 request is documented as best-effort there (SECURITY.md). Assert the
+  // real permission bits on POSIX only; on Windows assert the file exists.
+  check("init.mjs keeps the credential file at 0600",
+    process.platform === "win32"
+      ? (fs.existsSync(cfgPath) ? "exists (NTFS ACLs)" : "missing")
+      : (fs.statSync(cfgPath).mode & 0o777).toString(8),
+    process.platform === "win32" ? "exists (NTFS ACLs)" : "600");
   check("init.mjs leaves no temp file behind", fs.readdirSync(cfgDir), ["config.json"]);
   check("init.mjs keeps user env keys and their values",
     [entry.env?.HTTP_PROXY, entry.env?.MY_KEY], ["http://proxy.local:8080", "keep-me"]);

@@ -218,6 +218,15 @@ const timeoutMs = prevObj?.timeoutMs ?? entry.timeoutMs;
 // added by hand (HTTP_PROXY, DISABLE_TELEMETRY, their own ANTHROPIC_*) are NOT
 // derived here — dropping them on every re-init silently broke working setups.
 // Merge: user keys outside the derived set survive, derived keys overwrite.
+//
+// SEC-16 verified contract (locked by the audit-fixes suite's init case):
+//   prevEnv = { HTTP_PROXY, MY_KEY, ANTHROPIC_AUTH_TOKEN: "old" }
+//   derivedEnv = { ANTHROPIC_AUTH_TOKEN: "new", ANTHROPIC_BASE_URL }
+//   mergedEnv = { HTTP_PROXY, MY_KEY, ANTHROPIC_AUTH_TOKEN: "new", ANTHROPIC_BASE_URL }
+// — unknown keys keep their VALUES (not just their names), and a same-named
+// derived key always wins because it is spread last. Do not "clean up" prevEnv
+// by filtering it against a known-key list: that is exactly what dropped
+// HTTP_PROXY in 1.6.x.
 const prevEnv = prevObj?.env && typeof prevObj.env === "object" && !Array.isArray(prevObj.env) ? prevObj.env : {};
 const derivedEnv = entry.env && typeof entry.env === "object" ? entry.env : {};
 const mergedEnv = { ...prevEnv, ...derivedEnv };
@@ -230,14 +239,36 @@ if (prevObj && prevObj.command === entry.command && JSON.stringify(prevObj.args)
   const dir = path.dirname(zcodeConfigPath);
   // The file carries the gateway credential in mcp.servers[].env, so it must not
   // be world-readable: 0600 for the file, 0700 for its directory (the default
-  // umask would leave a token in a 0644 file). chmod after the call because mode
-  // only applies when the file is CREATED.
+  // umask would leave a token in a 0644 file).
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(dir, 0o700); } catch { /* pre-existing dir we do not own */ }
+  // SEC-16: write atomically — same-directory temp file + fsync + rename.
+  //
+  // The old code did writeFileSync(configPath), which truncates the live file
+  // before writing a single byte. ZCode (and every other MCP host) re-reads this
+  // file while the server runs, so a crash / ENOSPC / full disk between the
+  // truncate and the last byte leaves an unparsable config.json — and a parse
+  // failure in that file takes out every server it lists, not just this one.
+  // A rename on the same filesystem is atomic: readers see either the complete
+  // old file or the complete new one, never a partial one. The temp name is
+  // unique per process so two concurrent installers cannot clobber each other,
+  // and it is cleaned up on every failure path below.
+  const tmpPath = path.join(dir, `.config.json.${process.pid}.${Date.now()}.tmp`);
   try {
-    fs.writeFileSync(zcodeConfigPath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
-    try { fs.chmodSync(zcodeConfigPath, 0o600); } catch { /* best effort */ }
+    // mode 0600 at creation (this file holds a token even before the chmod).
+    const fd = fs.openSync(tmpPath, "w", 0o600);
+    try {
+      fs.writeFileSync(fd, JSON.stringify(config, null, 2) + "\n");
+      // fsync before the rename: rename publishes the directory entry, so the
+      // bytes must already be on disk or a power loss can publish an empty file.
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    try { fs.chmodSync(tmpPath, 0o600); } catch { /* best effort; mode was set at open */ }
+    fs.renameSync(tmpPath, zcodeConfigPath);
   } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch { /* never created / already gone */ }
     bad(`cannot write ${zcodeConfigPath} (${e?.message || e}) — the file may be read-only or locked; nothing was written`);
     process.exit(1);
   }

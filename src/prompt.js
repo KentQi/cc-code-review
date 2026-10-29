@@ -26,7 +26,11 @@ import { readFileSync } from "node:fs";
 import { bashAllowRules } from "./shell-guard.js";
 import { bundledSkillFile } from "./skill.js";
 
-/** Fallback thinking keywords when the CLI lacks --effort (low..max). */
+/**
+ * Fallback thinking keywords when the CLI lacks --effort. The effort levels
+ * themselves are defined once, by the zod enum on the tool in index.js
+ * (low/medium/high/xhigh/max); this table only has to cover them.
+ */
 const EFFORT_KEYWORDS = {
   low: "",
   medium: "think",
@@ -35,17 +39,25 @@ const EFFORT_KEYWORDS = {
   max: "ultrathink",
 };
 
-export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
-
 /**
  * The review's OWN depth level — the third knob next to the CLI reasoning
  * effort and ultracode. claude's native /code-review command takes this
  * argument (`/code-review low|medium|high|xhigh|max`), and each level selects
- * one of its playbooks (verbatim from the binary, see finderFleetRule below).
- * xhigh shares the max playbook in claude's code (`ao = ro("xhigh"),
- * lo = ro("max")` — same factory), so effort=xhigh maps to reviewLevel max.
+ * one of its playbooks (see finderFleetRule below for how this server fills
+ * the same levels).
+ *
+ * xhigh maps to max on purpose: claude builds both levels from the same
+ * playbook (`ao = ro("xhigh"), lo = ro("max")`), so there is no separate
+ * xhigh fleet. What that means for this server (audit P3-7):
+ *  - `effort=xhigh` and `effort=max` both derive reviewLevel max;
+ *  - at pipeline=auto, reviewLevel max selects the FLEET pipeline, so an
+ *    effort=xhigh run never executes the native `/code-review` command;
+ *  - the native command, when forced with pipeline=native, is only ever
+ *    invoked for low..high, and even then it receives the derived level
+ *    ("max", never "xhigh" — we never pass the effort value through).
+ * The README used to describe the native path as covering "low..xhigh" and
+ * "fix mode", which contradicted this mapping (fixed in 1.18.4).
  */
-export const REVIEW_LEVELS = ["low", "medium", "high", "max"];
 export function deriveReviewLevel(effort) {
   switch (effort) {
     case "max":
@@ -58,31 +70,62 @@ export function deriveReviewLevel(effort) {
 }
 
 /**
- * The reviewer-fleet structure, read verbatim out of claude 2.1.311's own
- * code-review playbooks (claude.exe: `ro("max")` for max/xhigh, `no()` for
- * medium, `to()` for low):
+ * The reviewer-fleet shape for a review level.
  *
- *   medium/high : "3+5 angles x 6 candidates -> 1-vote verify"
- *   max / xhigh : "5+5 angles x 8 candidates -> 1-vote verify -> sweep"
- *   low         : one diff pass, no subagents
+ * ONE set of numbers, shared by this prompt, the tool schema in index.js, the
+ * README and the bundled SKILL.md — they must not drift (audit P2-2):
+ *
+ *   low         : one diff pass, no subagents, at most 4 findings
+ *   medium/high : 8 finders  ("3+5") x up to 6 candidates each, cap 8 findings
+ *   max / xhigh : 10 finders ("5+5") x up to 8 candidates each, cap 15 findings
+ *   every fleet : one verifier per surviving candidate + 1 sweep finder
+ *
+ * How the slots are filled: the bundled playbook defines FIVE briefs (#1
+ * conventions, #2 bug scan, #3 git history, #4 previous PRs, #5 in-code
+ * comments), and five of the finder slots run those briefs one-for-one. The
+ * remaining 3 (medium/high) or 5 (max) slots split a brief across file groups —
+ * never a new angle. So the native header's counts come out as "5 briefs + 3
+ * extra finders = 8" and "5 + 5 = 10" (at max every brief runs twice).
+ *
+ * An earlier version described a correctness/cleanup/altitude/conventions
+ * taxonomy that the bundled playbook never defined, which left cleanup and
+ * altitude with no brief to attach to and made the fan-out
+ * unreproducible; it also claimed the structure was copied out of claude's
+ * binary — a claim this environment cannot verify (the binary on hand is
+ * 2.1.133) and that the bundled playbook contradicts. The numbers are what is
+ * actually shared; the brief assignment is ours.
  *
  * `finders` is phase 1's finder count. Phase 2 runs ONE verifier per surviving
  * candidate and phase 3 adds one sweep finder, so a max review legitimately
- * exceeds 15 agents without any hard-coded total. (The separate "about
- * clamp(2..8, lines/150) finders" string in the binary is a hint injected only
- * for the claude-sonnet-5 family at high+, not a universal rule.)
+ * exceeds 15 agents without any hard-coded total.
  */
 export function finderFleetRule(reviewLevel) {
-  // `angles` mirrors the native playbook's own composition header verbatim:
-  // medium/high "3+5" (correctness+cleanup+altitude+conventions = 8),
-  // max/xhigh "5+5" (same taxonomy at 5 correctness = 10).
+  const BRIEFS =
+    "5 briefs (#1 conventions, #2 bug scan, #3 git history, #4 previous PRs, #5 in-code comments)";
+  const SPLIT_3 =
+    `${BRIEFS}, with #1, #2 and #3 each split across file groups (+3 finders — the "3+5" shape = 8)`;
+  const SPLIT_5 =
+    `${BRIEFS}, with every brief split across file groups (+5 finders — the "5+5" shape = 10, each brief runs twice)`;
   const table = {
     low: { finders: 0, candidates: 0, cap: 4, angles: "one careful diff pass" },
-    medium: { finders: 8, candidates: 6, cap: 8, angles: "3 correctness angles + 3 cleanup angles + 1 altitude angle + 1 conventions angle" },
-    high: { finders: 8, candidates: 6, cap: 8, angles: "3 correctness angles + 3 cleanup angles + 1 altitude angle + 1 conventions angle" },
-    max: { finders: 10, candidates: 8, cap: 15, angles: "5 correctness angles + 3 cleanup angles + 1 altitude angle + 1 conventions angle" },
+    medium: { finders: 8, candidates: 6, cap: 8, angles: SPLIT_3 },
+    high: { finders: 8, candidates: 6, cap: 8, angles: SPLIT_3 },
+    max: { finders: 10, candidates: 8, cap: 15, angles: SPLIT_5 },
   };
   return table[reviewLevel] ?? table.max;
+}
+
+/**
+ * A bounded, single-line rendering of caller input for an error message.
+ *
+ * The rejected value is CALLER DATA: it reaches a human/LLM transcript, so it
+ * is truncated (a 400-char ref should not become a wall of text) and
+ * JSON-escaped (a newline must not fabricate a second log line or a second
+ * prompt bullet). Never interpolate the raw value (audit P3-2).
+ */
+function quotedInput(value, max = 60) {
+  const s = String(value);
+  return JSON.stringify(s.length > max ? `${s.slice(0, max)}…` : s);
 }
 
 /**
@@ -111,14 +154,14 @@ export function validateBaseRef(ref) {
   if (!ref) return { ok: true, ref: undefined };
   const s = String(ref).trim();
   if (!s) return { ok: true, ref: undefined };
-  if (s.length > 200) return { ok: false, error: "baseRef must be a short ref name (<= 200 chars)" };
+  if (s.length > 200) return { ok: false, error: `baseRef must be a short ref name (<= 200 chars; got ${s.length})` };
   // Before the charset check, so the original leading-"-" diagnosis (the git
   // --output=<file> write) keeps its dedicated, actionable message.
   if (s.startsWith("-")) {
     return {
       ok: false,
       error:
-        `baseRef must not start with "-" (got ${JSON.stringify(ref)}): it would be parsed as a git option ` +
+        `baseRef must not start with "-" (got ${quotedInput(ref)}): it would be parsed as a git option ` +
         `(e.g. git merge-base --output=<file> HEAD writes a file) instead of as a ref. Pass the plain name, e.g. "main".`,
     };
   }
@@ -126,7 +169,7 @@ export function validateBaseRef(ref) {
     return {
       ok: false,
       error:
-        `baseRef must be a single ref name with no whitespace (got ${JSON.stringify(ref)}). ` +
+        `baseRef must be a single ref name with no whitespace (got ${quotedInput(ref)}). ` +
         `It is appended to claude's "/code-review <level> <target>" command, where claude parses flags anywhere in the string: ` +
         `"main --fix" would enable fix mode and "main --comment" would post to the PR instead of naming a base ref. ` +
         `Pass just the branch/tag, e.g. "main".`,
@@ -136,7 +179,7 @@ export function validateBaseRef(ref) {
     return {
       ok: false,
       error:
-        `baseRef must be a plain git ref — letters, digits, ".", "_", "/", "@", "^", "~", "-" (got ${JSON.stringify(ref)}). ` +
+        `baseRef must be a plain git ref — letters, digits, ".", "_", "/", "@", "^", "~", "-" (got ${quotedInput(ref)}). ` +
         `It is interpolated into claude's /code-review command and into the reviewer's suggested git commands, so any other ` +
         `character (shell metacharacters, quotes, "{}", ":") is refused. Use the ref as git spells it, e.g. "main", "origin/release-1.2", "v1.2.3", "HEAD~1".`,
     };
@@ -145,11 +188,28 @@ export function validateBaseRef(ref) {
     return {
       ok: false,
       error:
-        `baseRef must be a single ref, not a revision range (got ${JSON.stringify(ref)}): ".." and "..." are range operators, ` +
+        `baseRef must be a single ref, not a revision range (got ${quotedInput(ref)}): ".." and "..." are range operators, ` +
         `and the prompt already writes them around the value (git diff <ref>...HEAD). Pass the base side only, e.g. "main".`,
     };
   }
   return { ok: true, ref: s };
+}
+
+/**
+ * Shape-only description of a rejected ref: the value itself never reaches the
+ * prompt. The prompt is a command-looking context — echoing the caller's bytes
+ * back into it (even JSON-quoted) is how "--output=<file>" or a newline-shaped
+ * string turns into an instruction (audit P3-2). The actionable message, with
+ * the (bounded, escaped) value, is returned to the CALLER by validateBaseRef.
+ */
+function refShape(raw) {
+  const s = String(raw);
+  const traits = [];
+  if (s.startsWith("-")) traits.push("starts with a dash");
+  if (/\s/.test(s)) traits.push("contains whitespace");
+  if (s.includes("..")) traits.push("contains '..'");
+  if (!/^[\x20-\x7e]*$/.test(s)) traits.push("contains non-printable/non-ASCII characters");
+  return `<${s.length} chars${traits.length ? ", " + traits.join(", ") : ""}>`;
 }
 
 function sanitizeBaseRef(baseRef) {
@@ -160,10 +220,9 @@ function sanitizeBaseRef(baseRef) {
   // prompt and returns the actionable error there, so through the tool an
   // invalid ref never reaches this line. If a future caller skips that
   // preflight, do NOT silently substitute the default branch: the note travels
-  // with the prompt and says the requested base was not used (the detailed
-  // rule stays in the preflight error, not in the prompt — the prompt must not
-  // carry option-shaped strings into a command-looking context).
-  return { ref: undefined, note: `\n- (baseRef ${JSON.stringify(String(baseRef))} ignored: only a single plain git ref is accepted)` };
+  // with the prompt and says the requested base was not used — but only by its
+  // SHAPE, never its content.
+  return { ref: undefined, note: `\n- (baseRef "${refShape(baseRef)}" ignored: only a single plain git ref is accepted)` };
 }
 
 function scopeDescription(scope, pr, baseRefIn) {
@@ -193,15 +252,29 @@ function scopeDescription(scope, pr, baseRefIn) {
       return { text: `the most recent commit (\`git show HEAD\`, i.e. HEAD~1..HEAD).`, suffix };
     case "auto":
     default:
+      // ONE order, shared by the tool schema, the native path (index.js
+      // nativeTarget: caller-named PR -> base ref -> no target) and the bundled
+      // SKILL.md: a caller-named PR, then the branch range, then the working
+      // tree, then the last commit. The old text put "the current PR if the
+      // branch's upstream is a GitHub PR" first and the bundled playbook put
+      // the working tree first, so one prompt carried two opposite priorities
+      // and the same repository could be reviewed as a PR or as a dirty tree
+      // depending on which paragraph the model followed (audit P2-12).
+      if (pr) {
+        return {
+          text: `the target you choose yourself (decide in this order — the FIRST one that applies wins): (1) the GitHub pull request ${pr}, because the caller named it; (2) the commits on the current branch ahead of the default branch; (3) uncommitted changes (staged or unstaged); (4) the most recent commit. If both the PR and local changes exist, review the PR and say what you did about the local changes. State which target you picked at the top of your report.`,
+          suffix,
+        };
+      }
       return {
-        text: `decide the review target yourself, in this order: (1) ${pr ? `the GitHub pull request ${pr}` : "the current PR if the branch's upstream is a GitHub PR"}; (2) if the current branch has commits ahead of the default branch, that range's combined diff; (3) if there are uncommitted changes (staged or unstaged), those; (4) otherwise the most recent commit. State which target you picked at the top of your report.`,
+        text: `the target you choose yourself (decide in this order — the FIRST one that applies wins): (1) the commits on the current branch ahead of the default branch (detect the default branch with \`git rev-parse --abbrev-ref origin/HEAD\`, falling back to \`git remote show origin\`); (2) uncommitted changes (staged or unstaged) and the full content of new untracked files; (3) the most recent commit (\`git show HEAD\`). The caller named no PR, so do not substitute one. State which target you picked at the top of your report.`,
         suffix,
       };
   }
 }
 
 /**
- * THE report contract, shared verbatim by every prompt path (fleet prompt,
+ * THE report contract, shared word-for-word by every prompt path (fleet prompt,
  * native appendix, fallback prompt). This is the fenced block from step
  * "Final report" of assets/skills/code-review/SKILL.md, which is the single
  * source of truth.
@@ -288,11 +361,13 @@ export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, p
       // one verifier per surviving candidate, phase 3 a sweep finder.
       lines.push(
         `- Reviewer fleet (level ${reviewLevel}, same structure as claude's native playbook): ` +
-        `PHASE 1 — dispatch ALL ${finders} finder subagents in ONE message (that many Agent tool calls in the SAME reply) using the Agent tool's background/async mode (run_in_background: true — the 2.1.x default), so the whole fleet runs concurrently and you are not blocked; never one per turn, never a foreground agent that blocks the rest. The angle set is ${angles}; on a large diff split an angle across files instead of adding new ones; each finder returns up to ${candidates} candidates as {file, line, summary, failure_scenario}. ` +
-        `PHASE 2 — dedup candidates that point at the same line/mechanism, then run ONE verifier subagent per surviving candidate (give it the diff, the file, and the claim); send each batch of verifiers in ONE message too; a verifier answers CONFIRMED, PLAUSIBLE or REFUTED with the evidence; keep CONFIRMED and PLAUSIBLE. ` +
+        `PHASE 1 — dispatch ALL ${finders} finder subagents in ONE message (that many Agent tool calls in the SAME reply) using the Agent tool's background/async mode (run_in_background: true — the 2.1.x default), so the whole fleet runs concurrently and you are not blocked; never one per turn, never a foreground agent that blocks the rest. Angle mix: ${angles}; on a large diff split a brief across files instead of inventing a new angle; each finder returns up to ${candidates} candidates as {file, line, summary, failure_scenario}. ` +
+        `PHASE 2 — dedup candidates that point at the same line/mechanism, then keep at most 20 candidates (drop the least severe first — every verifier is a turn out of the run's budget) and run ONE verifier subagent per surviving candidate (give it the diff, the file, and the claim); send each batch of verifiers in ONE message too; a verifier answers CONFIRMED, PLAUSIBLE or REFUTED with the evidence; keep CONFIRMED and PLAUSIBLE. ` +
+        `Score the survivors on the playbook's 0/25/50/75/100 scale: CONFIRMED = 85-100, PLAUSIBLE = 75-84 (the 75 anchor: real and important, hit in practice), REFUTED = 0 and dropped — so "keep CONFIRMED and PLAUSIBLE" and the "keep >= 75" filter select exactly the same findings. ` +
         `PHASE 3 — one more finder subagent as a fresh reviewer that sees the verified list and looks ONLY for gaps. ` +
         `That is ${finders} finders + one verifier per surviving candidate + 1 sweep, so a max-level review legitimately runs 15+ subagents in total. ` +
-        `If the Agent tool is unavailable, do every angle and every verification yourself, sequentially, instead of erroring. ` +
+        `Budget: the run has a hard turn cap (maxTurns, 80 by default) and a wall-clock timeout. If the diff is huge — more than ~40 changed files or ~3000 changed lines — do NOT grow the fleet: read the diff inline yourself, one pass per brief, and spend subagents only on the highest-yield briefs. An oversized fleet ends in error_max_turns with no report at all; a complete inline pass beats a truncated fleet run. ` +
+        `If the Agent tool is unavailable, do every brief and every verification yourself, sequentially, instead of erroring. ` +
         `Report at most ${cap} findings, most severe first.`,
       );
     }
@@ -393,9 +468,16 @@ export function buildNativeAppendix({ outputLanguage, focus, postToPR, cwd, fix 
 }
 
 /**
- * Fallback review prompt used when the code-review skill is NOT installed and
- * auto-install is disabled: a condensed, sequential version of the same
- * pipeline (5 review lenses + confidence filter) without subagent fan-out.
+ * Condensed, single-agent version of the same pipeline (5 lenses + the >= 75
+ * confidence filter) with no subagent fan-out.
+ *
+ * NOT on the runtime path: index.js builds either the native appendix or
+ * buildReviewPrompt, whose pipeline travels in the prompt, and no production
+ * caller selects this function. It is kept because
+ * scripts/audit-fixes-test.mjs locks its report contract and because it is the
+ * readable statement of the degraded procedure (audit P2-5 deferred the
+ * deletion to a test refactor — the old docstring claiming this was the
+ * auto-install-disabled path was fiction).
  */
 export function buildFallbackPrompt({ scope, pr, baseRef, focus, outputLanguage, fix, effort, useEffortFlag, cwd }) {
   const { text: scopeText, suffix: scopeSuffix } = scopeDescription(scope, pr, baseRef);
@@ -410,10 +492,12 @@ export function buildFallbackPrompt({ scope, pr, baseRef, focus, outputLanguage,
   lines.push(`1. Establish the diff and the changed-file list.`);
   lines.push(`2. Read the CLAUDE.md / AGENTS.md files (repo root + directories of changed files) that govern the changed code.`);
   lines.push(`3. Review through five lenses: (a) convention compliance vs those files — quote the exact instruction violated; (b) shallow bug scan of the diff itself — large bugs only, no nitpicks; (c) git history (\`git log -p --follow\`, \`git blame\`) — does the change break deliberately-introduced earlier behavior; (d) for GitHub repos, previous merged PRs touching these files (\`gh pr list --state all --search "<file>"\`) — do old review comments apply again; (e) in-code comments near changed lines (TODO/HACK/WARNING/guidance) — does the change comply.`);
-  lines.push(`4. Score every candidate finding 0-100 confidence: 0=false positive or pre-existing; 25=might be real; 50=real but nitpick/rare; 75=real, important, hit in practice or explicitly required by CLAUDE.md; 100=certain, frequent, evidence confirms.`);
+  lines.push(`4. Score every candidate finding 0-100 confidence: 0=refuted false positive or pre-existing; 25=might be real; 50=real but nitpick/rare; 75=real, important, hit in practice or explicitly required by CLAUDE.md; 100=certain, frequent, evidence confirms. A finding you can tie to a concrete failing scenario is CONFIRMED (85-100); one that is real but you cannot reproduce is PLAUSIBLE (75-84).`);
   // The anchors above are 0/25/50/75/100, where 75 is "real, important, will
   // be hit in practice" — a ">= 80" filter discarded exactly that bucket, so
-  // only 100s survived. 75 is the only threshold consistent with the scale.
+  // only 100s survived (audit P2-3). 75 is the only threshold consistent with
+  // the scale, and it is the same line the fleet path draws: CONFIRMED
+  // (85-100) and PLAUSIBLE (75-84) survive, REFUTED (0) does not.
   lines.push(`5. Keep only findings >= 75. Drop: pre-existing issues, pedantic nitpicks, anything a linter/typechecker/CI would catch, generic "needs tests/docs" (unless CLAUDE.md requires it), issues on lines the change did not touch.`);
   if (fix) {
     lines.push(`6. FIX MODE: after the report, apply minimal fixes to the repository files with the Edit/Write tools (never shell redirection such as \`cat > f\` / \`sed -i\` / \`node -e\` — those are denied by the permission allowlist) for every confirmed finding that does not require a business decision. Do NOT git commit. Never write inside .git/ or into .env / secret / key files. Append a "## Fixes Applied" section (file, what changed, which finding).`);
@@ -437,11 +521,19 @@ export function buildFallbackPrompt({ scope, pr, baseRef, focus, outputLanguage,
   return lines.filter((l) => l != null).join("\n");
 }
 
+/**
+ * The followup session is read-only by construction: index.js grants
+ * reviewAllowedTools() and denies Edit/Write (reviewDisallowedTools({fix:false})),
+ * so no wording in the prompt can enable a fix here. The old text promised
+ * "you must not modify it unless the message explicitly asks for a fix" — a
+ * path the session cannot honour, which made a fix request burn turns on
+ * denied Edit calls (audit P3-4). Offer the patch instead.
+ */
 export function buildFollowupPrompt(message, outputLanguage) {
   return [
     message,
     "",
-    `(Context: you are the review engine behind an MCP tool; answer in ${outputLanguage}, concise markdown, as your final message. Stay in review-engineer role: you may read the repository but must not modify it unless the message explicitly asks for a fix, and never run git write commands or post to GitHub.)`,
+    `(Context: you are the review engine behind an MCP tool; answer in ${outputLanguage}, concise markdown, as your final message. Stay in review-engineer role: you can read the repository (Read/Grep/Glob and the read-only git/gh commands), but this session has no write tools, so you must not modify it. If the message asks for a fix, describe the exact patch — file:line plus the code — and say it needs a fix-mode review (claude_code_review with fix=true) or a manual edit to be applied. Never run git write commands or post to GitHub.)`,
   ].join("\n");
 }
 
@@ -517,6 +609,11 @@ export function fixDisallowedTools() {
     "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx", "**/*.keystore", "**/*.jks",
     "**/id_rsa*", "**/id_dsa*", "**/id_ecdsa*", "**/id_ed25519*",
     "**/.ssh/**", "**/.aws/**", "**/.gnupg/**", "**/.netrc", "**/.pgpass",
+    // Self-review (repo == this package): writing the guard files would disarm
+    // every later run — the hook enforces the same two root-relative paths
+    // (SEC-15); the globs are the permission-engine half of that rule.
+    "scripts/pre-tool-hook.js", "**/scripts/pre-tool-hook.js",
+    "src/shell-guard.js", "**/src/shell-guard.js",
   ];
   return fileRules.flatMap((r) => [`Edit(${r})`, `Write(${r})`, `NotebookEdit(${r})`]);
 }

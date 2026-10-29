@@ -25,12 +25,17 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // deleting it must turn the gate red — it is the only regression cover for the
 // ANSI-C / glued-short-option / repo-supplied git driver / execution-config P0s
 // (audit P1-4).
+// pack-test is REQUIRED too (audit Q15): it packs the real tarball and runs the
+// extracted copy. Without it, narrowing package.json#files could drop
+// scripts/pre-tool-hook.js or assets/skills/... and every checkout test would
+// stay green while users could not run a single review.
 const SUITES = [
   { name: "shell-guard", script: "scripts/shell-guard-test.mjs" },
   { name: "audit-fixes", script: "scripts/audit-fixes-test.mjs" },
   { name: "p0-regression", script: "scripts/p0-regression-test.mjs" },
   { name: "smoke", script: "scripts/smoke-test.mjs" },
   { name: "validation", script: "scripts/validation-test.mjs" },
+  { name: "pack", script: "scripts/pack-test.mjs" },
   { name: "cross-cases", script: "scripts/cross-cases.mjs" },
 ];
 

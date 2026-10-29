@@ -6,10 +6,10 @@
 
 [English](README.en.md) | 简体中文
 
-**EN**: An MCP server that calls Claude Code's own `/code-review` (low..xhigh, including `--fix`) or runs a fleet pipeline with the same three-phase structure claude's playbook uses (8/10 parallel finder subagents, one verifier per surviving candidate, one sweep finder; findings ≥ 80 of 0–100). Reviews — PR / branch / working dir / last commit, effort `low→max` — from ZCode or any MCP client, full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI. Nothing is installed into Claude Code.
+**EN**: An MCP server that calls Claude Code's own `/code-review` (low..high, including `--fix`) or runs a fleet pipeline or runs a fleet pipeline with the same three-phase structure claude's playbook uses (8/10 parallel finder subagents, one verifier per surviving candidate, one sweep finder; findings ≥ 75 of 0–100). Reviews — PR / branch / working dir / last commit, effort `low→max` — from ZCode or any MCP client, full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI. Nothing is installed into Claude Code.
 
 把 **Claude Code 的 code review 能力**封装成 MCP server，让 ZCode（或任何 MCP 客户端）直接调用：
-ZCode → MCP → `claude -p`（headless）→ claude 内置 /code-review（low..xhigh，含 --fix）或内联舰队流水线（max：10 finder + 每候选 verifier + sweep）→ 审查报告原样返回给 ZCode → ZCode 根据报告改代码 → 再次调用复核。
+ZCode → MCP → `claude -p`（headless）→ claude 内置 /code-review（low..high，含 --fix）或内联舰队流水线（max：10 finder + 每候选 verifier + sweep）→ 审查报告原样返回给 ZCode → ZCode 根据报告改代码 → 再次调用复核。
 
 ```
 ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --output-format stream-json
@@ -86,19 +86,19 @@ npm run init
 | `scope` | `auto` | 5 选 1 | `auto` / `pr` / `branch` / `working-dir` / `last-commit`；auto 按 PR → 领先默认分支的提交 → 未提交改动 → 上一条提交 自动判断 |
 | `pr` | - | - | GitHub PR 编号或 URL |
 | `baseRef` | - | 纯 ref 字符 | `branch` 范围的基线（缺省自动探测默认分支；非法字符会被忽略） |
-| `focus` | - | - | 额外关注点（仅作为评审提示，不会被当作指令执行） |
+| `focus` | - | - | 额外关注点（仅作为评审提示，不会被当作指令执行；**必须单行**） |
 | `outputLanguage` | `中文` | - | 报告语言 |
 | `postToPR` | `false` | - | 额外用 `gh pr comment` 把摘要贴回 PR（默认只返回报告，不外发） |
 | `fix` | `false` | - | **修复模式**：报告后直接修改仓库文件修复 findings（只放开 Edit/Write，**无任何 git 写命令**，不 commit；`.git/**`、`.env*`、密钥文件均在 deny 列表，实测拦截有效） |
 | `effort` | `max` | low/medium/high/xhigh/max | **模型推理力度**，与 Claude Code 原生 `--effort` 同档位；默认 max（最深、最慢、最贵），想快想省就显式传 `low`/`medium`；CLI 不支持时自动退化为 think/ultrathink 关键词（两者不会叠加） |
-| `reviewLevel` | 由 `effort` 派生 | low/medium/high/max | **评审自身深度**（同原生 `/code-review low\|high\|max` 的参数）。舰队结构逐字对齐原生 playbook：low = 单遍无子代理（≤4 findings）；medium/high = **8 个 finder**（3+5 角度 × 6 候选）；max = **10 个 finder**（5+5 角度 × 8 候选）+ **每个存活候选 1 个 verifier**（CONFIRMED/PLAUSIBLE/REFUTED）+ **1 个 sweep finder**，findings 上限 15。max 的总代理数是结构性的 15+（实测 17），不是硬编码数字 |
+| `reviewLevel` | 由 `effort` 派生 | low/medium/high/max | **评审自身深度**（同原生 `/code-review low\|high\|max` 的参数）。舰队结构与原生 playbook 同为三阶段（finder → 每存活候选 1 个 verifier → sweep），数字与 prompt/SKILL.md 同一套：low = 单遍无子代理（≤4 findings）；medium/high = **8 个 finder**（"3+5" 形态：5 个 brief + 3 个拆分 finder，× 6 候选，findings 上限 8）；max = **10 个 finder**（"5+5" 形态：每个 brief 拆两次，× 8 候选）+ **每个存活候选 1 个 verifier**（CONFIRMED/PLAUSIBLE/REFUTED）+ **1 个 sweep finder**，findings 上限 15。max 的总代理数是结构性的 15+（实测 17），不是硬编码数字 |
 | `ultracode` | `false` | - | **Ultracode 模式**：通过 `--settings` 写入 `ultracode: true`，启用原生"常驻动态工作流编排"（每个实质任务走 Workflow 工具、多代理、不计 token 成本）；与 effort 正交；旧版 CLI 忽略该键（结果里的 `workflow_runs` 显示是否真正生效） |
 | `model` | - | - | 覆盖模型（`--model` 透传） |
 | `maxTurns` | `80` | 4–200 | agentic 轮数上限 |
 | `timeoutMinutes` | `30` | 1–60 | 硬超时——不设费用上限时它是唯一的总闸；触发时已完成的子代理报告照样返回 |
 | `maxBudgetUsd` | `0`（不设上限） | 0–50 | API 花费上限（`--max-budget-usd`）。**默认 0 = 任何 effort 级别都不设费用上限**：上限会在父代理综合前截停运行，而每个完成的子代理报告都已增量落盘、429 打断的子代理会从 output_file 转录抢救，设上限只会白扔已付费的工作；兜底 guards 是 `timeoutMinutes` 与 `maxTurns`。仍可显式设值；env `CLAUDE_REVIEW_MAX_BUDGET_USD` 只改默认值，显式传参优先 |
-| `pipeline` | `auto` | auto / native / fleet / skill | 评审引擎。**auto**：level 为 low..xhigh（含 fix——走命令自带 `--fix`）时直接用 claude 内置的 `/code-review`（无需任何文件）；仅 max 改用本 MCP 的舰队流水线（理由见下）。**native** 强制内置命令；**fleet** 强制内联舰队（指令写在 prompt 里）；**skill** 为兼容旧行为（唯一会往 `~/.claude` 写文件的模式） |
-| `installSkillIfMissing` | `false` | - | 仅在 `pipeline=skill` 时有意义：skill **缺失**时安装（默认不装——缺失时退化走内联舰队流水线；已存在且由本 MCP 管理的副本在实际使用前自动刷新；用户自建的副本永不触碰） |
+| `pipeline` | `auto` | auto / native / fleet / skill | 评审引擎。**auto**：level 为 low..high（含 fix——走命令自带 `--fix`）时直接用 claude 内置的 `/code-review`（无需任何文件）；max（以及映射到 max 的 effort=xhigh）、scope=last-commit 无父提交、或存在同名 skill 遮蔽内置命令时改用本 MCP 的舰队流水线（理由见下）。**native** 强制内置命令；**fleet** 强制内联舰队（指令写在 prompt 里）；**skill** 为兼容旧行为（唯一会往 `~/.claude` 写文件的模式） |
+| `installSkillIfMissing` | `false` | - | 仅在 `pipeline=skill` 时有意义：skill **缺失**时安装（默认不装——缺失时退化走内联舰队流水线；已存在且由本 MCP 管理的副本在实际使用前自动刷新；带本 MCP marker 的副本会在使用前自动刷新（对其本地改动会被覆盖）；无 marker 的用户副本永不写入、永不被删除；uninstall 只删本 MCP 写的文件） |
 
 返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（`## Code Review Summary` / `## Findings (N)` / `## Notes`，与随包 SKILL.md 同一份格式合同）+ 每个评审子代理各自的报告（`## Reviewer subagent reports`，数量随 diff 规模而定）+ 元数据（`session_id`、花费、轮数、日志路径、模型溯源）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
 
@@ -120,7 +120,8 @@ Claude Code 2.1.x **自带** `code-review` 技能（`/code-review [level] [targe
 
 | level | 默认走哪条 | 原因（实测 2.1.311） |
 |---|---|---|
-| low / medium / high / xhigh | **内置 `/code-review`** | 单上下文、按"角度"逐个精读，10 秒级完成，零安装；fix 模式走命令自带的 `--fix`（二进制实测） |
+| low / medium / high | **内置 `/code-review`** | 单上下文、按"角度"逐个精读，10 秒级完成，零安装；fix 模式走命令自带的 `--fix`（二进制实测） |
+| xhigh（映射到 max） | **本 MCP 舰队** | 与 max 同一条舰队流水线（xhigh 只是把 reviewLevel 映射到 max） |
 | max | **内联舰队流水线** | 内置 max 会派子代理，而子代理爱写 `cd X && ls && git config …` 这类复合/越界命令，被 manual 模式成片拒绝（实测 100 次 denial、5 分钟不收敛）；舰队提示词则明确约束在只读面内 |
 | `last-commit` 且 HEAD 无父提交 | 内联舰队流水线 | 内置命令的 target 是**基线 ref**（`HEAD~1`），root commit 或空仓库没有父提交 |
 
@@ -196,9 +197,9 @@ hook 没装上、`guardSelfTest()` 自检失败（hook 真的能拦下一条链�
 | `repoPath` | 必须是 git/hg/svn 仓库 | 所有 scope 都读 git 历史，非仓库只会得到一次注定失败的付费调用 |
 | 空仓库 | 无提交且无未提交改动 → 直接报错 | 没什么可审 |
 | `pr` | 只接受 `123` / `#123` / `owner/repo#123` / GitHub PR URL | 该值会拼进评审提示词 |
-| `outputLanguage` | 单行、≤40 字符、无反引号 | 同上，防止夹带指令 |
+| `outputLanguage` | 单行、≤20 字符、无反引号、无句末标点 | 防止夹带指令；语言名足够短（中文/English/English (US)） |
 | `baseRef` | 纯 ref 字符，且不接受以 `-` 开头 | 会拼进 `git merge-base <ref>`；以 `-` 开头会被 git 当成旗标（`git merge-base --output=<file>` 还会写文件），因此直接拒绝而不是"忽略" |
-| `focus` | 单行、≤2000 字符、拒绝控制字符 | 同上 |
+| `focus` | **单行**、≤2000 字符、拒绝控制字符（含 \t\n\r） | 换行/制表符会被拼进提示词结构，因此拒绝 |
 
 **取消语义**：MCP SDK 对已取消的请求会**故意丢弃响应**（协议规范如此，客户端本就已知自己取消了）。所以取消后你看不到"已取消"的返回值，但子进程树会在取消后约 2 秒内被 taskkill 杀掉、立刻停止计费；客户端断开 stdio 时同样会杀掉在跑的 review。
 
@@ -258,7 +259,7 @@ node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费�
 node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立刻杀掉（计费，几美分）
 ```
 
-`validation-test.mjs` 覆盖：相对 `repoPath` 拒绝、恶意 `pr` 拒绝、多行 `outputLanguage` 拒绝、空仓库拒绝、非 git 目录拒绝、`maxBudgetUsd=0` 被 schema 接受、`baseRef` 以 `-` 开头拒绝、`focus` 含控制字符/超长拒绝、guard 未生效时两个工具都 fail-closed 拒跑、以及 `CLAUDE_REVIEW_ALLOW_UNGUARDED=1` 的显式解锁。全部在付费调用之前返回——唯一例外是"clean repo 通过 preflight"这条（它会真的发起一次有预算上限的付费 run），默认跳过，设 `CC_REVIEW_ALLOW_PAID_PROBE=1` 才执行。
+`validation-test.mjs` 覆盖：相对 `repoPath` 拒绝、恶意 `pr`（含前导 `-`）拒绝、`outputLanguage` 超 20 字/句末标点/多行拒绝、`focus` 含换行或制表符拒绝、`followup` 消息超 100000 字拒绝、`claude_review_status` 无 jobId 的 cancel 拒绝、空仓库拒绝、非 git 目录拒绝、`maxBudgetUsd=0` 被 schema 接受、`baseRef` 以 `-` 开头拒绝、`focus` 含控制字符/超长拒绝、guard 未生效时两个工具都 fail-closed 拒跑、以及 `CLAUDE_REVIEW_ALLOW_UNGUARDED=1` 的显式解锁。全部在付费调用之前返回——唯一例外是"clean repo 通过 preflight"这条（它会真的发起一次有预算上限的付费 run），默认跳过，设 `CC_REVIEW_ALLOW_PAID_PROBE=1` 才执行。
 
 `shell-guard-test.mjs` 覆盖：链式/重定向/替换命令必须拦、`find -delete/-exec/-fprintf` 与 `rg --pre` 必须拦而普通 `find`/`rg` 读取必须放行、`git log --format="%h; %s"` 这类引号内分隔符必须放行、引号不配对 fail-closed、hook 进程的 stdin→deny 契约、Edit/Write/Read 的仓库边界与 `.git/`/密钥路径拦截、仓库内 junction/软链接逃逸（realpath 边界），以及一次真实 review 的 17 条命令回放（确认被拦的命令不会被误报成"逃逸"）。
 
@@ -275,6 +276,6 @@ node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立
 ## 授权与致谢
 
 - 本项目以 [MIT](LICENSE) 协议开源。
-- 内置的 code-review skill（`assets/skills/code-review/SKILL.md`）改编自 Anthropic 官方的 code-review 插件管线（5 路并行评审 + 置信度过滤），在此基础上适配了 headless 调用与只读边界。
+- 内置的 code-review skill（`assets/skills/code-review/SKILL.md`）改编自 Anthropic 官方的 code-review 插件管线（由 5 个 brief 驱动的 8/10 个并行 finder + 置信度过滤），在此基础上适配了 headless 调用与只读边界。
 - 感谢 Claude Code 团队与 CC Switch / claude-code-router 等网关项目，让"无账号登录也能跑 review"成为可能。
 - 安全模型经过多轮独立交叉审计（Windows / macOS / 认证网关 / 安装形态 / 回归五个视角），详见上文与 [SECURITY.md](SECURITY.md)。发现漏洞请走私有通告，不要开公开 Issue。

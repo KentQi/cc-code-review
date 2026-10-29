@@ -12,9 +12,11 @@ scoring → filter → final report.
 ## Review target
 
 The caller tells you WHAT to review — a GitHub PR, a branch range, the working
-tree, or the last commit. If nothing specific is given, detect in this order:
-(1) uncommitted changes, (2) commits on the current branch ahead of the default
-branch, (3) the last commit.
+tree, or the last commit. In auto mode take the FIRST one that applies, in this
+order: (1) the GitHub pull request the caller named (if none was named, skip
+this step — do not guess one), (2) commits on the current branch ahead of the
+default branch, (3) uncommitted changes, (4) the last commit. If both a PR and
+local changes exist, review the PR and say what you did about the local changes.
 
 ## Procedure
 
@@ -37,8 +39,13 @@ branch, (3) the last commit.
 4. **Reviewer fleet — the same three-phase structure claude's own
    /code-review playbook uses.** The level sets the fleet, not the diff:
    - **low**: one careful diff pass, no subagents, at most 4 findings.
-   - **medium / high**: 8 finder subagents (3+5 angles × 6 candidates).
-   - **max / xhigh**: 10 finder subagents (5+5 angles × 8 candidates).
+   - **medium / high**: 8 finder subagents (the 3+5 shape × up to 6 candidates), findings capped at 8.
+   - **max / xhigh**: 10 finder subagents (the 5+5 shape × up to 8 candidates), findings capped at 15.
+
+   The finder slots are filled from the 5 briefs below: five finders run one brief
+   each; the extra 3 (medium/high) split briefs #1, #2 and #3 across file groups,
+   and at max every brief is split (+5) so each brief runs twice. Never invent a
+   new angle.
 
    Then, at every level with a fleet:
    - **Phase 1 — find.** Dispatch the finders in ONE message (they run in
@@ -46,10 +53,12 @@ branch, (3) the last commit.
      brief across files rather than inventing new angles. Each finder returns
      candidates as `{file, line, summary, failure_scenario}`.
    - **Phase 2 — verify (1 vote).** Dedup candidates that point at the same
-     line/mechanism, then run **one verifier subagent per surviving candidate**
-     (send each batch of verifiers in ONE message as well):
-     it gets the diff, the file and the claim, and answers CONFIRMED /
-     PLAUSIBLE / REFUTED with the evidence. Keep CONFIRMED and PLAUSIBLE.
+     line/mechanism, keep at most 20 (drop the least severe first), then run
+     **one verifier subagent per surviving candidate** (send each batch of
+     verifiers in ONE message as well): it gets the diff, the file and the claim,
+     and answers CONFIRMED / PLAUSIBLE / REFUTED with the evidence. Keep CONFIRMED
+     and PLAUSIBLE — score CONFIRMED 85-100, PLAUSIBLE 75-84 (the 75 anchor),
+     REFUTED 0 (dropped).
    - **Phase 3 — sweep.** One more finder, as a fresh reviewer that sees the
      verified list, looks ONLY for gaps it does not already contain.
 
@@ -118,7 +127,9 @@ branch, (3) the last commit.
    For convention findings, double-check the CLAUDE.md actually calls out that
    issue specifically.
 
-6. **Filter** — keep only findings with score >= 75. Apply the false-positive
+6. **Filter** — keep only findings with score >= 75. With step 4's mapping this
+   keeps exactly the CONFIRMED and PLAUSIBLE findings: the threshold and the
+   phase-2 rule select the same set. Apply the false-positive
    filter at steps 4 and 5; drop findings that are:
    - pre-existing issues not introduced by these changes
    - something that looks like a bug but is not

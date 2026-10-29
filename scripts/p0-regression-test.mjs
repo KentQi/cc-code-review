@@ -550,7 +550,18 @@ try {
   // list this untracked path the same way, which made the check fail there).
   spawnSync("git", ["-C", nm, "add", "-A"], { stdio: "ignore" });
   spawnSync("git", ["-C", nm, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "nm"], { stdio: "ignore" });
-  check("refuses a driver activated by node_modules/.gitattributes", repoRunsGitPrograms(nm).refusals.length > 0, true);
+  {
+    const scan = repoRunsGitPrograms(nm);
+    check("refuses a driver activated by node_modules/.gitattributes", scan.refusals.length > 0, true);
+    // Diagnostics on failure only: the Windows runner needs to say WHY the scan
+    // came back empty (git enumeration vs driver registration vs path spelling).
+    if (scan.refusals.length === 0) {
+      const ls = spawnSync("git", ["-C", nm, "ls-files", "-z", "--cached", "--others", "--", ":(glob)**/.gitattributes"], { encoding: "utf8" });
+      console.log("        DIAG scan:", JSON.stringify(scan).slice(0, 600));
+      console.log("        DIAG ls-files:", JSON.stringify(ls.stdout), "status", ls.status, "stderr", String(ls.stderr || "").slice(0, 200));
+      console.log("        DIAG config:", JSON.stringify(spawnSync("git", ["-C", nm, "config", "--list"], { encoding: "utf8" }).stdout).slice(0, 400));
+    }
+  }
   fs.rmSync(nm, { recursive: true, force: true });
 
   // P1-1: an include target OUTSIDE the repo is read by git and was dropped with

@@ -89,6 +89,20 @@ const LOG_KEEP = 20;
 // of the server process — a restart clears them, which the status tool says.
 const reviewJobs = new Map();
 const JOB_KEEP = 10;
+/**
+ * P1-16: repositories with a fix-mode review in flight, keyed by the resolved
+ * repoPath. Fix mode EDITS the working tree, so a second concurrent run on the
+ * same repository would overwrite the first run's changes — and each run
+ * verifies "the tree changed" against its own pre-run snapshot, so both reports
+ * could describe a tree the other run already rewrote.
+ *
+ * The check-and-add is synchronous (no await between has() and add()), which is
+ * what stops two requests from both passing the check. Released by
+ * settleReviewJob (the single place both the async job and the synchronous path
+ * settle) and by the handler's finally for every refusal that happens before a
+ * job exists. Read-only reviews are never gated — they cannot modify the tree.
+ */
+const activeFixRepos = new Set();
 function pruneReviewJobs() {
   // A finished job is either "done" (a successful result) or "failed" (the tool
   // result was an error); every other state is still in flight and addressable.
@@ -115,6 +129,12 @@ function settleReviewJob(job, result) {
   // Completion time, used by pruneReviewJobs to evict the oldest FINISHED job
   // instead of the oldest STARTED one.
   job.settledAt = job.finishedAt;
+  // P1-16: the fix-mode repo lock belongs to the JOB, not to the request that
+  // created it. Releasing here covers the async path, a client that cancelled
+  // the initial call, and a crashed run (the .catch() settles too) — without it
+  // one failed fix run would block every later fix run in this repository until
+  // the server restarted.
+  if (job?.fixRepoKey) activeFixRepos.delete(job.fixRepoKey);
 }
 /**
  * Add the polled jobId to a finished async result. It used to be dropped once
@@ -126,6 +146,83 @@ function withJobId(result, jobId) {
   if (!result || typeof result !== "object") return result;
   const sc = result.structuredContent && typeof result.structuredContent === "object" ? result.structuredContent : {};
   return { ...result, structuredContent: { ...sc, jobId } };
+}
+
+/**
+ * P2-4: the largest response claude_review_status will hand back in one piece.
+ *
+ * A max-effort review quotes large code blocks in every subagent report, so a
+ * settled result can run to megabytes. It travels as ONE JSON-RPC message over
+ * stdio: clients (and their transport buffers) truncate or drop a response that
+ * size, and a dropped response loses the report the caller already paid for
+ * with no hint that anything was cut. Cap the returned copy and point at the
+ * files that still hold the full text.
+ *
+ * The job's stored result is never modified — every poll rebuilds the capped
+ * view, so a second poll cannot append the truncation note a second time.
+ */
+const MAX_RESULT_BYTES = 512 * 1024;
+
+/**
+ * Cut a string to at most maxBytes of UTF-8 without splitting a character.
+ *
+ * Binary-searching character indexes keeps this O(log n) on a multi-megabyte
+ * report; slicing the Buffer directly (or a linear character walk) would either
+ * emit an invalid UTF-8 tail or take a byteLength measurement per character.
+ */
+function truncateUtf8(text, maxBytes) {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return { text, truncated: false };
+  let lo = 0;
+  let hi = Math.min(text.length, maxBytes); // one char is >= 1 byte, so this is a safe ceiling
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (Buffer.byteLength(text.slice(0, mid), "utf8") <= maxBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  let end = lo;
+  // A high surrogate at the cut would become a lone surrogate in the JSON
+  // response; drop it, which only shortens the output by one character.
+  if (end > 0) {
+    const code = text.charCodeAt(end - 1);
+    if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+  }
+  return { text: text.slice(0, end), truncated: true };
+}
+
+/** Cap one settled job result on its way out of claude_review_status. */
+function capSavedResult(result) {
+  if (!result || typeof result !== "object") return result;
+  const sourceSc = result.structuredContent && typeof result.structuredContent === "object" ? result.structuredContent : null;
+  const pointers = [
+    typeof sourceSc?.logFile === "string" ? `full log: ${sourceSc.logFile}` : "",
+    typeof sourceSc?.subagentsFile === "string" ? `reviewer subagent reports: ${sourceSc.subagentsFile}` : "",
+  ].filter(Boolean);
+  const note =
+    `\n\n…[truncated at ${Math.round(MAX_RESULT_BYTES / 1024)} KB to keep this MCP response deliverable — ` +
+    (pointers.length
+      ? `the complete output is on disk (${pointers.join("; ")}); read it there for the full report`
+      : `this run recorded no log file, so the remainder is only reachable through the reviewer's session`) +
+    `. Re-run with a narrower scope (e.g. last-commit) if you need a smaller report in one response.]`;
+  let truncated = false;
+  const content = Array.isArray(result.content)
+    ? result.content.map((item) => {
+        if (!item || item.type !== "text" || typeof item.text !== "string") return item;
+        const cut = truncateUtf8(item.text, MAX_RESULT_BYTES);
+        if (!cut.truncated) return item;
+        truncated = true;
+        return { ...item, text: cut.text + note };
+      })
+    : result.content;
+  const sc = sourceSc ? { ...sourceSc } : null;
+  if (sc && typeof sc.report === "string") {
+    const cut = truncateUtf8(sc.report, MAX_RESULT_BYTES);
+    if (cut.truncated) {
+      sc.report = cut.text + note;
+      truncated = true;
+    }
+  }
+  if (!truncated) return result;
+  return { ...result, content, structuredContent: sc ? { ...sc, truncated: true } : { truncated: true } };
 }
 function logsDir() {
   // 0700 so review logs (they quote repo code) stay private from other local users on macOS/Linux.
@@ -553,6 +650,23 @@ function interruptedResult(text, run, requestedModel) {
  * human message in `result`. Turn those into an unmistakable failure banner
  * with actionable hints instead of a fake "report".
  */
+/**
+ * The CLI died (signal / non-zero exit) AFTER printing a result event.
+ *
+ * The report is real and is kept, but the run did not finish cleanly: the stream
+ * may have been cut mid-synthesis. Treating that as success is how a caller
+ * mistakes a killed run for a clean review (audit P2-7); the banner names the
+ * exact exit so the caller can decide whether to re-run.
+ */
+function abnormalExitBanner(run) {
+  const how = run.exitCode === null || run.exitCode === undefined
+    ? `was killed by signal ${run.signal || "unknown"}`
+    : `exited with code ${run.exitCode}`;
+  return `⚠️ REVIEW INCOMPLETE — the reviewer ${how} after it had already printed a report.\n` +
+    "The report is preserved below, but the run did not finish cleanly, so treat it as possibly truncated. " +
+    "Check the log for the last events, and re-run if the report looks cut off.\n\n";
+}
+
 function failureBanner(j, run) {
   const resultText = typeof j.result === "string" ? j.result : "";
   const blob = `${resultText}\n${run.stderr.slice(-1500)}`;
@@ -718,27 +832,51 @@ async function prepareRunHardening(cli, { ultracode = false } = {}) {
   const notes = [];
 
   if (guard.state !== "on") {
+    // SEC-14: the escape hatch is deliberately narrow — it covers ONLY a guard
+    // the operator switched off (CLAUDE_REVIEW_SHELL_GUARD=0). A guard that
+    // FAILED to install (unwritable temp dir, missing/broken hook, foreign-owned
+    // directory) is exactly the case the hatch must never wave through: those
+    // are the failures that happen by accident, and an inherited
+    // CLAUDE_REVIEW_ALLOW_UNGUARDED=1 in a host/CI profile would turn "the
+    // protection is broken" into a silent unguarded run that still looks
+    // protected. Refuse regardless of the env var and name the real fix.
+    if (guard.state === "failed") {
+      cleanupGuardSettings(); // guardState() wrote a probe file; nobody will remove it now
+      return {
+        ok: false,
+        error:
+          `Refusing to run unguarded: the PreToolUse shell guard could not be installed (${guard.reason}). ` +
+          `CLAUDE_REVIEW_ALLOW_UNGUARDED=1 does not apply here — that escape hatch only allows a guard you deliberately switched off, ` +
+          `and an installation that failed is the case it must never bypass: the run would advertise a guard while no command is policed. ` +
+          `Fix the installation first: check that ${hookScriptPath()} exists and that node can spawn it, and that ` +
+          `${path.join(os.tmpdir(), "cc-code-review")} is writable and owned by this user. ` +
+          `If you truly accept a run with NO per-command guard, say so explicitly with CLAUDE_REVIEW_SHELL_GUARD=0 (not recommended).`,
+      };
+    }
     if (!allowUnguarded) {
       cleanupGuardSettings(); // guardState() wrote a probe file; nobody will remove it now
       return {
         ok: false,
-        error: guard.state === "off"
-          ? `Refusing to run unguarded: the PreToolUse shell guard is switched off (${guard.reason}). ` +
-            `It is the only thing that polices every segment of a Bash command and the only thing that keeps writes inside the reviewed repo. ` +
-            `Unset CLAUDE_REVIEW_SHELL_GUARD (or set it to 1), or set CLAUDE_REVIEW_ALLOW_UNGUARDED=1 to accept the risk.`
-          : `Refusing to run unguarded: the PreToolUse shell guard could not be installed (${guard.reason}). ` +
-            `Check that ${hookScriptPath()} exists and that node can spawn it, or set ` +
-            `CLAUDE_REVIEW_ALLOW_UNGUARDED=1 to run anyway at your own risk.`,
+        error:
+          `Refusing to run unguarded: the PreToolUse shell guard is switched off (${guard.reason}). ` +
+          `It is the only thing that polices every segment of a Bash command and the only thing that keeps writes inside the reviewed repo. ` +
+          `Unset CLAUDE_REVIEW_SHELL_GUARD (or set it to 1), or set CLAUDE_REVIEW_ALLOW_UNGUARDED=1 to accept the risk.`,
       };
     }
     notes.push(
-      `⚠ shell guard ${guard.state === "off" ? "is OFF" : "FAILED to install"} (${guard.reason}) — the run proceeds only because ` +
+      `⚠ shell guard is OFF (${guard.reason}) — the run proceeds only because ` +
       `CLAUDE_REVIEW_ALLOW_UNGUARDED=1 is set. Chained Bash commands and out-of-repo writes are NOT blocked.`
     );
-    log(`guard ${guard.state} but CLAUDE_REVIEW_ALLOW_UNGUARDED=1 — proceeding unguarded:`, guard.reason);
+    log("guard off but CLAUDE_REVIEW_ALLOW_UNGUARDED=1 — proceeding unguarded:", guard.reason);
   } else {
     // Installed is not the same as working: prove it denies before trusting it.
-    const selfTest = await guardSelfTest();
+    // P2-14: the verdict is cached for 5 minutes, but the hook is spawned from
+    // disk on every call. When the sources on disk are newer than this process
+    // (an upgrade without an MCP restart) the cached "ok" vouches for the OLD
+    // hook while the run gets the NEW one — force a fresh probe so the
+    // fingerprint mismatch is refused immediately instead of up to 5 minutes
+    // into the upgrade window.
+    const selfTest = await guardSelfTest(codeDrift().stale ? { refresh: true } : {});
     if (!selfTest.ok && !allowUnguarded) {
       cleanupGuardSettings(); // probe files from guardState()+guardSelfTest(); nobody will remove them now
       return {
@@ -776,7 +914,10 @@ async function prepareRunHardening(cli, { ultracode = false } = {}) {
       error:
         "Refusing to run unguarded: the PreToolUse hook settings file could not be written (the guard is installed, but this run could not pass it to claude). " +
         "Check that " + path.join(os.tmpdir(), "cc-code-review") + " is writable and has free space, then retry. " +
-        "Set CLAUDE_REVIEW_ALLOW_UNGUARDED=1 only if you accept a run with no per-command guard.",
+        // SEC-14: the escape hatch covers only a guard that was deliberately
+        // switched off; it cannot conjure the settings file this run failed to
+        // write, so suggesting it here sent the model down a dead end.
+        "CLAUDE_REVIEW_ALLOW_UNGUARDED=1 does not bypass this — it only covers a guard you switched off explicitly, not one whose settings file could not be written.",
     };
   }
   markGuardSettingsInFlight(guardSettings, true); // held until the claude spawn returns
@@ -1119,6 +1260,35 @@ server.tool(
     if (!repoCheck.ok) return err(repoCheck.error);
     const repoPath = repoCheck.path;
 
+    // --- P1-16: one fix-mode review per repository at a time -----------------
+    // Fix mode EDITS the working tree, so two concurrent fix runs on the same
+    // repository overwrite each other's changes — and each run verifies "the
+    // tree changed" against its own pre-run snapshot, so both reports can be
+    // wrong. The has()/add() pair is synchronous (nothing awaits between them),
+    // which is what makes two simultaneous requests unable to both pass; the
+    // lock is taken after input validation and before any paid preflight.
+    const fixRepoKey = fix ? path.resolve(repoPath) : null;
+    if (fixRepoKey && activeFixRepos.has(fixRepoKey)) {
+      return err(
+        `a fix-mode review is already running for ${repoPath} — fix mode edits the working tree, so a second concurrent run would overwrite the changes ` +
+        `the running one is making (and its "working tree changed" verification would race the first run's edits). ` +
+        `Wait for it: claude_review_status lists the running job and returns its report when it finishes. Or run a read-only review (fix=false) now.`
+      );
+    }
+    if (fixRepoKey) activeFixRepos.add(fixRepoKey);
+    // From here on this request holds the lock. The async path hands ownership to
+    // the job (settleReviewJob releases it); every other exit — a preflight
+    // refusal, the synchronous path, a crash — releases it in the finally at the
+    // end of this handler. Without that, one refused fix run would disable fix
+    // mode for this repository until the server restarted.
+    let fixLockHeld = !!fixRepoKey;
+    const releaseFixLock = () => {
+      if (fixLockHeld && fixRepoKey) {
+        activeFixRepos.delete(fixRepoKey);
+        fixLockHeld = false;
+      }
+    };
+    try {
     const cli = resolveClaudeCli();
     if (!cli) {
       return err("Claude Code CLI not found. Install it (https://code.claude.com/docs/en/setup), or set CLAUDE_CODE_PATH to the claude executable / cli.js, then retry. claude_review_env shows what was probed.");
@@ -1451,11 +1621,16 @@ server.tool(
     // stream, or a turn cap hit before writing). Returning that as success is
     // how a caller concludes "clean review" from a run that never reviewed anything.
     const emptyReport = reportText.trim().length === 0;
-    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !emptyReport;
+    // A signal / non-zero exit with a parseable result used to be reported as
+    // success because only the JSON event was consulted (audit P2-7). The report
+    // is kept, but the run is failed and the banner names the exit.
+    const abnormalExit = !run.timedOut && !run.cancelled && run.ok === false;
+    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !emptyReport && !abnormalExit;
     // A non-success subtype is the more specific diagnosis (budget/turn cap);
     // "empty_report" is used only when claude itself claimed success.
     const status2 = ok ? "success"
-      : (j.subtype && j.subtype !== "success" ? j.subtype : (emptyReport ? "empty_report" : "claude reported an error"));
+      : (abnormalExit ? "completed_with_error"
+        : (j.subtype && j.subtype !== "success" ? j.subtype : (emptyReport ? "empty_report" : "claude reported an error")));
 
     // Under `--permission-mode manual` a missing allowlist entry shows up here
     // instead of aborting the run — surface it, or a silently degraded review
@@ -1562,17 +1737,27 @@ server.tool(
       const errNote = [provenanceNote, errReports, errMeta].filter(Boolean).join("\n\n");
       // An empty result has its own causes and next steps; the generic
       // "did not complete" banner would print "(no message)" and bury them.
-      const errBanner = status2 === "empty_report" ? emptyReportBanner(j) : failureBanner(j, run);
+      const errBanner = status2 === "empty_report"
+        ? emptyReportBanner(j)
+        : (abnormalExit ? abnormalExitBanner(run) : failureBanner(j, run));
+      // An abnormal exit still produced a (possibly truncated) report: keep it in
+      // the content instead of returning only the banner.
+      const keptReport = abnormalExit ? runResultText(j.result, meta) + "\n\n" : "";
       return {
         isError: true,
-        content: [{ type: "text", text: gitProgramNotes + errBanner + stderrTail(run.stderr) + logNote + (errNote ? `\n\n${errNote}` : "") }],
+        content: [{ type: "text", text: gitProgramNotes + errBanner + keptReport + stderrTail(run.stderr) + logNote + (errNote ? `\n\n${errNote}` : "") }],
         structuredContent: {
           status: status2, sessionId: j.session_id, costUsd: meta.costUsd,
           numTurns: j.num_turns, durationMs: meta.durationMs, pipeline: skillMode, pipelineMode: pipeline, effort, fix, logFile,
           hardening,
           error: status2 === "empty_report"
             ? "empty report: claude's result was empty, so the reviewer produced no report (this is a failed review, not a clean one)"
-            : String(j.result || ""),
+            : (abnormalExit
+              ? `the run did not finish cleanly (${run.exitCode === null ? "signal " + (run.signal || "unknown") : "exit code " + run.exitCode}); the report below may be truncated`
+              : String(j.result || "")),
+          // Additive: only present when the CLI died abnormally.
+          exitCode: abnormalExit ? run.exitCode : undefined,
+          signal: abnormalExit ? run.signal || undefined : undefined,
           subagents: subagentsView(run.agentReports),
           subagentsSpawned: meta.subagentsSpawned,
           ultracode: ultracode || undefined,
@@ -1625,14 +1810,21 @@ server.tool(
     };
     }; // end executeRun
 
-    if (args.waitForResult) return executeRun(extra?.signal, extra?._meta?.progressToken);
-
-    // Async mode: hand back a jobId at once; the run continues in the background
-    // (the server outlives this request) and its result waits in the job registry.
+    // P1-8: register the job BEFORE branching on waitForResult. The synchronous
+    // path used to create no job at all, so when the client cancelled the call
+    // the SDK discarded the response and the report the run had already paid
+    // for (every finished subagent report included) became unreachable. Now the
+    // job exists in both modes: after a cancel the caller can find it with
+    // claude_review_status (the no-argument form lists this process's jobs) and
+    // read the interruptedResult from it.
     const jobId = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const job = {
       id: jobId, repoPath, scope: scope + (pr ? ` pr=${pr}` : ""), fix, effort,
       startedAt, state: "running", result: null, abort: jobAbort, subagents: [],
+      // P1-16: the job owns the repository lock from here on; settleReviewJob
+      // releases it on every settle path (success, error result, crash), and the
+      // handler's finally no longer owns it once this flag is cleared below.
+      fixRepoKey,
     };
     liveJob = job;
     reviewJobs.set(jobId, job);
@@ -1645,10 +1837,35 @@ server.tool(
       if (extra.signal.aborted) jobAbort.abort();
       else extra.signal.addEventListener("abort", () => jobAbort.abort(), { once: true });
     }
+    const settle = (result) => {
+      settleReviewJob(job, result);
+      pruneReviewJobs();
+    };
+    if (args.waitForResult) {
+      // Synchronous contract: the caller still waits for the result. Settling
+      // the job anyway is what keeps it (and the report) pollable after a
+      // client-side cancel — and moves the fix-mode lock release into
+      // settleReviewJob, the same place the async path releases it.
+      try {
+        const result = await executeRun(jobAbort.signal, extra?._meta?.progressToken);
+        settle(result);
+        return result;
+      } catch (e) {
+        const crashed = err(`review crashed before it produced a result: ${e?.message || e}. The job is settled as failed; retry, or check the server log.`);
+        settle(crashed);
+        return crashed;
+      } finally {
+        // Normally a no-op (settleReviewJob already released the lock); this
+        // also covers a settle that threw before reaching the release.
+        releaseFixLock();
+      }
+    }
+    // Async mode: hand back a jobId at once; the run continues in the background
+    // (the server outlives this request) and its result waits in the job registry.
+    fixLockHeld = false; // ownership moved to the job — settleReviewJob releases it
     void executeRun(jobAbort.signal, undefined)
-      .then((result) => settleReviewJob(job, result))
-      .catch((e) => settleReviewJob(job, err(`review job crashed: ${e?.message || e}`)))
-      .finally(() => pruneReviewJobs());
+      .then(settle)
+      .catch((e) => settle(err(`review job crashed: ${e?.message || e}`)));
     return {
       content: [{
         type: "text",
@@ -1660,6 +1877,11 @@ server.tool(
       }],
       structuredContent: { jobId, status: "running", repoPath, scope, effort, fix, startedAt },
     };
+    } finally {
+      // P1-16: every exit that did not hand the lock to a job (a preflight
+      // refusal, the sync path, an unexpected throw) must release it here.
+      releaseFixLock();
+    }
   }
 );
 
@@ -1724,7 +1946,9 @@ server.tool(
     if (cancel) return { content: [{ type: "text", text: `job ${jobId} already finished — nothing to cancel.` }] };
     // Stamp the jobId onto the settled result (audit P-03): the final shape used
     // to lose it, so a multi-job client could not tell which job it was reading.
-    return withJobId(job.result, jobId);
+    // P2-4: this is the one place a settled report is returned, so the size cap
+    // lives here; the running branch above never returns the report at all.
+    return withJobId(capSavedResult(job.result), jobId);
   }
 );
 
@@ -1925,9 +2149,12 @@ server.tool(
     // answer. A caller that trusts status/isError would otherwise read "the
     // reviewer said nothing" as "there is nothing to say".
     const emptyReply = replyText.trim().length === 0;
-    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !emptyReply;
+    // Same abnormal-exit rule as a review (audit P2-7).
+    const abnormalExit = !run.timedOut && !run.cancelled && run.ok === false;
+    const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !emptyReply && !abnormalExit;
     const status2 = ok ? "success"
-      : (j.subtype && j.subtype !== "success" ? j.subtype : (emptyReply ? "empty_report" : "claude reported an error"));
+      : (abnormalExit ? "completed_with_error"
+        : (j.subtype && j.subtype !== "success" ? j.subtype : (emptyReply ? "empty_report" : "claude reported an error")));
     // Same denial split as a full review (audit P0-7). The chaining reporter
     // needs the set of commands that were actually DENIED: passing an empty set
     // turned every command the guard correctly blocked into "RAN WITHOUT BEING
@@ -1938,15 +2165,17 @@ server.tool(
       // The same empty-result treatment as a review (same status value, same
       // actionable hints); logNote/carried keep the paid-for subagent reports
       // reachable even when the parent turn produced nothing.
-      const errBanner = status2 === "empty_report" ? emptyReportBanner(j, "reply") : failureBanner(j, run);
+      const errBanner = status2 === "empty_report"
+        ? emptyReportBanner(j, "reply")
+        : (abnormalExit ? abnormalExitBanner(run) : failureBanner(j, run));
       return {
         isError: true,
-        content: [{ type: "text", text: errBanner + stderrTail(run.stderr) + logNote + carried }],
+        content: [{ type: "text", text: errBanner + (abnormalExit ? runResultText(replyText, { status: status2, sessionId: j.session_id ?? sessionId }) + "\n\n" : "") + stderrTail(run.stderr) + logNote + carried }],
         structuredContent: {
           status: status2, sessionId: j.session_id ?? sessionId, reply: replyText,
           ...(status2 === "empty_report"
             ? { error: "empty reply: claude's result was empty, so the reviewer produced no reply (this is a failed followup, not an empty answer)" }
-            : {}),
+            : (abnormalExit ? { error: "the run did not finish cleanly; the reply below may be truncated", exitCode: run.exitCode, signal: run.signal || undefined } : {})),
           subagents: subagentsView(followReports),
           subagentsSpawned: followReports.length || undefined,
           subagentsFile: followSubagentsFile || undefined,
@@ -1997,8 +2226,10 @@ server.tool(
     };
     }; // end executeFollowup
 
-    if (args.waitForResult) return executeFollowup(extra?.signal, extra?._meta?.progressToken);
-
+    // P1-8: same job-before-branch contract as claude_code_review. A cancelled
+    // synchronous followup used to leave no job behind, so the paid reply (and
+    // any subagent report captured alongside it) was unreachable. Register the
+    // job in both modes and settle it even when the caller is blocking.
     const jobId = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const job = {
       id: jobId, repoPath, scope: `followup session=${String(sessionId).slice(0, 8)}`, fix: false, effort: "-",
@@ -2009,10 +2240,24 @@ server.tool(
       if (extra.signal.aborted) jobAbort.abort();
       else extra.signal.addEventListener("abort", () => jobAbort.abort(), { once: true });
     }
+    const settle = (result) => {
+      settleReviewJob(job, result);
+      pruneReviewJobs();
+    };
+    if (args.waitForResult) {
+      try {
+        const result = await executeFollowup(jobAbort.signal, extra?._meta?.progressToken);
+        settle(result);
+        return result;
+      } catch (e) {
+        const crashed = err(`followup crashed before it produced a reply: ${e?.message || e}. It is settled in the job list; retry, or fetch it with claude_review_status.`);
+        settle(crashed);
+        return crashed;
+      }
+    }
     void executeFollowup(jobAbort.signal)
-      .then((result) => settleReviewJob(job, result))
-      .catch((e) => settleReviewJob(job, err(`followup job crashed: ${e?.message || e}`)))
-      .finally(() => pruneReviewJobs());
+      .then(settle)
+      .catch((e) => settle(err(`followup job crashed: ${e?.message || e}`)));
     return {
       content: [{
         type: "text",

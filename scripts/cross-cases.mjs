@@ -192,6 +192,32 @@ const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
   s.kill();
 }
 
+/* --- P1-7: a malformed HOST ANTHROPIC_BASE_URL must not crash the env tool --- */
+{
+  // A host environment can carry a half-typed gateway URL while settings.json
+  // holds the real one (CC Switch / claude-code-router rewrite both). The env
+  // tool compared process.env's raw base URL with new URL() unguarded, so the
+  // whole diagnostic threw an internal error once any auth residue existed
+  // (audit P1-7). A throwaway HOME keeps the developer's own ~/.claude out of it.
+  const home = fs.mkdtempSync(path.join(tmp, "c3url-"));
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:15721" } }));
+  const s = startServer({
+    CLAUDE_CODE_PATH: STUB, HOME: home, USERPROFILE: home,
+    CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
+    ANTHROPIC_BASE_URL: "http://[::1",           // malformed on purpose
+    ANTHROPIC_API_KEY: "sk-ant-c3-url-not-real", // forces the residue branch
+  });
+  await s.ready;
+  const r = await s.call("claude_review_env", {});
+  const t = textOf(r);
+  check("C3", "malformed host ANTHROPIC_BASE_URL yields a verdict, not an internal error (P1-7)",
+    r.result?.isError !== true && !r.error && /verdict:/.test(t) && /not a parseable URL/.test(t),
+    (r.error ? JSON.stringify(r.error) : t.slice(0, 240)));
+  s.kill();
+}
+
 /* ================= C4 installer ================= */
 {
   // init.mjs copies the effective ANTHROPIC_* credentials into the config it
@@ -848,6 +874,133 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   check("C22", "a non-zero CLI exit is a failed review", r.result?.isError === true, t.slice(0, 200));
   check("C22", "the failure names the exit code and the missing result",
     /exited \(code 7\)/.test(t) && /without a parseable result/i.test(t), t.slice(0, 300));
+  s.kill();
+}
+
+/* ================= C23 a CLI killed by a signal after reporting ================= */
+{
+  // P2-7: the shipped stub always exits 0, so the crash/signal branches in
+  // claude.js had no coverage. This disposable CLI (same pattern as C22) emits a
+  // valid stream-json result and then SIGTERMs itself: the process did not finish
+  // cleanly, and a wrapper/Gatekeeper/AV kill can truncate a run after a partial
+  // report. Presenting that as a successful review is how a caller concludes
+  // "clean" from a run that never completed. Assertions stay platform-generic —
+  // the darwin Gatekeeper wording is environment-specific and must not be pinned.
+  const sigCli = path.join(tmp, `signal-claude-${process.pid}.mjs`);
+  fs.writeFileSync(sigCli, [
+    'const args = process.argv.slice(2);',
+    'if (args.includes("--version")) { console.log("2.1.300 (Claude Code)"); process.exit(0); }',
+    // String.fromCharCode(10), not "\\n": this line is itself inside a JS string,
+    // and a single \\n would be turned into a REAL newline in the generated CLI,
+    // making it a syntax error that exits before printing anything (a fake pass).
+    'if (args.includes("--help")) { console.log(["Usage: claude [options]","  -p, --print","  --effort <level>","  --max-budget-usd <n>","  --permission-mode <mode>","  --permission-prompts <policy>","  --output-format <fmt>  (json, stream-json)","  --settings <file>","  --verbose"].join(String.fromCharCode(10))); process.exit(0); }',
+    'process.stdin.resume();',
+    'setTimeout(() => {',
+    '  console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "C23-STUB-REPORT", session_id: "signal-stub", num_turns: 1, total_cost_usd: 0, duration_ms: 10, permission_denials: [] }));',
+    // Long enough that the parent has certainly read and parsed the result line:
+    // this test is about the SIGNAL being honored, not about a stdout race.
+    '  setTimeout(() => process.kill(process.pid, "SIGTERM"), 1000);',
+    '}, 300);',
+  ].join("\n") + "\n");
+  const s = startServer({ CLAUDE_CODE_PATH: sigCli });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c23"), scope: "last-commit", waitForResult: true });
+  const t = textOf(r);
+  check("C23", "a run killed by a signal is a failed review, not a clean report", r.result?.isError === true, t.slice(0, 300));
+  check("C23", "the failure names the signal/exit (no Gatekeeper-specific wording)",
+    /(SIGTERM|SIGKILL|killed by|signal|exited \(code)/i.test(t), t.slice(0, 300));
+  // Proves the CLI really emitted a valid result BEFORE dying: without this a
+  // broken fixture (e.g. a syntax error) would also "fail the review" and the
+  // case would pass while testing nothing (the failure mode this round hit).
+  check("C23", "the valid report is preserved alongside the failure",
+    /C23-STUB-REPORT/.test(t), t.slice(0, 300));
+  s.kill();
+}
+
+/* ================= C24 an unwritable log directory is a tool error ================= */
+{
+  // P2-12: logsDir() is a synchronous fs call. On the waitForResult path a bad
+  // CLAUDE_REVIEW_LOG_DIR used to escape the tool handler as a raw ENOTDIR /
+  // EACCES, before any paid work. A regular file is the portable way to make
+  // mkdirSync fail on Windows, macOS and Linux without depending on mode bits.
+  const bad = path.join(tmp, `c24-logdir-file-${process.pid}`);
+  fs.writeFileSync(bad, "not a directory");
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, CLAUDE_REVIEW_LOG_DIR: bad });
+  await s.ready;
+  const r = await s.call("claude_code_review", { repoPath: gitRepo("c24"), scope: "last-commit", waitForResult: true });
+  const t = textOf(r);
+  check("C24", "bad CLAUDE_REVIEW_LOG_DIR is an actionable tool error (P2-12)",
+    r.result?.isError === true && /Could not prepare this review's log directory/.test(t) && /CLAUDE_REVIEW_LOG_DIR/.test(t),
+    t.slice(0, 320));
+  s.kill();
+}
+
+/* ================= C25 one fix-mode review per repository ================= */
+{
+  // P1-16: fix mode EDITS the working tree, so two concurrent fix runs on the
+  // same repository overwrite each other and each run's "tree changed"
+  // verification races the other's edits. The lock is per repoPath; read-only
+  // reviews stay allowed (the refusal text says so).
+  const repo = gitRepo("c25");
+  const s = startServer({ CLAUDE_CODE_PATH: STUB });
+  await s.ready;
+  const first = await s.call("claude_code_review", { repoPath: repo, scope: "last-commit", fix: true });
+  const second = await s.call("claude_code_review", { repoPath: repo, scope: "last-commit", fix: true });
+  check("C25", "the first fix run is accepted and returns a jobId",
+    !!first.result?.structuredContent?.jobId, textOf(first).slice(0, 200));
+  check("C25", "a second concurrent fix run on the same repo is refused",
+    second.result?.isError === true && /already running/i.test(textOf(second)), textOf(second).slice(0, 240));
+  const jid = first.result?.structuredContent?.jobId;
+  if (jid) await s.call("claude_review_status", { jobId: jid, cancel: true });
+  s.kill();
+}
+
+/* ================= C26 a cancelled sync run is still pollable ================= */
+{
+  // P1-8: a waitForResult=true call used to create no job. When the client
+  // cancelled it, the SDK dropped the response — and every reviewer report the
+  // run had already paid for became unreachable. The job must exist in both
+  // modes, so the interrupted result can be fetched by jobId after the cancel.
+  const s = startServer({ CLAUDE_CODE_PATH: STUB, STUB_SUBAGENT_DELAY_MS: "1500" });
+  await s.ready;
+  const repo = gitRepo("c26");
+  // A STRING request id cannot collide with the harness's numeric ids, letting
+  // this file send the cancel notification itself while polling from the same
+  // connection (the sync response is expected to be dropped).
+  const requestId = "p1-8-sync-cancel";
+  s.child.stdin.write(JSON.stringify({
+    jsonrpc: "2.0", id: requestId, method: "tools/call",
+    params: { name: "claude_code_review", arguments: { repoPath: repo, scope: "last-commit", waitForResult: true } },
+  }) + "\n");
+  let jobId = "";
+  let sawReport = false;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 400));
+    const list = await s.call("claude_review_status", {});
+    const m = /(job-[a-z0-9-]+)/.exec(textOf(list));
+    if (!m) continue;
+    jobId = m[1];
+    const p = await s.call("claude_review_status", { jobId });
+    if ((p.result?.structuredContent?.subagentsSoFar || []).length > 0) { sawReport = true; break; }
+    if (p.result?.structuredContent?.status !== "running") break;
+  }
+  check("C26", "a waitForResult run is registered as a job (P1-8)", !!jobId, "no job visible in claude_review_status");
+  check("C26", "at least one reviewer report landed before the cancel", sawReport, "none before the cancel");
+  s.child.stdin.write(JSON.stringify({
+    jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId, reason: "c26" },
+  }) + "\n");
+  let final = null;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 400));
+    const p = await s.call("claude_review_status", { jobId });
+    if (p.result?.structuredContent?.status !== "running") { final = p.result; break; }
+  }
+  const sc = final?.structuredContent || {};
+  check("C26", "after the cancel the job reports the cancellation",
+    final?.isError === true && sc.status === "cancelled", JSON.stringify({ isError: final?.isError, status: sc.status }));
+  check("C26", "the reports produced before the cancel survive (P1-8)",
+    (sc.subagents || []).length >= 1 && /## Reviewer subagent reports/.test(final?.content?.[0]?.text || ""),
+    JSON.stringify({ subagents: (sc.subagents || []).length }));
   s.kill();
 }
 

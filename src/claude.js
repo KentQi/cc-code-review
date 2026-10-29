@@ -1765,6 +1765,10 @@ export function runClaude({
         timedOut,
         cancelled: wasCancelled,
         exitCode: code,
+        // The signal (SIGTERM/SIGKILL/...) when the CLI died abnormally; null on a
+        // clean exit. index.js needs it to tell "finished" from "killed after
+        // printing a result" (audit P2-7).
+        signal: signalName || null,
         durationMs: Date.now() - started,
       });
     }
@@ -1898,6 +1902,16 @@ const CONFIG_CMD_PATTERNS = [
   /(^|[.\s])sshcommand\s*=/i,
   /(^|[.\s])gitproxy\s*=/i,
   /(^|[.\s])pager\s*=/i,
+  // Round-2 scanner gap: the remaining config keys whose value git runs. `pager.<cmd>` is
+  // per-SUBCOMMAND and therefore has a dot before the variable name (the plain
+  // `pager\s*=` above only sees core.pager, which git ignores once a
+  // subcommand-specific pager exists). core.askPass is executed to answer a
+  // credential challenge, and sequence.editor when an interactive rebase opens
+  // an editor — neither is reachable through the read allowlist today, but both
+  // are execution surfaces the scanner must not leave blank.
+  /(^|[.\s])askpass\s*=/i,
+  /(^|[.\s])pager\s*\.\s*[\w-]+\s*=/i,
+  /(^|[.\s])sequence\s*\.\s*editor\s*=/i,
   /\bhelper\s*=/i,
 ];
 // `core.fsmonitor` is a command only when it is not a boolean (`true` uses git's
@@ -1919,7 +1933,21 @@ const CONFIG_EXEC_KEYS = new Set([
   "core.pager",
   "core.gitproxy",
   "diff.external",
+  // Round-2 scanner gap: a credential challenge runs core.askPass, and an interactive rebase
+  // runs sequence.editor. The read allowlist does not reach the operations that
+  // trigger them today, but "not reachable today" is not a boundary: both are
+  // repo-controlled programs and the review must not run them by accident.
+  "core.askpass",
+  "sequence.editor",
 ]);
+/**
+ * `pager.<cmd>` (exactly one subcommand name, no further dots). git resolves
+ * the pager for a subcommand from this key BEFORE falling back to core.pager, so
+ * the hardened `-c core.pager=cat` does not neutralise it. A boolean value is
+ * git's enable/disable form (false disables the pager, true uses the default
+ * one) — not a program — so booleans stay inert, exactly like core.fsmonitor.
+ */
+const CONFIG_PAGER_KEY = /^pager\.[^.]+$/;
 /** credential.helper, plain and in the credential.<url>.helper form. */
 const CONFIG_CREDENTIAL_HELPER = /^credential(?:\..+)?\.helper$/;
 /**
@@ -1972,6 +2000,24 @@ function normalizedConfigEntries(file, repoPath) {
 }
 
 /**
+ * A Windows UNC path (`\\server\share\...`, and the forward-slash spelling
+ * `//server/share` that the Win32 API accepts for the same namespace).
+ *
+ * This is checked BEFORE any fs call on purpose. fs.existsSync() against a UNC
+ * path is a synchronous network round trip with no timeout: on Windows a dead
+ * or firewalled server stalls it for ~21s, and a mounted POSIX network share can
+ * do the same. This scan runs synchronously before the review spawns and there
+ * is no timer that can fire while it blocks — the whole MCP server freezes. A
+ * UNC target is also not provably inert: whether the share answers says nothing
+ * about the program a live server would hand back. Callers therefore treat it
+ * as live/unverifiable (refusal) and never probe it.
+ */
+function isUncPath(value) {
+  const v = String(value || "").trim().replace(/^["']|["']$/g, "");
+  return /^\\\\[^\\]/.test(v) || /^\/\/[^/]/.test(v);
+}
+
+/**
  * Can we PROVE this config value cannot execute on THIS machine?
  *
  * A repository cloned from (or copied via a full-folder copy from) another OS
@@ -1989,7 +2035,12 @@ function deadPathOnThisMachine(value, repoPath) {
   if (!isAbs) return false; // relative/bare: resolves against cwd/PATH — not provably dead
   // UNC paths are never "dead": an existsSync against a dead server stalls ~21s
   // per probe, and reachability of the share is not proof about the target.
-  if (v.startsWith("\\\\")) return false;
+  // isUncPath() also catches the `//server/share` spelling, which used to reach
+  // the existsSync calls below just because it starts with "/". The line-scan
+  // fallback hands over RAW config text, where git escapes each backslash as
+  // \\ (`\\\\server\share`), so detect the unescaped spelling too — the
+  // probe must never see either form.
+  if (isUncPath(v) || isUncPath(v.replace(/\\\\/g, "\\"))) return false;
   // A drive-RELATIVE path (/x or \x) resolves against the REPO's drive for git,
   // not this server's cwd drive — anchor it there before probing.
   const anchored = /^[\\/][^\\/]/.test(v) && repoPath && /^[a-zA-Z]:/.test(repoPath)
@@ -2132,6 +2183,22 @@ function repoConfigFiles(repoPath) {
     for (const m of read.text.matchAll(/^\s*(?:\[[^\]]*\]\s*)?path\s*=\s*(.+?)\s*$/gim)) {
       const raw = m[1].trim().replace(/^["']|["']$/g, "");
       if (!raw || raw.startsWith("~/")) continue; // ~ is the user's own config, not repo-controlled
+      // Same pre-spawn hazard as core.attributesFile: the readRepoFile() inside
+      // walk() calls lstatSync, which blocks on a UNC target with no timeout
+      // (network I/O cannot be cancelled while the event loop is stuck). Git
+      // would read config from a location this scan cannot verify, and that
+      // config can define any executable key, so refuse instead of probing.
+      // The value here is RAW file text, not git's unescaped value: git writes
+      // each backslash as \\, so a UNC path arrives as four leading
+      // backslashes. Unescape a COPY only for detection — the walk keeps using
+      // the original spelling so non-UNC paths behave exactly as before.
+      const unescaped = raw.replace(/\\\\/g, "\\");
+      if (isUncPath(raw) || isUncPath(unescaped)) {
+        refusals.push(label + ": [include] path = " + raw.slice(0, 120) +
+          " is a UNC path; a UNC path cannot be verified without network I/O (probing it can block this pre-spawn scan), " +
+          "so the included config cannot be scanned; remove the include or review a local copy of the repository");
+        continue;
+      }
       walk(path.isAbsolute(raw) ? raw : path.resolve(base, raw), `${label} -> include`, depth + 1, roots);
     }
   };
@@ -2226,6 +2293,21 @@ function repoAttributeFiles(repoPath, attributeSources = []) {
   for (const { label, value } of attributeSources) {
     const raw = String(value || "").trim().replace(/^["']|["']$/g, "");
     if (!raw) continue; // empty value: git reads no extra attributes file
+    // The line-scan fallback passes RAW config text, where git escapes every
+    // backslash (`\\\\server\share`), so the UNC test covers both the
+    // normalized value and the unescaped spelling before any fs call.
+    if (isUncPath(raw) || isUncPath(raw.replace(/\\\\/g, "\\"))) {
+      // Refuse BEFORE resolving or probing. On Windows the existsSync below is a
+      // synchronous SMB round trip with no timeout (~21s against a dead share),
+      // and on POSIX the `//host` spelling can still reach a network mount. The
+      // file is also unverifiable either way: a share that answers can hand back
+      // attributes naming a live driver, and one that does not says nothing.
+      refusals.push(label + ": core.attributesFile = " + raw.slice(0, 120) +
+        " is a UNC path; a UNC path cannot be verified without network I/O (probing it can block this pre-spawn scan), " +
+        "so the attribute file cannot be scanned for driver references. Point core.attributesFile at a file inside the " +
+        "repository or remove the key (git config --unset core.attributesFile)");
+      continue;
+    }
     const resolved = raw.startsWith("~/") ? path.join(os.homedir(), raw.slice(2)) : raw;
     const abs = path.isAbsolute(resolved) ? resolved : path.resolve(repoPath, resolved);
     if (!fs.existsSync(abs)) {
@@ -2371,6 +2453,15 @@ export function repoRunsGitPrograms(repoPath) {
   // A value git would EXECUTE. A dead absolute path (a config copied from another
   // machine) cannot run anything, so it is a note: that is what keeps a clone
   // carrying the previous owner's paths reviewable.
+  // Why THIS key runs a program. The model needs the consequence, not just the
+  // key name, to choose between removing the key and trusting the repository.
+  const execReason = (key) => {
+    if (CONFIG_PAGER_KEY.test(key)) return "it is run as the pager for that subcommand";
+    if (key === "core.askpass") return "it is run to answer a credential challenge";
+    if (key === "sequence.editor") return "it is run as the editor for interactive rebase";
+    return null;
+  };
+
   const refuseCommand = (label, key, value) => {
     const line = shownKey(label, key, value);
     if (deadPathOnThisMachine(value, repoPath)) {
@@ -2380,7 +2471,9 @@ export function repoRunsGitPrograms(repoPath) {
     // Actionable for the model: name the exact key and the exact undo command.
     // The label prefixes the line, so "that config file" is unambiguous even
     // when the key came from an [include] target.
-    refusals.push(line + " — git executes this value; remove the key from that config file (git config --unset " + key +
+    const why = execReason(key);
+    refusals.push(line + " — git executes this value" + (why ? " (" + why + ")" : "") +
+      "; remove the key from that config file (git config --unset " + key +
       " when it is .git/config) or review a copy of the repository without it");
   };
 
@@ -2422,11 +2515,16 @@ export function repoRunsGitPrograms(repoPath) {
       }
       return;
     }
-    if (!CONFIG_EXEC_KEYS.has(key) && !CONFIG_CREDENTIAL_HELPER.test(key) && !CONFIG_MERGE_DRIVER.test(key)) return;
+    if (!CONFIG_EXEC_KEYS.has(key) && !CONFIG_PAGER_KEY.test(key) &&
+        !CONFIG_CREDENTIAL_HELPER.test(key) && !CONFIG_MERGE_DRIVER.test(key)) return;
     const trimmed = val.trim();
     if (!trimmed) return; // an empty value neutralises the key; it runs nothing
     // core.fsmonitor accepts a boolean: true means git's built-in monitor.
     if (key === "core.fsmonitor" && CONFIG_BOOLEAN.test(trimmed)) return;
+    // pager.<cmd> has the same boolean form (verified on git 2.54): false
+    // disables the pager, true/no value uses the default — no program runs, so
+    // refusing these would be a false positive on an ordinary config.
+    if (CONFIG_PAGER_KEY.test(key) && CONFIG_BOOLEAN.test(trimmed)) return;
     // core.gitProxy's documented "none" form DISABLES the proxy; it runs nothing.
     if (key === "core.gitproxy" && /^none(\s|$)/i.test(trimmed)) return;
     refuseCommand(label, key, trimmed);
@@ -2452,6 +2550,11 @@ export function repoRunsGitPrograms(repoPath) {
       // cross-check silently passed.
       const dm = /^\s*(?:diff|filter)\s*(?:"([^"]+)"|\.([\w.-]+))\s*$/i.exec(sec.header || "");
       const dmName = dm ? (dm[1] || dm[2]) : null;
+      // Plain section name (`[pager]`, `[core]`, `[sequence]`). The normalized
+      // path receives full dotted keys from git; this fallback only sees the
+      // variable name on each line, so the section must be folded back in for
+      // the keys whose execution meaning lives in the dotted name.
+      const secName = /^\s*([A-Za-z0-9][\w-]*)\s*$/.exec(sec.header || "")?.[1]?.toLowerCase() ?? null;
       for (const line of sec.lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
@@ -2472,6 +2575,28 @@ export function repoRunsGitPrograms(repoPath) {
         // core.gitProxy's "none" form disables the proxy; it runs nothing. The
         // normalized path handles this explicitly; keep the fallback honest too.
         if (/^\s*gitproxy\s*=\s*none(\s|$)/i.test(line)) continue;
+        // pager.<cmd> / core.askPass / sequence.editor in their normal section
+        // form. A line pattern cannot rebuild `pager.<cmd>` from `[pager]` +
+        // `log = ...`, and `[pager] log = ...` (header sharing the line) lands
+        // here too, so the full key is derived from the section instead.
+        const kv = /^\s*([A-Za-z0-9][\w-]*)\s*=\s*(.*)$/.exec(line);
+        if (kv && secName) {
+          const varName = kv[1].toLowerCase();
+          const fullKey = secName === "pager" ? "pager." + varName
+            : secName === "sequence" && varName === "editor" ? "sequence.editor"
+            : secName === "core" && varName === "askpass" ? "core.askpass"
+            : null;
+          if (fullKey) {
+            const val = kv[2].trim().replace(/^["']|["']$/g, "");
+            // Same liveness rule as the normalized path: an empty value runs
+            // nothing, a pager boolean is git's enable/disable form, a dead
+            // absolute path cannot execute here, everything else is a refusal.
+            if (val && !(CONFIG_PAGER_KEY.test(fullKey) && CONFIG_BOOLEAN.test(val))) {
+              refuseCommand(label, fullKey, val);
+            }
+            continue;
+          }
+        }
         if (!isCmdLine(line)) continue;
         const val = rhs(line) ?? "";
         if (dmName) {

@@ -34,14 +34,16 @@ const SUITES = [
   { name: "cross-cases", script: "scripts/cross-cases.mjs" },
 ];
 
-// Paid / real-CLI suites: deliberately NOT run here — they spend Claude credits,
-// and cancel-test's process check is Windows-only (audit P2-5). Listing them
-// keeps this gate honest about what it does NOT cover and makes the opt-in
-// scripts discoverable; each is reachable through its own npm script.
+// Paid / real-CLI suites: deliberately NOT run here — they spend Claude credits.
+// Listing them keeps this gate honest about what it does NOT cover and makes the
+// opt-in scripts discoverable; each is reachable through its own npm script.
+// cancel-test's process check is platform-aware (tasklist on Windows, ps +
+// resolveClaudeCli() elsewhere), so it is mechanically runnable on macOS/Linux;
+// it stays here because a REAL run costs credits (audit P2-5).
 const PAID_SUITES = [
   { name: "e2e (real)", script: "scripts/e2e-test.mjs", npm: "test:e2e:real", why: "real Claude review, billed" },
   { name: "followup-e2e", script: "scripts/followup-e2e.mjs", npm: "test:followup", why: "real Claude followup, billed" },
-  { name: "cancel-test", script: "scripts/cancel-test.mjs", npm: "test:cancel", why: "real run + cancel, billed; Windows-only tasklist" },
+  { name: "cancel-test", script: "scripts/cancel-test.mjs", npm: "test:cancel", why: "real run + cancel, billed; cross-platform process check" },
   { name: "paid-smoke", script: "scripts/paid-smoke.mjs", npm: "test:paid", why: "real CLI smoke, billed (~$0.5)" },
 ];
 

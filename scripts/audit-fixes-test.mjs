@@ -398,7 +398,9 @@ check("guard state is one of on/off/failed", ["on", "off", "failed"].includes(gu
   check("native command omits an empty target", buildNativeCommand({ reviewLevel: "high" }), "/code-review high");
   check("native command falls back to max for an unknown level", buildNativeCommand({ reviewLevel: "turbo" }), "/code-review max");
   const appendix = buildNativeAppendix({ outputLanguage: "中文", focus: "并发", postToPR: false, cwd: "C:/repo", fix: false });
-  check("native appendix carries the report contract", /## Review Summary/.test(appendix), true);
+  // The contract is the bundled SKILL.md block, verbatim: "## Code Review Summary"
+  // (the old "## Review Summary" heading was the second, drifting copy of it).
+  check("native appendix carries the report contract", /## Code Review Summary/.test(appendix) && /## Findings \(N\)/.test(appendix), true);
   check("native appendix carries the language", /中文/.test(appendix), true);
   check("native appendix forbids posting", /Do not post/.test(appendix), true);
 

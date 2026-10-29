@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const SERVER_VERSION = "1.15.1";
+export const SERVER_VERSION = "1.15.2";
 
 /**
  * @param {number} [now] injectable clock (tests)

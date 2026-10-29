@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.15.2 — 2026-10-29
+
+Reported from a live run: "why does it still dispatch exactly five subagents?" — because the *installed* skill had not changed since October 16.
+
+- **The installed skill was frozen at its first install.** The bundled `SKILL.md` is copied into `~/.claude/skills/code-review/` once, and the call site only re-ran the installer when the skill was **missing** (`status === "bundled"` took a branch that never refreshed). So a managed copy never picked up pipeline fixes. Observed on this machine: the copy on disk was 5951 bytes, "dispatch five Task subagents in ONE message", while the bundled pipeline had long since become diff-sized (7620 bytes, `max(2, min(8, ceil(lines/150)))` plus the subagent execution contract). The review looked normal and silently ran the old procedure — the one failure mode that cannot be seen from the outside.
+- **A managed copy is now refreshed before every review** when its content differs from the bundled file (content compare, so an up-to-date copy is not rewritten), and the result carries a note saying it was refreshed and why it matters. A **user-managed** skill (no marker file) is still never touched.
+- **`claude_review_env` reports the sync state**: `— up to date`, or `— ⚠ OUTDATED: <n> bytes on disk vs <m> in this build` with the fix (refreshed automatically before the next review; `installSkill=true` does it now).
+- The install/refresh logic gained a directory parameter so the contract is unit-tested: missing → installed, outdated → refreshed, identical → untouched, user-managed → untouched.
+- Suites: shell-guard 203, audit-fixes 256 (+10), validate 16, cross-cases 118/118.
+
 ## 1.15.1 — 2026-10-29
 
 A real report after upgrading without restarting: `Refusing to run unguarded: the shell guard is installed but did not behave as expected (the hook did not deny a chained command)`. The guard was right; the message was not.

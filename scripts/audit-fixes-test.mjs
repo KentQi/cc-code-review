@@ -21,6 +21,7 @@ import {
   parseAgentLaunchAck, looksLikeLaunchAck, recoverReportFromTranscript,
 } from "../src/claude.js";
 import { codeDrift } from "../src/version.js";
+import { skillStatus, skillSync, installBundledSkill, bundledSkillFile } from "../src/skill.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -378,6 +379,33 @@ check("guard state is one of on/off/failed", ["on", "off", "failed"].includes(gu
   check("codeDrift is quiet when the process is newer than the sources", codeDrift(now + 86_400_000).stale, false);
   check("codeDrift flags sources newer than the process", codeDrift(now - 86_400_000).stale, true);
   check("codeDrift reports when the newest source changed", typeof codeDrift(now).newestSourceAt, "string");
+}
+
+/* ---------------- the installed skill is refreshed, not frozen ----------------
+ * The skill file IS the pipeline. A managed copy frozen at an older release kept
+ * telling the model to dispatch exactly five reviewers long after the bundled
+ * pipeline sized its fleet from the diff, so the review silently ran the old
+ * procedure. A user-managed skill must still never be touched. */
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-skill-"));
+  check("skill: missing on an empty dir", skillStatus(dir), "missing");
+  const first = installBundledSkill(dir);
+  check("skill: installs the bundled copy", first.installed && first.changed, true);
+  check("skill: up to date right after install", skillSync(dir).upToDate, true);
+  fs.writeFileSync(path.join(dir, "SKILL.md"), "old pipeline\n");
+  check("skill: an outdated managed copy is detected", skillSync(dir).upToDate, false);
+  check("skill: an outdated managed copy is refreshed", installBundledSkill(dir).changed, true);
+  check("skill: refreshed content equals the bundled file",
+    fs.readFileSync(path.join(dir, "SKILL.md"), "utf8") === fs.readFileSync(bundledSkillFile(), "utf8"), true);
+  check("skill: an up-to-date copy is not rewritten", installBundledSkill(dir).changed, false);
+
+  const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-skill-user-"));
+  fs.writeFileSync(path.join(userDir, "SKILL.md"), "my own pipeline\n");
+  check("skill: a user-managed skill is detected", skillStatus(userDir), "user");
+  check("skill: a user-managed skill is not overwritten", installBundledSkill(userDir).installed, false);
+  check("skill: user content is intact", fs.readFileSync(path.join(userDir, "SKILL.md"), "utf8"), "my own pipeline\n");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(userDir, { recursive: true, force: true });
 }
 
 /* ---------------- allowlist replay of a real run's Bash calls ---------------- */

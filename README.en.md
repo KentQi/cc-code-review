@@ -98,7 +98,7 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `maxTurns` | `80` | 4–200 | agentic turn cap |
 | `timeoutMinutes` | `30` | 1–60 | hard timeout — with no spend cap this is the master guard; when it fires, the finished subagent reports are still returned |
 | `maxBudgetUsd` | `0` (no cap) | 0–50 | API spend cap (`--max-budget-usd`). **The default 0 sets NO cap at any effort level**: a cap stops the parent before it synthesizes, while every finished subagent report is already captured incrementally and a 429-killed agent is recovered from its output_file transcript — a cap only throws away paid work. `timeoutMinutes` and `maxTurns` are the guards. Set a number to opt into a hard stop; env `CLAUDE_REVIEW_MAX_BUDGET_USD` changes the default only — an explicit argument wins |
-| `installSkillIfMissing` | `true` | - | auto-install the skill when missing |
+| `installSkillIfMissing` | `true` | - | auto-install when missing; a copy managed by this MCP is refreshed before every review when it differs from the bundled one (a user-managed skill is never touched) |
 
 Returns (async by default: a jobId (<1s) plus the preflight verdict, with the report fetched via claude_review_status(jobId); with waitForResult: true the synchronous form below applies): a markdown report (Review Summary / Findings / Notes) + each reviewer subagent's own report (`## Reviewer subagent reports`, sized from the diff) + metadata (`session_id`, spend, turns, log path, model provenance). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
 
@@ -237,7 +237,7 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # shell-guard unit tests (203, free) + audit-fix unit tests (246, free) + stdio handshake/env check
+npm test                                         # shell-guard unit tests (203, free) + audit-fix unit tests (256, free) + stdio handshake/env check
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
 node scripts/cross-cases.mjs                    # 20 MECE cases (118 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)

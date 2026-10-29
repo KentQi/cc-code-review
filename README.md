@@ -97,7 +97,7 @@ npm run init
 | `maxTurns` | `80` | 4–200 | agentic 轮数上限 |
 | `timeoutMinutes` | `30` | 1–60 | 硬超时——不设费用上限时它是唯一的总闸；触发时已完成的子代理报告照样返回 |
 | `maxBudgetUsd` | `0`（不设上限） | 0–50 | API 花费上限（`--max-budget-usd`）。**默认 0 = 任何 effort 级别都不设费用上限**：上限会在父代理综合前截停运行，而每个完成的子代理报告都已增量落盘、429 打断的子代理会从 output_file 转录抢救，设上限只会白扔已付费的工作；兜底 guards 是 `timeoutMinutes` 与 `maxTurns`。仍可显式设值；env `CLAUDE_REVIEW_MAX_BUDGET_USD` 只改默认值，显式传参优先 |
-| `installSkillIfMissing` | `true` | - | skill 缺失时自动安装 |
+| `installSkillIfMissing` | `true` | - | 缺失时自动安装；由本 MCP 管理的副本若与 bundled 版本不一致，会在每次 review 前自动刷新（用户自建的 skill 永不覆盖） |
 
 返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（Review Summary / Findings / Notes）+ 每个评审子代理各自的报告（`## Reviewer subagent reports`，数量随 diff 规模而定）+ 元数据（`session_id`、花费、轮数、日志路径、模型溯源）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
 
@@ -236,7 +236,7 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # shell-guard 单测（203 条，免费）+ 审计修复单测（246 条，免费）+ stdio 握手/环境检查
+npm test                                         # shell-guard 单测（203 条，免费）+ 审计修复单测（256 条，免费）+ stdio 握手/环境检查
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
 node scripts/cross-cases.mjs                    # 20 个 MECE 用例（118 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）

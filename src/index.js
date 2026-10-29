@@ -38,7 +38,7 @@ import {
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools, postPROnlyTools,
   deriveReviewLevel,
 } from "./prompt.js";
-import { skillStatus, installBundledSkill, userSkillDir } from "./skill.js";
+import { skillStatus, skillSync, installBundledSkill, userSkillDir } from "./skill.js";
 import { SERVER_VERSION, codeDrift } from "./version.js";
 
 const execFileAsync = promisify(execFile);
@@ -708,7 +708,7 @@ server.tool(
       cliState = "OK";
     }
 
-    lines.push("code-review skill (~/.claude/skills/code-review): " + describeSkill(skillStatus()));
+    lines.push("code-review skill (~/.claude/skills/code-review): " + describeSkill(skillSync()));
 
     const t = gatewayTarget();
     if (t) {
@@ -787,10 +787,17 @@ server.tool(
   }
 );
 
-function describeSkill(status) {
+function describeSkill(sync) {
+  const { status } = sync;
   if (status === "missing") return "missing (will be auto-installed on the first claude_code_review call; or call this tool with installSkill=true)";
-  if (status === "bundled") return `installed (bundled, managed by this MCP) at ${userSkillDir()}`;
-  return `user-managed skill present at ${userSkillDir()} — it will be used as-is`;
+  if (status === "bundled") {
+    if (sync.upToDate) return `installed (bundled, managed by this MCP) at ${userSkillDir()} — up to date`;
+    return `installed (bundled, managed by this MCP) at ${userSkillDir()} — ⚠ OUTDATED: ` +
+      `${sync.installedBytes ?? "?"} bytes on disk vs ${sync.bundledBytes ?? "?"} in this build. ` +
+      "It is refreshed automatically before the next review, or call this tool with installSkill=true now — " +
+      "a stale copy keeps running the old pipeline (e.g. a fixed five reviewers after the fleet became diff-sized).";
+  }
+  return `user-managed skill present at ${userSkillDir()} — it will be used as-is (never refreshed by this MCP)`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -923,12 +930,26 @@ server.tool(
     }
 
     // Skill: use user-managed > bundled(auto-install) > embedded fallback prompt.
+    // A MANAGED copy is refreshed too: the skill file IS the pipeline, so a copy
+    // frozen at an older release keeps driving the old procedure (a stale
+    // "dispatch five reviewers" copy did exactly that long after the fleet
+    // started sizing itself from the diff). A user-managed copy is never touched.
     let skillMode;
+    let skillRefreshNote = "";
     const status = skillStatus();
     if (status === "user") {
       skillMode = "code-review skill (user-managed)";
     } else if (status === "bundled") {
       skillMode = "code-review skill (bundled)";
+      const before = skillSync();
+      if (!before.upToDate) {
+        const r = installBundledSkill();
+        if (r.installed && r.changed) {
+          skillRefreshNote =
+            `the installed code-review skill was out of date (${before.installedBytes ?? "?"} bytes vs ${before.bundledBytes ?? "?"} in this build) and has been refreshed for this run — ` +
+            `a stale copy keeps driving the old pipeline (e.g. a fixed five reviewers after the fleet became diff-sized)`;
+        }
+      }
     } else if (installSkillIfMissing) {
       const r = installBundledSkill();
       skillMode = r.installed ? "code-review skill (bundled, auto-installed this run)" : `fallback inline pipeline (${r.reason})`;
@@ -1158,7 +1179,7 @@ server.tool(
     const budgetUnsupportedNote = typeof maxBudgetUsd === "number" && maxBudgetUsd > 0 && !budgetFlagSupported
       ? `⚠ maxBudgetUsd=${maxBudgetUsd} was requested but this claude CLI does not advertise --max-budget-usd, so NO spend cap is enforced for this run. Upgrade claude or rely on timeoutMinutes/maxTurns.`
       : "";
-    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote, provenanceNote, budgetUnsupportedNote].filter(Boolean).join("\n\n");
+    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote, provenanceNote, budgetUnsupportedNote, skillRefreshNote].filter(Boolean).join("\n\n");
 
     const meta = {
       status: status2,

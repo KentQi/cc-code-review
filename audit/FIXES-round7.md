@@ -8,6 +8,8 @@ status: final
 # 修复报告（第七轮）— v1.18.7
 
 **基线**：v1.18.6（复核记录二：R-1/R-2/R-3/N-1；PR #5/#6 最终审计：1 P1 / 6 P2 / 5 P3）
+**PR**：[#7](https://github.com/KentQi/cc-code-review/pull/7)（stacked on [#6](https://github.com/KentQi/cc-code-review/pull/6)）
+**CI**：ubuntu/macos/windows × node 20/22/24 **18/18 全绿**（两个 workflow run：push + pull_request）
 **结果**：v1.18.7（`npm test` 7 套件全绿：shell-guard 320 / audit-fixes 318 / p0-regression 238 / validation 30 / pack 52 / cross-cases 154 / smoke）
 
 ## 复核的 4 项

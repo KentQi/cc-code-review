@@ -528,7 +528,10 @@ for (const c of ["rg -n x src", "rg -n x file.ts", "rg -n TODO src/", "rg -n '.*
 for (const c of ['grep -rn "" .', "grep -R x .", "grep -r x", "grep -rE x .", "grep --recursive x .", "grep -Hrn x ./",
   // Any spelling that RESOLVES to the repository root is the same recursive
   // scan; a literal "." comparison missed these normalized/absolute forms.
-  "grep -rn x .//", "grep -rn x ././", "grep -rn x src/..", "grep -rn x " + REPO]) {
+  "grep -rn x .//", "grep -rn x ././", "grep -rn x src/..",
+  // Forward slashes: a raw Windows C:\... token is a bash escape sequence, and
+  // bash (git-bash included) would strip the backslashes before grep sees it.
+  "grep -rn x " + REPO.replace(/\\/g, "/")]) {
   check(`P1-4: refuses recursive grep ${c}`, analyseCommand(c, { repoRoot: REPO }).ok, false);
 }
 for (const c of ["grep -rn x src", "grep -n x file.ts"]) {

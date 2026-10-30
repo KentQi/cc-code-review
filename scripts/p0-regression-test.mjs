@@ -767,17 +767,25 @@ console.log("-- fail-closed: unparseable repository config / unreadable index / 
   // git), not only when git runs and reports a corrupt index. Real repository,
   // clean config: the only failing step is the attribute enumeration.
   const real = gitRepo("p0-nogit");
-  const emptyPath = fs.mkdtempSync(path.join(os.tmpdir(), "p0-empty-path-"));
+  // Simulate "git runs but fails" deterministically. Emptying PATH does not work:
+  // gitSpawnOpts() inherits buildClaudeEnv(), which appends /usr/local/bin and
+  // friends, so a CI runner with a brew git still found one (this test failed
+  // only on those machines). A fake git first on PATH is platform-independent.
+  const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "p0-fakegit-"));
+  const isWin = process.platform === "win32";
+  const fake = path.join(fakeBin, isWin ? "git.cmd" : "git");
+  fs.writeFileSync(fake, isWin ? "@exit /b 1\r\n" : "#!/bin/sh\nexit 1\n");
+  try { fs.chmodSync(fake, 0o755); } catch { /* best effort */ }
   const oldPath = process.env.PATH;
   try {
-    process.env.PATH = emptyPath;
+    process.env.PATH = fakeBin + path.delimiter + (oldPath || "");
     const res = repoRunsGitPrograms(real);
-    check("an attribute enumeration without git is refused", res.refusals.length > 0, true);
-    check("the no-git refusal names the attribute enumeration",
+    check("an attribute enumeration that fails is refused", res.refusals.length > 0, true);
+    check("the refusal names the attribute enumeration",
       res.refusals.some((r) => /could not be enumerated/.test(r)), true);
   } finally {
     process.env.PATH = oldPath;
-    fs.rmSync(emptyPath, { recursive: true, force: true });
+    fs.rmSync(fakeBin, { recursive: true, force: true });
   }
   fs.rmSync(real, { recursive: true, force: true });
 }

@@ -192,6 +192,7 @@ It also closes the **write/execute forms that a prefix rule cannot express**: `f
 - **Self-review protects the whole guard/spawn pipeline**: `src/*.js`, `scripts/pre-tool-hook.js`, `scripts/init.mjs`, `scripts/lib/**` and `assets/skills/**` can no longer be written in fix mode — editing `src/index.js` or `src/claude.js` would disarm every later run just like editing the hook.
 - **The hook fails closed on a payload it cannot judge**: malformed JSON, an empty stdin, a non-object or a missing `tool_name` now denies (it used to exit 0); a parsed payload naming a tool the hook does not police still passes, because those are governed by the server allowlist.
 - **Node >= 20**: the declared runtime floor, the CI matrix (20/22/24) and the README badge agree; a pack-test assertion keeps them in step.
+- **`postToPR` requires a fully-qualified PR selector**: a bare number (`pr: "123"`) is resolved by `gh` against the reviewed repository's own remote, and that repository is untrusted content — so its `origin` would decide where the comment is published. `owner/repo#N` or a PR URL pins the target; reading a PR by bare number stays allowed (the documented `scope=pr` behaviour).
 
 
 Redirection (including `2>/dev/null`) stays fully refused: it is the read/write primitive that bypasses the allowlist, and allowing it would require proving every destination harmless. Let the command write to stdout instead.

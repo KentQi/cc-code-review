@@ -165,9 +165,10 @@ check("every tarball path is a regular packaged file", dryFiles.every((f) => !f.
 // files field even if the forbidden list above is not updated.
 truthy(`tarball is lean (${dryFiles.length} files)`, dryFiles.length <= 20, `${dryFiles.length} files`);
 const unpackedBytes = dry[0]?.unpackedSize ?? 0;
-// The docs (README/CHANGELOG) are ~160KB of the total; scripts/ used to add
-// another ~190KB. A re-widened files field crosses this ceiling immediately.
-truthy(`tarball unpacked size is runtime-sized (${Math.round(unpackedBytes / 1024)}KB)`, unpackedBytes < 700 * 1024);
+// The docs (README/CHANGELOG) are ~170KB of the total and grew with the
+// 1.18.5–1.18.7 security sections; scripts/ used to add another ~190KB. A
+// re-widened files field crosses this ceiling immediately.
+truthy(`tarball unpacked size is runtime-sized (${Math.round(unpackedBytes / 1024)}KB)`, unpackedBytes < 720 * 1024);
 
 /* ---- 3. pack for real, extract, and run the extracted copy ---- */
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cc-pack-"));

@@ -1828,7 +1828,7 @@ registerTool(
     baseRef: z.string().optional().describe("Base branch/tag for scope=branch and for scope=auto's branch step (default: auto-detect the default branch). A validated ref always reaches the reviewer — it is never silently dropped."),
     focus: z.string().optional().describe("Extra review focus or instructions, e.g. '重点看并发安全'"),
     outputLanguage: z.string().default("中文").describe('Language for the report, e.g. "中文" or "English"'),
-    postToPR: z.boolean().default(false).describe("Also post the summary comment to a GitHub PR via gh. Requires pr (the PR to comment on) — without it the call is refused before any paid work (default false — report only)."),
+    postToPR: z.boolean().default(false).describe("Also post the summary comment to a GitHub PR via gh. Requires a fully-qualified pr — \"owner/repo#123\" or a GitHub PR URL; a bare number is refused because gh would resolve it against the reviewed repository's remote (default false — report only)."),
     fix: z.boolean().default(false)
       .describe("Fix mode: after the report, Claude Code edits the repo files to fix the confirmed findings (Edit only, no git commands, no commit; .git and secret paths are deny-listed). Adds a '## Fixes Applied' section."),
     effort: z.enum(["low", "medium", "high", "xhigh", "max"]).default("max")
@@ -1885,9 +1885,22 @@ registerTool(
     // never named. Refuse before anything paid starts.
     if (postToPR && !prCheck.pr) {
       return err(
-        `postToPR=true requires a pr — name the pull request to comment on ("123", "owner/repo#123", or a GitHub PR URL). ` +
+        `postToPR=true requires a pr — name the pull request to comment on ("owner/repo#123" or a GitHub PR URL; a bare number is not accepted for postToPR). ` +
         `Without one the reviewer has no target for the summary comment: it would either fail after burning turns or choose a PR itself and publish ` +
-        `the review somewhere you never named. Pass pr (e.g. pr: "123"), or set postToPR=false to keep the report local.`
+        `the review somewhere you never named. Pass pr (e.g. pr: "owner/repo#123"), or set postToPR=false to keep the report local.`
+      );
+    }
+    // postToPR + a BARE number: gh resolves "123" against the reviewed
+    // repository's own remote, and the reviewed repository is untrusted content —
+    // its origin decides where the summary comment is published. owner/repo#N and
+    // a URL pin the target to what the caller named, so postToPR requires one of
+    // those. (Reading a PR by bare number stays allowed: the reviewed repository
+    // resolving its own PR number is the documented scope=pr behaviour.)
+    if (postToPR && /^\d+$/.test(prCheck.pr)) {
+      return err(
+        `postToPR=true requires a fully-qualified pr — "${prCheck.pr}" would be resolved by gh against the reviewed repository's own remote, ` +
+        `which the repository controls, so the comment could land on a different repository than the one you meant. ` +
+        `Pass "owner/repo#${prCheck.pr}" or a GitHub PR URL, or set postToPR=false to keep the report local.`
       );
     }
     const langCheck = validateLanguage(args.outputLanguage);

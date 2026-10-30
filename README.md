@@ -191,6 +191,7 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 - **自审保护整条 guard/spawn 管线**：`src/*.js`、`scripts/pre-tool-hook.js`、`scripts/init.mjs`、`scripts/lib/**`、`assets/skills/**` 在 fix 模式下不可写——改 `src/index.js` 或 `src/claude.js` 与改 hook 一样能让后续所有 run 卸防。
 - **hook 对无法判定的 payload fail-closed**：非法 JSON、空 stdin、非对象、缺 `tool_name` 一律拒绝（此前 exit 0）；解析成功但属于 hook 不负责的工具仍放行（那些由服务端 allowlist 管）。
 - **Node ≥ 20**：声明的最低运行时、CI 矩阵（20/22/24）与 README 徽章一致，并由 pack-test 断言锁住。
+- **`postToPR` 需要完整 PR 选择器**：`pr: "123"` 会被 `gh` 按被审仓库自己的 remote 解析，而被审仓库是不可信内容——评论目标因此由仓库控制。`owner/repo#N` 或 PR URL 把目标钉死在调用方指名的仓库；只读评审用裸号仍然允许（`scope=pr` 的既有行为）。
 
 hook 还有第二条确定性规则：**git 的 `--output=` / `--output-directory=` 会让"只读"命令写文件**（`git diff/show/log --output=<file>`、`git format-patch --output-directory=` 实测都会落盘；`--output-to=` 不是真实旗标）。deny glob 对这条无能为力——Bash 规则是整条命令前缀匹配，`Bash(git diff --output=*)` 拦不住 `git diff HEAD --output=x`，而中间带 `*` 的规则语义无法从 CLI 外验证——所以这一条由 hook 直接判掉。注意 `grep --output`、`find -print` 等非 git 的 `--output` 不受影响。
 

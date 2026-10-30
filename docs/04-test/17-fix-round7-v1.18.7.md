@@ -39,6 +39,7 @@ status: final
 | P3-6.5 | P3 | README 说 baseRef 非法字符「会被忽略」，代码是硬拒 | 文案改为「评审前拒绝」 |
 | P3-6.6 | P3 | 审计文档违反 `CLAUDE-PROJECT-RULES` §四（无 frontmatter、不在 `/docs/`、命名不合规） | **完整合规**：19 份文档 `git mv` 到 `docs/04-test/NN-类型-主题-vX.Y.md`，补 YAML frontmatter，重写跨文档引用，新增 `docs/README.md` 索引与旧路径映射；`audit/` 只留指针（规则 §四.1/2/3/7） |
 | P3-6.7 | P3 | `.env.example` 在权限层与 hook 层不一致且未文档化 | 代码注释说明这是有意的 over-block，并由 p0 断言锁定 |
+| 追加 | P2 | `postToPR` + 裸 PR 号：`gh` 按被审仓库 remote 解析，评论目标由仓库控制 | 要求完整选择器（`owner/repo#N` 或 URL）；裸号只读评审仍允许 |
 
 ## 验证
 

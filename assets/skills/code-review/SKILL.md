@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Comprehensive code review pipeline with the same three-phase fleet claude's own /code-review uses — parallel finder subagents (8 at medium/high, 10 at max), one verifier per surviving candidate, a sweep finder — then 0-100 confidence scoring, keeps only findings >= 75, outputs a structured markdown report. Use when asked to review code changes, a pull request, a branch, or the working tree. Adapted from Anthropic's official code-review plugin.
+description: Comprehensive code review pipeline with the same three-phase fleet claude's own /code-review uses — parallel finder subagents (the run's prompt states the level's exact fleet), one verifier per surviving candidate, a sweep finder — then 0-100 confidence scoring, keeps only findings >= 75, outputs a structured markdown report. Use when asked to review code changes, a pull request, a branch, or the working tree. Adapted from Anthropic's official code-review plugin.
 ---
 
 # Code Review
@@ -23,7 +23,11 @@ local changes exist, review the PR and say what you did about the local changes.
 1. **Make a todo list** of these steps first.
 
 2. **Establish the diff**
-   - PR: `gh pr view <N> --json state,title,body` and `gh pr diff <N>`
+   - PR: `gh pr view <selector> --json state,title,body` and `gh pr diff <selector>`
+     — use the selector EXACTLY as the caller named it. `owner/repo#N` or a PR
+     URL pins the repository; a bare number is resolved against the reviewed
+     repo's own remote, which can be a different repository, so never reduce a
+     full selector to a bare number.
    - Branch range: `git log --oneline <base>..HEAD`, then `git diff <base>...HEAD`
      (`git merge-base <base> HEAD` is NOT in this run's Bash allowlist — the
      two-dot/dot-dot forms express the same base without it)
@@ -37,15 +41,15 @@ local changes exist, review the PR and say what you did about the local changes.
    the directories of changed files) that govern the changed code.
 
 4. **Reviewer fleet — the same three-phase structure claude's own
-   /code-review playbook uses.** The level sets the fleet, not the diff:
-   - **low**: one careful diff pass, no subagents, at most 4 findings.
-   - **medium / high**: 8 finder subagents (the 3+5 shape × up to 6 candidates), findings capped at 8.
-   - **max / xhigh**: 10 finder subagents (the 5+5 shape × up to 8 candidates), findings capped at 15.
+   /code-review playbook uses.** The prompt's `Reviewer fleet (level …)` line
+   states this run's exact numbers — the finder count, candidates per finder and
+   the findings cap. Use it verbatim instead of assuming a fleet size; low is a
+   single careful diff pass with no subagents.
 
    The finder slots are filled from the 5 briefs below: five finders run one brief
-   each; the extra 3 (medium/high) split briefs #1, #2 and #3 across file groups,
-   and at max every brief is split (+5) so each brief runs twice. Never invent a
-   new angle.
+   each; the extra finders split briefs #1, #2 and #3 across file groups at the
+   lighter levels, and at the heaviest every brief is split so each brief runs
+   twice. Never invent a new angle.
 
    Then, at every level with a fleet:
    - **Phase 1 — find.** Dispatch the finders in ONE message (they run in
@@ -53,7 +57,8 @@ local changes exist, review the PR and say what you did about the local changes.
      brief across files rather than inventing new angles. Each finder returns
      candidates as `{file, line, summary, failure_scenario}`.
    - **Phase 2 — verify (1 vote).** Dedup candidates that point at the same
-     line/mechanism, keep at most 20 (drop the least severe first), then run
+     line/mechanism, keep at most the candidate cap the prompt states (drop the
+     least severe first), then run
      **one verifier subagent per surviving candidate** (send each batch of
      verifiers in ONE message as well): it gets the diff, the file and the claim,
      and answers CONFIRMED / PLAUSIBLE / REFUTED with the evidence. Keep CONFIRMED
@@ -62,8 +67,8 @@ local changes exist, review the PR and say what you did about the local changes.
    - **Phase 3 — sweep.** One more finder, as a fresh reviewer that sees the
      verified list, looks ONLY for gaps it does not already contain.
 
-   That is `finders + one-verifier-per-candidate + 1 sweep` subagents, so a
-   max-level review legitimately exceeds 15 in total. If the Agent tool is not
+   That is `finders + one-verifier-per-candidate + 1 sweep` subagents, so the
+   total legitimately exceeds the findings cap. If the Agent tool is not
    available, do every angle and every verification yourself, sequentially —
    never skip an angle for lack of fan-out. Give each subagent the diff (or the
    exact commands to obtain it) plus its brief.
@@ -86,7 +91,10 @@ local changes exist, review the PR and say what you did about the local changes.
    > ANSI-C quoting (`$'...'`). Reads must stay inside the repository: `rg`/`find`
    > with an outside path (`~`, `..`, an absolute path elsewhere) is refused, so
    > search from `.`. For file contents and line ranges prefer the Read/Grep/Glob
-   > tools (sed is not a permitted sink).
+   > tools (sed is not a permitted sink). Those tools are confined to the
+   > repository as well: a Read `file_path` and a Grep/Glob `path` outside it
+   > are denied, and secret files (.env, keys, credentials) are refused — point
+   > Grep/Glob at `.`.
 
    Every subagent returns ONLY a JSON list of candidate issues — the same shape
    claude's own playbook uses:
@@ -142,7 +150,9 @@ local changes exist, review the PR and say what you did about the local changes.
    - real issues on lines the changes did not modify
 
 7. **Final report** — print as your FINAL message (this is the deliverable).
-   Do NOT post anything to GitHub unless the caller explicitly asked.
+   Do NOT post anything to GitHub unless the caller explicitly named a PR to post
+   it to. If posting was requested but no PR was named, report that a PR is
+   required instead of guessing one.
    Keep the H2 headings exactly as written below, in English, regardless of the
    report language; translate only the body text.
 

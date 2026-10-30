@@ -34,6 +34,24 @@ const guardUrl = pathToFileURL(
 
 const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 const READ_TOOLS = new Set(["Read"]);
+// Granted as bare rules by reviewAllowedTools(); they carry a path field and
+// used to produce no decision at all (audit P1-5).
+const GREP_GLOB_TOOLS = new Set(["Grep", "Glob"]);
+
+/**
+ * The policy tables and the fingerprint live in src/shell-guard.js so the hook
+ * and the server hash the same policy (audit P1-13). Load it once: every tool
+ * branch needs the tables, and a guard that cannot load must fail closed.
+ */
+let guardPolicy = null;
+let guardPolicyError = null;
+try {
+  guardPolicy = await import(guardUrl);
+} catch (err) {
+  guardPolicyError = err;
+}
+const PROTECTED_WRITE = guardPolicy?.PROTECTED_WRITE;
+const isSecretPath = guardPolicy?.isSecretPath;
 
 /**
  * Info mode (CC_REVIEW_GUARD_INFO=1): print the policy fingerprint and exit.
@@ -45,10 +63,8 @@ const READ_TOOLS = new Set(["Read"]);
  */
 if (process.env.CC_REVIEW_GUARD_INFO === "1") {
   try {
-    const { policyFingerprint } = await import(
-      pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "shell-guard.js")).href,
-    );
-    fs.writeSync(1, JSON.stringify({ fingerprint: policyFingerprint() }) + "\n");
+    if (!guardPolicy) throw guardPolicyError || new Error("shell-guard.js did not load");
+    fs.writeSync(1, JSON.stringify({ fingerprint: guardPolicy.policyFingerprint() }) + "\n");
   } catch (e) {
     fs.writeSync(1, JSON.stringify({ fingerprint: null, error: String(e?.message || e) }) + "\n");
   }
@@ -56,67 +72,96 @@ if (process.env.CC_REVIEW_GUARD_INFO === "1") {
 }
 
 /**
- * In-repo paths that are execution configuration rather than source: writing them
- * survives the run and fires later (a git hook on the next commit, a project
- * .claude/settings.json hook on the next session, direnv on the next cd, a CI
- * workflow on the next push). fix mode is allowed to change source; it is not
- * allowed to plant something that runs. Case-insensitive because macOS/Windows
- * resolve .GIT to .git and the path check must not depend on the caller's spelling.
- *
- * .gitattributes/.gitconfig are here because they can name a diff/filter driver
- * that git then executes (see repoRunsGitPrograms in src/claude.js).
+ * package.json is not wholesale protected: fix mode legitimately edits its
+ * metadata (dependencies, scripts.test). What must never be planted is an
+ * install hook, which runs the next time anyone runs npm install. Only the
+ * Write tool carries the full new body, so only Write is checked here; an Edit
+ * or MultiEdit can still introduce the same key one line at a time (documented
+ * residual — the permission engine denies the file name, not the content).
  */
-const PROTECTED_WRITE = [
-  /(^|\/)\.claude(\/|$)/i,
-  /(^|\/)\.envrc(\.|$)/i,
-  /(^|\/)\.github\/workflows(\/|$)/i,
-  /(^|\/)\.vscode(\/|$)/i,
-  /(^|\/)\.idea(\/|$)/i,
-  /(^|\/)\.mcp\.json$/i,
-  /(^|\/)\.gitmodules$/i,
-  /(^|\/)\.gitattributes$/i,
-  /(^|\/)\.gitconfig$/i,
-  // Self-review: the reviewed repository can be this very package. Writing its
-  // guard files would disarm the hook for every later run, so these two
-  // package-relative paths are protected even though they are ordinary source.
-  // Root-anchored on purpose — other src/* files stay editable.
-  /^scripts\/pre-tool-hook\.js$/i,
-  /^src\/shell-guard\.js$/i,
-];
+const PACKAGE_INSTALL_SCRIPT = /["'](?:pre|post)?install["']\s*:/;
 
-/**
- * Secret material a review must not copy into the transcript. Review mode may
- * read source, but a credential read through the Read tool ends up in the
- * transcript, the run log and the report, so the path is refused even though
- * it is inside the reviewed repository (audit SEC-23). This follows the
- * write-side secret list in prompt.js; .git/ is deliberately absent — git*
- * commands already report repository paths and a review may need git metadata,
- * while a real secret file has no legitimate reason to be read. Templates are
- * the exception: .env.example documents configuration without a credential.
- */
-const SECRET_READ = [
-  /(^|\/)\.ssh(\/|$)/i,
-  /(^|\/)\.aws(\/|$)/i,
-  /(^|\/)\.gnupg(\/|$)/i,
-  /(^|\/)\.netrc$/i,
-  /(^|\/)\.pgpass$/i,
-  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)[^/]*$/i,
-  /(^|\/)[^/]+\.(pem|key|p12|pfx|keystore|jks)$/i,
-  /(^|\/)credentials(\.[^/]*)?$/i,
-];
-// .env is a separate rule so a template can be allowed without exempting a
-// .env.example file that sits inside .ssh/.aws (the directory rules above win).
-const SECRET_ENV = /(^|\/)\.env(\.[^/]*)?$/i;
-const SECRET_READ_ALLOW = /(^|\/)\.env\.(example|sample|template|dist)$/i;
+function packageJsonAddsInstallScript(content) {
+  if (typeof content !== "string") return false;
+  try {
+    const pkg = JSON.parse(content);
+    const scripts = pkg && typeof pkg === "object" ? pkg.scripts : null;
+    if (!scripts || typeof scripts !== "object" || Array.isArray(scripts)) return false;
+    return ["preinstall", "install", "postinstall"].some((k) =>
+      Object.prototype.hasOwnProperty.call(scripts, k));
+  } catch {
+    // An unparseable body is not a package.json anyone can install; fall back
+    // to the literal key so a truncated write cannot slip the hook through.
+    return PACKAGE_INSTALL_SCRIPT.test(content);
+  }
+}
 
-/** Why `relSlash` is secret material review mode must not Read, or null. */
-function secretReadProblem(relSlash) {
-  const why = SECRET_READ.some((re) => re.test(relSlash)) ||
-    (SECRET_ENV.test(relSlash) && !SECRET_READ_ALLOW.test(relSlash));
-  if (!why) return null;
-  return "Read blocked: `" + relSlash + "` is secret material (.env, key or credential file). " +
+/** Why relSlash is secret material, or null. label is the tool + decision verb. */
+function secretPathProblem(relSlash, label, action) {
+  if (!isSecretPath(relSlash)) return null;
+  if (action === "write") {
+    return label + " blocked: `" + relSlash + "` is secret material (.env, credential, key or vault file). " +
+      "fix mode may edit source; it must not create or modify credentials, keys or vaults. " +
+      "Point the fix at a non-secret file; `.env.example` / `.env.sample` templates are allowed.";
+  }
+  return label + " blocked: `" + relSlash + "` is secret material (.env, credential, key or vault file). " +
     "A review must not copy credentials into the transcript, run log or report. " +
     "Read a non-secret file instead; `.env.example` / `.env.sample` templates are allowed.";
+}
+
+/** Why relSlash is secret material review mode must not Read, or null. */
+function secretReadProblem(relSlash, tool = "Read") {
+  return secretPathProblem(relSlash, tool, "read");
+}
+
+/**
+ * The same boundary for the Bash surface (audit P1-4): rg/grep/git view can read
+ * .env, keys and credential stores without going through the Read tool, and the
+ * text lands in the transcript/run log/report just the same. Scan every
+ * whitespace/operator-delimited token, including the value after =, the path
+ * after a git rev: prefix, and a Windows backslash path.
+ */
+function secretBashProblem(command) {
+  // A dot-glob can expand to the repository's dotfiles before the program
+  // runs: `git show HEAD:a | cat .*` and `rg -n x .*` read .env / .npmrc /
+  // .ssh without ever spelling them. git also expands its own pathspec globs
+  // even when the shell quoted them (`git diff -- 'src/.*'`). The guard's
+  // tokenizer answers both, while a quoted regex (rg '.*', find -name '.*')
+  // stays usable.
+  const dotGlob = guardPolicy.dotGlobProblem(String(command));
+  if (dotGlob) return dotGlob;
+
+  const tokens = String(command).split(/[\s;|&()<>'"`,]+/);
+  for (const raw of tokens) {
+    if (!raw || raw === "-") continue;
+    const candidates = [raw];
+    const eq = raw.indexOf("=");
+    if (eq > 0) candidates.push(raw.slice(eq + 1));
+    const colon = raw.lastIndexOf(":");
+    if (colon > 0 && !/^[A-Za-z]:[\\/]/.test(raw)) candidates.push(raw.slice(colon + 1));
+    // A Windows path is the one case where backslashes are separators rather
+    // than regex escapes; do not normalize a pattern such as \.env, which is a
+    // legal way to search for the literal dot. Only a host that actually treats
+    // these as paths gets the normalized candidate.
+    if (process.platform === "win32" && /^(?:[A-Za-z]:\\|\\\\)|^\.{1,2}\\/.test(raw)) {
+      candidates.push(raw.replace(/\\/g, "/"));
+    }
+    for (const candidate of candidates) {
+      const clean = candidate.replace(/^\.\//, "");
+      if (!clean) continue;
+      if (isSecretPath(clean)) return clean;
+      // A glob can name the secret without spelling it: .env* / credentials* /
+      // [.]env all expand to the same file before the command runs. Judge the
+      // glob-stripped spelling too, so the check cannot be stepped around with
+      // one wildcard (audit P1-4).
+      const globless = clean.replace(/[*?\[\]]/g, "");
+      // A bare "secrets" directory/file is not on the list (the rule is
+      // secrets.<ext>), but secrets* is a glob that can match secrets.yaml.
+      if (globless && globless !== clean &&
+        (isSecretPath(globless) || /(^|\/)secrets$/.test(globless))) return clean;
+    }
+  }
+  return null;
 }
 
 let raw = "";
@@ -154,6 +199,17 @@ process.stdin.on("error", () => {
 
 process.stdin.on("end", async () => {
   const deny = (reason) => emitDeny(reason, 0);
+
+  // The policy module now carries the write/read/Bash tables, so a hook that
+  // cannot load it has no policy at all: fail closed for every payload shape,
+  // including one we would otherwise treat as "not ours" and pass through.
+  if (guardPolicyError || !PROTECTED_WRITE || typeof isSecretPath !== "function" ||
+    typeof guardPolicy?.dotGlobProblem !== "function") {
+    emitDeny(
+      "the shell policy failed to load (" + (guardPolicyError?.message || "missing exports") + "); refusing the tool call (fail closed)",
+      1,
+    );
+  }
 
   /**
    * Lexical containment (path.relative) can be escaped by a directory junction
@@ -232,6 +288,17 @@ process.stdin.on("end", async () => {
     if (execCfg) {
       deny(`${tool} blocked: ${relSlash} is execution configuration — it runs code (or decides what runs) when the project is opened, its diff is taken, or CI starts. fix mode may edit source files, not plant persistence. Edit the source file the finding points at instead.`);
     }
+    // A credential file planted in the repo is read by the next reviewer and
+    // GitHub-facing tooling; fix mode must not create or modify one (audit
+    // P2-2: the write side was missing the secret patterns entirely).
+    const secret = secretPathProblem(relSlash, tool, "write");
+    if (secret) deny(secret);
+    // package.json is only special-cased for the keys that make npm RUN
+    // something on the next install. Metadata edits stay allowed (audit P1-3).
+    if (tool === "Write" && /(^|\/)package\.json$/i.test(relSlash) &&
+      packageJsonAddsInstallScript(payload?.tool_input?.content)) {
+      deny(`${tool} blocked: ${relSlash} would gain an install hook (scripts.preinstall/install/postinstall), which runs the next time anyone runs npm install. fix mode may change package metadata, not plant an install-time command. Write the package.json without that script; install hooks are not permitted in fix mode.`);
+    }
     process.exit(0);
   }
 
@@ -265,6 +332,40 @@ process.stdin.on("end", async () => {
     process.exit(0);
   }
 
+  // ---- Grep/Glob: the same boundary as Read, keyed on the path field ----
+  // reviewAllowedTools() grants both as bare rules, so this is their only
+  // boundary. Grep's pattern is a regex, not a path; Glob's pattern is a glob
+  // rooted at its path argument, so only that path is resolved (audit P1-5).
+  if (GREP_GLOB_TOOLS.has(tool)) {
+    const root = process.env.CLAUDE_REVIEW_REPO_ROOT;
+    if (!root) deny(`${tool} blocked: no repository root was provided to the guard (fail closed)`);
+    const target = String(payload?.tool_input?.path ?? "");
+    // An omitted path means the process cwd, which the launcher sets to the
+    // repository root. That is inside the boundary, so only check it when the
+    // caller names one.
+    if (!target) process.exit(0);
+    let rel;
+    try {
+      rel = realContainment(root, target);
+    } catch {
+      deny(`${tool} blocked: cannot resolve the target path against the repository root (fail closed)`);
+    }
+    if (rel === null) {
+      deny(`${tool} blocked: cannot resolve the target path against the repository root (fail closed)`);
+    }
+    // The root itself is a legitimate search root for both tools (rel is ""),
+    // unlike Read, which has no use for "the directory as a file" (audit P2-3).
+    if (rel.startsWith("..") || path.isAbsolute(rel)) {
+      deny(`${tool} blocked: the review may only search inside the reviewed repository (${root}), not ${target}`);
+    }
+    if (rel) {
+      const relSlash = rel.split(path.sep).join("/");
+      const secret = secretReadProblem(relSlash, tool);
+      if (secret) deny(secret);
+    }
+    process.exit(0);
+  }
+
   if (tool !== "Bash") process.exit(0);
 
   // Fail closed when the command is not a string: analyseCommand treats a
@@ -277,11 +378,9 @@ process.stdin.on("end", async () => {
     return;
   }
 
-  let guard;
-  try {
-    ({ guardVerdict: guard } = await import(guardUrl));
-  } catch (err) {
-    deny(`shell guard failed to load (${err?.message || err}); refusing to run Bash`);
+  const guard = guardPolicy?.guardVerdict;
+  if (typeof guard !== "function") {
+    deny("shell guard failed to load (guardVerdict is missing); refusing to run Bash");
     return;
   }
 
@@ -300,6 +399,20 @@ process.stdin.on("end", async () => {
   } catch (err) {
     deny(`shell guard failed (${err?.message || err}); refusing to run Bash`);
     return;
+  }
+
+  // The guard scopes paths but deliberately allows the repository's own files;
+  // a secret INSIDE the repo is still a secret once rg/grep/git print it into
+  // the transcript (audit P1-4). Only run this after the guard allowed the
+  // command, so a policy denial keeps its more specific reason.
+  let secret = null;
+  try {
+    secret = secretBashProblem(command);
+  } catch (err) {
+    deny(`Bash blocked: the secret-material check failed (${err?.message || err}); refusing to run Bash (fail closed)`);
+  }
+  if (secret) {
+    deny(`Bash blocked: the command names or globs secret material ("${secret}") — a .env, credential, key or vault file. A review must not copy credentials into the transcript, run log or report. Read a non-secret file instead; .env.example / .env.sample templates are allowed.`);
   }
   process.exit(0);
 });

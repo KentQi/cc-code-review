@@ -37,6 +37,13 @@ const check = (label, actual, expected) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${label}${ok ? "" : `\n        expected ${JSON.stringify(expected)}\n        actual   ${JSON.stringify(actual)}`}`);
 };
 const truthy = (label, cond) => check(label, !!cond, true);
+// A skipped check is NOT a pass: it is printed and counted separately so a
+// fixture that stopped working can never look green (same rule as cross-cases).
+let skipped = 0;
+const skip = (label) => {
+  skipped++;
+  console.log(`SKIP  ${label}`);
+};
 
 /* ---------------- deny-list coverage (M1 / H1 / H2) ---------------- */
 const denied = new Set(reviewDisallowedTools({ fix: true }));
@@ -384,8 +391,12 @@ try {
   check("H4: a live driver defined in a WORKTREE's real config is refused", repoRunsGitPrograms(wt).refusals.length, 1);
   fs.rmSync(path.dirname(wt), { recursive: true, force: true });
 } catch (e) {
-  check("H4: worktree fixture runnable (git worktree support)", true, true);
-  console.log("        (worktree fixture skipped:", e?.message?.slice(0, 80), ")");
+  // Honest skip, never a green check that asserted nothing: the old line was
+  // check("…", true, true), which is true BY CONSTRUCTION, so on any host where
+  // `git worktree add` failed this suite printed ALL PASS while H4 — the
+  // "linked worktree, .git is a FILE, real config carries a live driver" case
+  // that most malicious repositories use — never executed at all (audit P2-8).
+  skip(`H4: worktree fixture unavailable on this host (${String(e?.message || e).slice(0, 120)})`);
 }
 fs.rmSync(wtRoot, { recursive: true, force: true });
 
@@ -999,5 +1010,59 @@ check("effort xhigh maps to review level max (same native playbook as max)", der
   fs.rmSync(home, { recursive: true, force: true });
 }
 
-console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);
+/* ---------------- P1-9: init.mjs carries the settings.json gateway credentials ----------------
+ * The installer prints `✓ gateway: …` from gatewayTarget(), which reads
+ * mergedAuthEnv() = process.env + ~/.claude/settings.json's env block — but the
+ * env block it WROTE came from process.env only. A machine configured entirely
+ * through settings.json (CC Switch's normal shape) therefore got an entry with
+ * no BASE_URL and no token, so every review failed auth. Assert the written
+ * config, not the printed line: the printing was already correct while the
+ * registration was empty. */
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccinit-settings-"));
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({
+    env: {
+      ANTHROPIC_BASE_URL: "https://gateway.invalid",
+      ANTHROPIC_AUTH_TOKEN: "sk-from-settings-token",
+    },
+  }));
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  delete env.CLAUDE_CONFIG_DIR; // claudeConfigDir() must resolve to this HOME
+  for (const k of ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]) delete env[k];
+  const r = spawnSync(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "init.mjs")], {
+    env, encoding: "utf8", timeout: 120000,
+  });
+  check("init.mjs still detects a settings.json-only gateway", /gateway: https:\/\/gateway\.invalid/.test(`${r.stdout || ""}${r.stderr || ""}`), true);
+  let written = null;
+  try { written = JSON.parse(fs.readFileSync(path.join(home, ".zcode", "cli", "config.json"), "utf8")); } catch { /* asserted below */ }
+  const entry = written?.mcp?.servers?.["cc-code-review"] ?? {};
+  check("init.mjs copies the settings.json gateway BASE_URL into the entry",
+    entry.env?.ANTHROPIC_BASE_URL, "https://gateway.invalid");
+  check("init.mjs copies the settings.json gateway token into the entry",
+    entry.env?.ANTHROPIC_AUTH_TOKEN, "sk-from-settings-token");
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+/* ---------------- P2-9: the smoke test must fail on a non-OK verdict ----------------
+ * smoke-test only rejected the literal "NOT FOUND", so a CLI path that exists but
+ * cannot run produced `verdict: MISCONFIGURED`, "SMOKE TEST PASSED" and exit 0 —
+ * a broken CI stub kept nine green matrix cells while every real review refused
+ * to start. Run the real suite with such a path and require a NON-ZERO exit that
+ * names the verdict. */
+{
+  const smoke = path.join(path.dirname(fileURLToPath(import.meta.url)), "smoke-test.mjs");
+  const r = spawnSync(process.execPath, [smoke], {
+    env: { ...process.env, CLAUDE_CODE_PATH: path.join(os.tmpdir(), "no-such-claude-" + process.pid) },
+    encoding: "utf8",
+    timeout: 120000,
+    windowsHide: true,
+  });
+  const out = `${r.stdout || ""}${r.stderr || ""}`;
+  check("smoke-test exits non-zero when the verdict is not OK", r.status !== 0, true);
+  truthy("smoke-test names the verdict and does not print PASSED",
+    /verdict is MISCONFIGURED/.test(out) && !/SMOKE TEST PASSED/.test(out), out.slice(-300));
+}
+
+console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed${skipped ? `, ${skipped} skipped` : ""}`);
 process.exit(fail ? 1 : 0);

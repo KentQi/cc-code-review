@@ -12,11 +12,12 @@
  * Exit 0 only when a real report came back AND at least one subagent report
  * was captured (incrementally, with a durable JSONL).
  */
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { connectServer } from "./lib/mcp-client.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const plan = { cap: null };
@@ -98,43 +99,19 @@ execFileSync("git", ["-C", repo, "add", "-A"]);
 execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add auth/config/paging helpers"], { env: gitEnv });
 console.log("fixture repo:", repo);
 
-/* ---------- stdio client ---------- */
-function startServer() {
-  const child = spawn(process.execPath, [path.join(ROOT, "src", "index.js")], { stdio: ["pipe", "pipe", "inherit"] });
-  let buf = Buffer.alloc(0);
-  const pending = new Map();
-  let id = 0;
-  child.stdout.on("data", (d) => {
-    buf = Buffer.concat([buf, d]);
-    let i;
-    while ((i = buf.indexOf(0x0a)) >= 0) {
-      const line = buf.subarray(0, i).toString("utf8").trim();
-      buf = buf.subarray(i + 1);
-      if (!line.startsWith("{")) continue;
-      try {
-        const m = JSON.parse(line);
-        if (pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
-      } catch { /* ignore */ }
-    }
-  });
-  child.stdin.on("error", () => {});
-  const req = (method, params) => new Promise((resolve, reject) => {
-    const n = ++id;
-    const t = setTimeout(() => reject(new Error(`timeout: ${method}`)), 120_000);
-    pending.set(n, (m) => { clearTimeout(t); resolve(m); });
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: n, method, params }) + "\n");
-  });
-  const ready = (async () => {
-    await req("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "paid-smoke", version: "0" } });
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
-  })();
-  return { call: (name, args) => req("tools/call", { name, arguments: args }), ready, kill: () => child.kill() };
-}
+/* ---------- stdio client (shared; this suite budgets 120s per request) ---------- */
+const srv = connectServer({
+  args: [path.join(ROOT, "src", "index.js")],
+  stdio: ["pipe", "pipe", "inherit"],
+  timeoutMs: 120_000,
+  clientInfo: { name: "paid-smoke", version: "0" },
+  requireJsonObjectPrefix: true,
+});
+await srv.initialize();
 const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
 
 /* ---------- one real review ---------- */
-const s = startServer();
-await s.ready;
+const s = { call: (name, args) => srv.call(name, args), close: () => srv.close() };
 const t0 = Date.now();
 console.log("launching review (effort=low, reviewLevel=low, timeout 8m)…");
 const args = { repoPath: repo, scope: "last-commit", effort: "low", reviewLevel: "low", timeoutMinutes: 8, waitForResult: false };
@@ -143,7 +120,7 @@ const started = await s.call("claude_code_review", args);
 const jobId = started.result?.structuredContent?.jobId;
 if (!jobId) {
   console.log("FAIL  no jobId:", textOf(started).slice(0, 500));
-  s.kill();
+  srv.close();
   process.exit(1);
 }
 console.log(`jobId ${jobId} in ${Date.now() - t0}ms`);
@@ -195,5 +172,5 @@ console.log(text.slice(0, 2500));
 
 console.log(`\n${ok ? "PAID SMOKE PASSED" : "PAID SMOKE FAILED"}`);
 console.log("logs stay in %TEMP%/cc-code-review/ for inspection; fixture repo:", repo);
-s.kill();
+srv.close();
 process.exit(ok ? 0 : 1);

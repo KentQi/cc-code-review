@@ -986,6 +986,70 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   s.kill();
 }
 
+/* ================= C27 audit round 5: scope/baseRef, postToPR, sync job status ================= */
+{
+  // P1-6: scope=auto (the tool default) silently DROPPED a validated baseRef, so
+  // claude_code_review({repoPath, baseRef:"release-1.2"}) reviewed another diff
+  // while the report looked normal. The native command is the observable: after
+  // the fix it carries the caller's ref as claude's target.
+  const promptFile = path.join(tmp, `c27-prompt-${process.pid}.txt`);
+  const skills = path.join(tmp, "c27-skills");
+  fs.mkdirSync(skills, { recursive: true });
+  const s = startServer({
+    CLAUDE_CODE_PATH: STUB, STUB_ECHO_PROMPT: promptFile, CLAUDE_REVIEW_SKILL_DIR: skills,
+  });
+  await s.ready;
+  await s.call("claude_code_review", {
+    repoPath: gitRepo2("c27a"), scope: "auto", baseRef: "release-1.2", effort: "medium",
+    waitForResult: true, timeoutMinutes: 2,
+  });
+  let prompt = "";
+  try { prompt = fs.readFileSync(promptFile, "utf8"); } catch { /* asserted below */ }
+  check("C27", "scope=auto forwards baseRef as the native command target (P1-6)",
+    /^\/code-review medium release-1\.2/.test(prompt.trim()), prompt.slice(0, 140));
+  s.kill();
+
+  // P1-10: postToPR=true with no PR used to be accepted, granting
+  // Bash(gh pr comment:*) while the same prompt forbade naming a PR — the
+  // reviewer either posts to a PR it invented or the comment never lands.
+  // Refuse before any run (and before the gh preflight's own wording).
+  const s2 = startServer({ CLAUDE_CODE_PATH: STUB, CLAUDE_REVIEW_SKILL_DIR: skills });
+  await s2.ready;
+  const r2 = await s2.call("claude_code_review", {
+    repoPath: gitRepo("c27b"), scope: "auto", postToPR: true, waitForResult: false,
+  });
+  const t2 = textOf(r2);
+  check("C27", "postToPR without a PR is refused before any run (P1-10)",
+    r2.result?.isError === true && /postToPR/i.test(t2) && /(?<!postTo)\bPR\b/i.test(t2) && /requir/i.test(t2),
+    t2.slice(0, 240));
+  s2.kill();
+
+  // P1-7: the sync path stamped the result BEFORE settling the job, so a failure
+  // with no status of its own (the log-directory preflight is the free repro)
+  // came back as isError:true + status:"running" — and the stored job kept
+  // answering "running" forever. Settle first, then stamp.
+  const badLog = path.join(tmp, `c27-logdir-${process.pid}`);
+  fs.writeFileSync(badLog, "not a directory");
+  const s3 = startServer({ CLAUDE_CODE_PATH: STUB, CLAUDE_REVIEW_LOG_DIR: badLog });
+  await s3.ready;
+  const r3 = await s3.call("claude_code_review", {
+    repoPath: gitRepo("c27c"), scope: "last-commit", waitForResult: true,
+  });
+  const sc3 = r3.result?.structuredContent || {};
+  check("C27", "a sync run that fails before claude reports a settled status (P1-7)",
+    r3.result?.isError === true && sc3.status !== "running",
+    JSON.stringify({ isError: r3.result?.isError, status: sc3.status }));
+  if (sc3.jobId) {
+    const polled = await s3.call("claude_review_status", { jobId: sc3.jobId });
+    check("C27", "polling the same failed job does not resurrect 'running' (P1-7)",
+      polled.result?.structuredContent?.status !== "running",
+      JSON.stringify(polled.result?.structuredContent?.status));
+  } else {
+    skip("C27", "failed sync job was not registered (no jobId) — polling case skipped");
+  }
+  s3.kill();
+}
+
 /* ---------- summary ---------- */
 const failed = results.filter((r) => !r.ok);
 const skipped = results.filter((r) => r.skipped);

@@ -58,6 +58,21 @@ const text = env.result?.content?.[0]?.text || "";
 console.log("ok: claude_review_env ->");
 console.log(text.split("\n").map((l) => "    " + l).join("\n"));
 if (/NOT FOUND/.test(text)) fail("Claude Code CLI not resolved — fix resolution before shipping");
+// The env tool has THREE verdicts (OK / NOT_FOUND / MISCONFIGURED) and only the
+// first means "a review can run". This smoke test used to reject the literal
+// "NOT FOUND" only, so `CLAUDE_CODE_PATH=/tmp/notacli` printed
+// "verdict: MISCONFIGURED" and still exited 0 — the CI stub could break and all
+// nine matrix cells stayed green while every review refused to start on a user's
+// machine (audit P2-9). Fail on anything that is not OK, and say which.
+const verdict = env.result?.structuredContent?.verdict
+  ?? (/^verdict: (OK|NOT_FOUND|MISCONFIGURED)\b/m.exec(text)?.[1] ?? "UNKNOWN");
+if (verdict !== "OK") {
+  fail(
+    verdict === "MISCONFIGURED"
+      ? "verdict is MISCONFIGURED — CLAUDE_CODE_PATH points at something that exists but cannot run claude; fix it before shipping (see the diagnostics above)"
+      : `verdict is ${verdict}, not OK — a review would refuse to start on this machine (see the diagnostics above)`,
+  );
+}
 
 srv.close();
 console.log("\nSMOKE TEST PASSED");

@@ -1,13 +1,13 @@
 ---
-title: cc-code-review 最终审计报告（六轮汇总）
+title: cc-code-review 最终审计报告（七轮汇总）
 version: v1.18.7
 created: 2026-10-30
 status: final
 ---
 
-# cc-code-review — 最终审计报告（六轮汇总）
+# cc-code-review — 最终审计报告（七轮汇总）
 
-**对象**：从 v1.18.0 到 v1.18.6，6 个 stacked PR（#1 1.18.1 → #2 1.18.2 → #3 1.18.3 → #4 1.18.4 → #5 1.18.5 → #6 1.18.6），5 轮独立审计 + 2 轮残余收口。
+**对象**：从 v1.18.0 到 v1.18.7，7 个 stacked PR（#1 1.18.1 → #2 1.18.2 → #3 1.18.3 → #4 1.18.4 → #5 1.18.5 → #6 1.18.6 → #7 1.18.7），5 轮独立审计 + 3 轮残余收口。
 **结论**：累计 17 条 P0 与 46 条 P1 全部修复；P2/P3 存量 98 条已清，5 条有理由接受，1 条不成立，2 条审计证据被证伪。当前 npm test 7 套件全绿。
 
 ## 1. 轮次与结果
@@ -20,8 +20,9 @@ status: final
 | 4 | 1.18.4 | P2/P3 triage（98 修 / 5 接受 / 1 不成立） | 51 条 | 260 / 300 / 126 / 23 / 150，CI 6/6 |
 | 5 | 1.18.5 | 第三轮审计：7 P0 / 14 P1 / 22 P2 / 8 P3 | 7 P0 + 14 P1 + 21 P2/P3 | 272 / 305 / 163 / 30 / 154 + pack 43 |
 | 6 | 1.18.6 | 1.18.5 残余：P2-1 / P2-3 / P2-22 + P1-4、P1-13、fail-closed 缺口 | 6 项 + lockfile | 292 / 313 / 181 / 30 / 154 + pack 43 |
+| 7 | 1.18.7 | 复核 R-1/R-2/R-3/N-1 + PR #5/#6 审计（1 P1 / 6 P2 / 5 P3） | 16 项 | 320 / 318 / 238 / 30 / 154 + pack 52，CI 18/18 |
 
-## 2. 五轮的关键安全成果
+## 2. 各轮的关键安全成果
 
 - **1.18.1**：shell guard tokenizer 改为 bash argv 视图（$ 单引号、反斜杠、紧贴短选项）；.GIT 大小写；fix 模式持久化路径；仓库自带 git driver 扫描；空报告=失败。
 - **1.18.2**：core.sshCommand RCE（git config --list -z + 子进程 GIT_CONFIG_* 中和）；core.attributesFile；深度 .gitattributes；echo $VAR 凭据外带；Read fail-open；hook stdin fail-open；baseRef 单一校验器；followup 误报。
@@ -74,6 +75,7 @@ status: final
 | #4 | 1.18.4 | OPEN / MERGEABLE / CI 5/6 + 1 queued |
 | #5 | 1.18.5 | OPEN / MERGEABLE / CI 6/6 |
 | #6 | 1.18.6 | OPEN / MERGEABLE / CI 6/6 |
+| #7 | 1.18.7 | OPEN / MERGEABLE / CI 18/18 |
 
 合并顺序 #1 → #5；main 未修改（仍为 659ff49），未打 tag、未发布 npm。
 

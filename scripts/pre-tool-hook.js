@@ -76,7 +76,48 @@ const PROTECTED_WRITE = [
   /(^|\/)\.gitmodules$/i,
   /(^|\/)\.gitattributes$/i,
   /(^|\/)\.gitconfig$/i,
+  // Self-review: the reviewed repository can be this very package. Writing its
+  // guard files would disarm the hook for every later run, so these two
+  // package-relative paths are protected even though they are ordinary source.
+  // Root-anchored on purpose — other src/* files stay editable.
+  /^scripts\/pre-tool-hook\.js$/i,
+  /^src\/shell-guard\.js$/i,
 ];
+
+/**
+ * Secret material a review must not copy into the transcript. Review mode may
+ * read source, but a credential read through the Read tool ends up in the
+ * transcript, the run log and the report, so the path is refused even though
+ * it is inside the reviewed repository (audit SEC-23). This follows the
+ * write-side secret list in prompt.js; .git/ is deliberately absent — git*
+ * commands already report repository paths and a review may need git metadata,
+ * while a real secret file has no legitimate reason to be read. Templates are
+ * the exception: .env.example documents configuration without a credential.
+ */
+const SECRET_READ = [
+  /(^|\/)\.ssh(\/|$)/i,
+  /(^|\/)\.aws(\/|$)/i,
+  /(^|\/)\.gnupg(\/|$)/i,
+  /(^|\/)\.netrc$/i,
+  /(^|\/)\.pgpass$/i,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)[^/]*$/i,
+  /(^|\/)[^/]+\.(pem|key|p12|pfx|keystore|jks)$/i,
+  /(^|\/)credentials(\.[^/]*)?$/i,
+];
+// .env is a separate rule so a template can be allowed without exempting a
+// .env.example file that sits inside .ssh/.aws (the directory rules above win).
+const SECRET_ENV = /(^|\/)\.env(\.[^/]*)?$/i;
+const SECRET_READ_ALLOW = /(^|\/)\.env\.(example|sample|template|dist)$/i;
+
+/** Why `relSlash` is secret material review mode must not Read, or null. */
+function secretReadProblem(relSlash) {
+  const why = SECRET_READ.some((re) => re.test(relSlash)) ||
+    (SECRET_ENV.test(relSlash) && !SECRET_READ_ALLOW.test(relSlash));
+  if (!why) return null;
+  return "Read blocked: `" + relSlash + "` is secret material (.env, key or credential file). " +
+    "A review must not copy credentials into the transcript, run log or report. " +
+    "Read a non-secret file instead; `.env.example` / `.env.sample` templates are allowed.";
+}
 
 let raw = "";
 process.stdin.setEncoding("utf8");
@@ -162,7 +203,12 @@ process.stdin.on("end", async () => {
   if (WRITE_TOOLS.has(tool)) {
     const root = process.env.CLAUDE_REVIEW_REPO_ROOT;
     if (!root) deny(`${tool} blocked: no repository root was provided to the guard`);
-    const target = String(payload?.tool_input?.file_path ?? payload?.tool_input?.path ?? "");
+    // NotebookEdit names its target `notebook_path`; without it the target was
+    // the empty string, containment said "outside", and every notebook edit in
+    // fix mode was refused (audit SEC-25).
+    const target = String(
+      payload?.tool_input?.file_path ?? payload?.tool_input?.notebook_path ?? payload?.tool_input?.path ?? "",
+    );
     let rel;
     try {
       rel = realContainment(root, target);
@@ -211,10 +257,25 @@ process.stdin.on("end", async () => {
     if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
       deny(`Read blocked: the review may only read inside the reviewed repository (${root}), not ${target}`);
     }
+    // A secret inside the repo is still a secret: refuse it before the path is
+    // handed to the model (audit SEC-23).
+    const relSlash = rel.split(path.sep).join("/");
+    const secret = secretReadProblem(relSlash);
+    if (secret) deny(secret);
     process.exit(0);
   }
 
   if (tool !== "Bash") process.exit(0);
+
+  // Fail closed when the command is not a string: analyseCommand treats a
+  // non-string as inert ({ ok: true }), so a payload that carries the command
+  // under another key or wrong type would run unguarded (audit SEC-24). An
+  // empty string is a no-op and stays allowed — the guard already handles it.
+  const command = payload?.tool_input?.command;
+  if (typeof command !== "string") {
+    deny(`Bash blocked: the hook payload carries no command string (got ${command === null ? "null" : typeof command}), so the shell guard cannot inspect it (fail closed).`);
+    return;
+  }
 
   let guard;
   try {
@@ -234,7 +295,7 @@ process.stdin.on("end", async () => {
   }
 
   try {
-    const verdict = guard(payload?.tool_input?.command, { repoRoot });
+    const verdict = guard(command, { repoRoot });
     if (!verdict.ok) deny(verdict.reason);
   } catch (err) {
     deny(`shell guard failed (${err?.message || err}); refusing to run Bash`);

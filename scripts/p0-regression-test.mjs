@@ -365,6 +365,96 @@ if (process.platform !== "win32") {
 }
 
 /* ------------------------------------------------------------------ */
+/* Round-4 regression: fixes landed by the security/runtime agents    */
+/* (P2-11 branch upstream, SEC-15 self-review guard files, SEC-23     */
+/* secret reads, SEC-25 NotebookEdit notebook_path). Same principle   */
+/* as every case above: assert the LIVE hook's decision, not a unit   */
+/* function's opinion.                                                */
+/* ------------------------------------------------------------------ */
+console.log("-- round-4: upstream writes, guard-file writes, secret reads, notebooks");
+{
+  fs.writeFileSync(path.join(REPO, ".env"), "SECRET=1\n");
+  fs.writeFileSync(path.join(REPO, ".env.example"), "SECRET=\n");
+  fs.mkdirSync(path.join(REPO, ".ssh"), { recursive: true });
+  fs.writeFileSync(path.join(REPO, ".ssh", "id_rsa"), "PRIVATE\n");
+  fs.mkdirSync(path.join(REPO, "notebooks"), { recursive: true });
+  fs.writeFileSync(path.join(REPO, "notebooks", "x.ipynb"), "{}\n");
+
+  /** Live hook decision + reason + exit code. */
+  const hookDetail = (toolName, toolInput) => {
+    const payload = JSON.stringify({ tool_name: toolName, tool_input: toolInput, cwd: REPO });
+    const r = spawnSync(process.execPath, [HOOK], {
+      input: payload,
+      env: { ...process.env, CLAUDE_REVIEW_REPO_ROOT: REPO },
+      encoding: "utf8",
+      timeout: 20000,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let out = null;
+    try { out = JSON.parse(String(r.stdout || "").trim().split("\n").pop()); } catch { /* no decision */ }
+    return {
+      // The hook's wire value is "deny"; keep this block's vocabulary aligned
+      // with the hook() helper above ("ALLOW"/"DENY") so the two read the same.
+      decision: out?.hookSpecificOutput?.permissionDecision ? "DENY" : "ALLOW",
+      reason: String(out?.hookSpecificOutput?.permissionDecisionReason ?? ""),
+      status: r.status,
+    };
+  };
+  const bashDetail = (cmd) => hookDetail("Bash", { command: cmd });
+  const writeDetail = (rel) => hookDetail("Write", { file_path: path.join(REPO, rel) });
+
+  // P2-11: the ATTACHED short option (git branch -u<ref>). The permission
+  // allowlist grants the git-branch prefix, so only the hook can tell the read
+  // forms from the upstream write -- and the attached spelling used to slip
+  // past requireFlagsOnly/denyFlags entirely.
+  for (const cmd of [
+    "git branch -uorigin/main",
+    "git branch -u origin/main",
+    "git branch --set-upstream-to=origin/main",
+    "git branch --unset-upstream",
+  ]) {
+    const v = bashDetail(cmd);
+    check("bash DENY branch upstream: " + JSON.stringify(cmd), v.decision, "DENY");
+    check("  ...and the reason names the upstream write: " + JSON.stringify(cmd), /upstream|-u\b/.test(v.reason), true);
+  }
+  // The read forms must keep working (a blanket git-branch deny would break the
+  // branch listing the pipeline relies on).
+  check("bash ALLOW git branch -a after the upstream rule", bash("git branch -a"), "ALLOW");
+  check("bash ALLOW git branch -vv after the upstream rule", bash("git branch -vv"), "ALLOW");
+
+  // SEC-15: the reviewed repository can be this very package. Writing either
+  // guard file would disarm the hook for every later run.
+  for (const rel of ["scripts/pre-tool-hook.js", "src/shell-guard.js"]) {
+    const v = writeDetail(rel);
+    check("write DENY guard file: " + rel, v.decision, "DENY");
+    check("  ...and explains it is execution configuration: " + rel, /execution configuration/.test(v.reason), true);
+  }
+  // Ordinary source stays editable in fix mode -- the deny must be exact.
+  check("write ALLOW ordinary source: src/index.js", write("src/index.js"), "ALLOW");
+  check("write ALLOW a new file: src/new-module.js", write("src/new-module.js"), "ALLOW");
+
+  // SEC-23: review mode must not copy repo secrets into the transcript.
+  const READ = (rel) => hookDetail("Read", { file_path: path.join(REPO, rel) });
+  for (const rel of [".env", ".ssh/id_rsa", ".aws/credentials", "certs/server.pem", ".netrc"]) {
+    const v = READ(rel);
+    check("read DENY secret: " + rel, v.decision, "DENY");
+    check("  ...and names it secret material: " + rel, /secret material/.test(v.reason), true);
+  }
+  check("read ALLOW .env.example", READ(".env.example").decision, "ALLOW");
+  check("read ALLOW ordinary source", READ("src/index.js").decision, "ALLOW");
+
+  // SEC-25: NotebookEdit's target key is notebook_path, not file_path.
+  check("notebook ALLOW inside the repo",
+    hookDetail("NotebookEdit", { notebook_path: path.join(REPO, "notebooks", "x.ipynb"), new_source: "x" }).decision, "ALLOW");
+  check("notebook DENY outside the repo",
+    hookDetail("NotebookEdit", { notebook_path: path.join(os.tmpdir(), "outside-" + process.pid + ".ipynb"), new_source: "x" }).decision, "DENY");
+
+  // Generic policy denials exit 0; the decision JSON (not the exit code) is the
+  // channel. A crash would deny too, so lock the clean exit explicitly (Q18).
+  const policyDeny = bashDetail("git branch -uorigin/main");
+  check("a policy denial exits 0 (clean decision, not a crash)", policyDeny.status, 0);
+}
+
 try { fs.rmSync(REPO, { recursive: true, force: true }); } catch { /* ignore */ }
 if (failures.length) {
   console.log("\n" + failures.length + " FAILURE(S):");

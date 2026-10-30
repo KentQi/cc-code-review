@@ -81,8 +81,10 @@ export const BASH_POLICY = [
         // `git branch <name>` CREATES a branch (a write with no flag to match),
         // so this prefix is only safe when it carries flags and nothing else.
         requireFlagsOnly: true,
-        denyFlags: ["-d", "-D", "-m", "-M", "-c", "-C", "-f", "-t", "--delete", "--move", "--copy",
-          "--force", "--track", "--edit-description", "--set-upstream-to", "--unset-upstream-to", "--unset-upstream"],
+        // -u is the short form of --set-upstream-to: it rewrites .git/config,
+        // so it belongs here even when its value is glued on (-uorigin/main).
+        denyFlags: ["-d", "-D", "-m", "-M", "-c", "-C", "-f", "-t", "-u", "--delete", "--move", "--copy",
+          "--force", "--track", "--edit-description", "--set-upstream", "--set-upstream-to", "--unset-upstream-to", "--unset-upstream"],
       },
     ],
   },
@@ -738,6 +740,26 @@ export function analyseCommand(cmd, opts = {}) {
       // (`git branch`): the per-prefix flag guard is what makes the prefix safe.
       // A bare positional after `git branch` creates a branch: every remaining
       // token must be a flag.
+      //
+      // Denied flags come first: `git branch -u origin/main` also carries a
+      // non-flag operand, so the flags-only check below would refuse it for the
+      // wrong reason. A short option may glue its value on
+      // (-uorigin/main, -torigin/main); without the attached-form match the
+      // flag never reached this table and `git branch -u<ref>` rewrote
+      // .git/config in read-only mode (audit P2-11).
+      const banned = (match.prefix.denyFlags || []).find((flag) =>
+        words.some((w) =>
+          w === flag ||
+          w.startsWith(flag + "=") ||
+          (/^-[^-]$/.test(flag) && w.length > flag.length && w.startsWith(flag))));
+      if (banned) {
+        return {
+          ok: false, kind: "dangerous",
+          reason: "blocked: `" + [words[0], ...match.prefix.words, banned].join(" ") +
+            "` writes (it changes branches or refs). Review mode is read-only — list branches instead (`git branch -a`).",
+          chained, substituted: false, dangerous: true,
+        };
+      }
       if (match.prefix.requireFlagsOnly) {
         const operand = words.slice(match.prefix.words.length + 1).find((w) => !w.startsWith("-"));
         if (operand) {
@@ -748,15 +770,6 @@ export function analyseCommand(cmd, opts = {}) {
             chained, substituted: false, dangerous: true,
           };
         }
-      }
-      const banned = (match.prefix.denyFlags || []).find((flag) => words.some((w) => w === flag || w.startsWith(flag + "=")));
-      if (banned) {
-        return {
-          ok: false, kind: "dangerous",
-          reason: "blocked: `" + [words[0], ...match.prefix.words, banned].join(" ") +
-            "` writes (it changes branches or refs). Review mode is read-only — list branches instead (`git branch -a`).",
-          chained, substituted: false, dangerous: true,
-        };
       }
       const why = segmentProblem(words, opts.repoRoot, segs[i].quoted);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };

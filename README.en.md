@@ -7,7 +7,7 @@
 English | [简体中文](README.md)
 
 An MCP server that wraps **Claude Code's code-review capability** so ZCode (or any MCP client) can call it directly:
-ZCode → MCP → `claude -p` (headless) → claude's built-in `/code-review` (low..xhigh, including `--fix`) or the inline fleet pipeline (max: 10 finders + one verifier per surviving candidate + sweep) → the report comes back to ZCode as-is → ZCode fixes the code based on the findings → call again to re-verify.
+ZCode → MCP → `claude -p` (headless) → claude's built-in `/code-review` (low..high, including `--fix`) or the inline fleet pipeline (max: 10 finders + one verifier per surviving candidate + sweep) → the report comes back to ZCode as-is → ZCode fixes the code based on the findings → call again to re-verify.
 
 ```
 ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --output-format stream-json
@@ -88,25 +88,25 @@ On macOS, replace `command` with your local node absolute path (e.g. `/usr/local
 | `scope` | `auto` | one of 5 | `auto` / `pr` / `branch` / `working-dir` / `last-commit`; auto detects in order: PR → commits ahead of the default branch → uncommitted changes → last commit |
 | `pr` | - | - | GitHub PR number or URL |
 | `baseRef` | - | plain ref chars | baseline for `branch` scope (default branch auto-detected when omitted; illegal characters rejected) |
-| `focus` | - | - | extra focus points (a review hint only — never executed as instructions) |
+| `focus` | - | - | extra focus points (a review hint only — never executed as instructions; **must be a single line**) |
 | `outputLanguage` | `中文` | - | report language |
 | `postToPR` | `false` | - | additionally post the summary back to the PR via `gh pr comment` (by default the report is only returned, nothing leaves the machine) |
 | `fix` | `false` | - | **fix mode**: after the report, edit repo files to fix the findings (only Edit/Write unlocked, **zero git write commands**, no commits; `.git/**`, `.env*` and secret files are all in the deny list — blocking verified on a real CLI) |
 | `effort` | `max` | low/medium/high/xhigh/max | **model reasoning effort**, same levels as Claude Code's native `--effort`; defaults to max (deepest, slowest, priciest) — pass low/medium explicitly for a fast, cheap pass; degrades to think/ultrathink keywords when the CLI lacks the flag (never both at once) |
-| `reviewLevel` | derived from `effort` | low/medium/high/max | **the review's own depth** — the same argument the native `/code-review low\|high\|max` takes. The fleet mirrors the native playbooks verbatim: low = one pass, no subagents (≤4 findings); medium/high = **8 finders** (3+5 angles × 6 candidates); max = **10 finders** (5+5 angles × 8 candidates) + **one verifier per surviving candidate** (CONFIRMED/PLAUSIBLE/REFUTED) + **1 sweep finder**, findings capped at 15. A max run therefore exceeds 15 agents structurally (measured: 17), not by a hard-coded number |
+| `reviewLevel` | derived from `effort` | low/medium/high/max | **the review's own depth** — the same argument the native `/code-review low\|high\|max` takes. The fleet has the same three-phase structure as the native playbook, with these numbers (shared with the prompt and SKILL.md): low = one pass, no subagents (≤4 findings); medium/high = **8 finders** (the 3+5 shape, filled from 5 briefs × 6 candidates, findings capped at 8); max = **10 finders** (the 5+5 shape, every brief split × 8 candidates) + **one verifier per surviving candidate** (CONFIRMED/PLAUSIBLE/REFUTED) + **1 sweep finder**, findings capped at 15. A max run therefore exceeds 15 agents structurally (measured: 17), not by a hard-coded number |
 | `ultracode` | `false` | - | **Ultracode mode**: writes `ultracode: true` into the `--settings` file, enabling claude's standing dynamic-workflow orchestration (every substantive step via the Workflow tool, multi-agent, token cost no object). Orthogonal to effort; older CLIs ignore the key (`workflow_runs` in the result shows whether it took effect) |
 | `model` | - | - | model override (`--model` passthrough) |
 | `maxTurns` | `80` | 4–200 | agentic turn cap |
 | `timeoutMinutes` | `30` | 1–60 | hard timeout — with no spend cap this is the master guard; when it fires, the finished subagent reports are still returned |
 | `maxBudgetUsd` | `0` (no cap) | 0–50 | API spend cap (`--max-budget-usd`). **The default 0 sets NO cap at any effort level**: a cap stops the parent before it synthesizes, while every finished subagent report is already captured incrementally and a 429-killed agent is recovered from its output_file transcript — a cap only throws away paid work. `timeoutMinutes` and `maxTurns` are the guards. Set a number to opt into a hard stop; env `CLAUDE_REVIEW_MAX_BUDGET_USD` changes the default only — an explicit argument wins |
-| `pipeline` | `auto` | auto / native / fleet / skill | review engine. **auto**: claude's built-in `/code-review` for low..xhigh (needs no file on disk); max and fix mode use this MCP's fleet pipeline (reasons below). **native** forces the built-in; **fleet** forces the inline fleet; **skill** is the legacy mode — the only one that writes to `~/.claude` |
-| `installSkillIfMissing` | `false` | - | only meaningful with `pipeline=skill`: install the bundled skill when MISSING (default false — a missing skill degrades to the inline fleet pipeline; a managed existing copy is refreshed before use; a user-managed copy is never touched) |
+| `pipeline` | `auto` | auto / native / fleet / skill | review engine. **auto**: claude's built-in `/code-review` for low..high (needs no file on disk; fix rides its own --fix flag); max (including effort=xhigh), scope=last-commit with no parent, and a shadowing skill use the fleet (reasons below). **native** forces the built-in; **fleet** forces the inline fleet; **skill** is the legacy mode — the only one that writes to `~/.claude` |
+| `installSkillIfMissing` | `false` | - | only meaningful with `pipeline=skill`: install the bundled skill when MISSING (default false — a missing skill degrades to the inline fleet pipeline; a managed existing copy is refreshed before use; a copy carrying this MCP's marker is refreshed before use (local edits to it are overwritten); a copy without the marker is never written or removed, and uninstall removes only this MCP's files) |
 
 Returns (async by default: a jobId (<1s) plus the preflight verdict, with the report fetched via claude_review_status(jobId); with waitForResult: true the synchronous form below applies): a markdown report (`## Code Review Summary` / `## Findings (N)` / `## Notes`, the same contract as the bundled SKILL.md) + each reviewer subagent's own report (`## Reviewer subagent reports`, sized from the diff) + metadata (`session_id`, spend, turns, log path, model provenance). Auth/gateway failures from claude come back as a prominent `⚠️ REVIEW FAILED` banner with actionable hints — never disguised as a "report".
 
 ### 2. `claude_review_status` — poll / fetch / cancel a background review (free)
 
-`claude_code_review` is **async by default**: after all free preflight checks pass it returns a jobId in under a second — real reviews take 2-15 minutes and most MCP clients cut tool calls at ~30s. This tool: with jobId, poll (reports elapsed time) or fetch the finished report; with jobId + cancel=true, abort and stop billing; without arguments, list this process's jobs. Clients that want the synchronous contract pass waitForResult: true to claude_code_review.
+`claude_code_review` is **async by default**: after a fast preflight (20s soft budget on the probes) it returns a jobId — real reviews take 2-15 minutes and most MCP clients cut tool calls at ~30s. This tool: with jobId, poll (reports elapsed time) or fetch the finished report; with jobId + cancel=true, abort and stop billing; without arguments, list this process's jobs. Clients that want the synchronous contract pass waitForResult: true to claude_code_review.
 
 ### 3. `claude_review_followup` — follow-up questions / re-review
 
@@ -122,7 +122,8 @@ Claude Code 2.1.x **ships** a `code-review` skill (`/code-review [level] [target
 
 | level | Default engine | Why (measured on 2.1.311) |
 |---|---|---|
-| low / medium / high / xhigh | **built-in `/code-review`** | single-context, angle-by-angle reading, finishes in ~10s, zero installs; fix mode rides the command's own `--fix` flag (verified in the binary) |
+| low / medium / high | **built-in `/code-review`** | single-context, angle-by-angle reading, finishes in ~10s, zero installs; fix mode rides the command's own `--fix` flag (verified in the binary) |
+| xhigh (mapped to max) | **this MCP's fleet** | the same fleet pipeline as max (xhigh only maps reviewLevel to max) |
 | max | **inline fleet pipeline** | the built-in max spawns subagents whose `cd X && ls && git config …` exploration is denied wholesale by manual mode (measured: 100 denials, no convergence in 5 minutes); the fleet prompt keeps them inside the read-only surface |
 | `last-commit` on a root commit | inline fleet pipeline | the built-in's target is a BASE ref (`HEAD~1`); a root commit has no parent |
 
@@ -198,7 +199,7 @@ When the hook is not installed, when `guardSelfTest()` fails (the hook must real
 | `repoPath` | must be a git/hg/svn repo | every scope reads git history; a non-repo buys one guaranteed-to-fail paid call |
 | empty repo | no commits and no uncommitted changes → refused | nothing to review |
 | `pr` | only `123` / `#123` / `owner/repo#123` / a GitHub PR URL | the value is interpolated into the review prompt |
-| `outputLanguage` | single line, ≤40 chars, no backticks | same — prevents smuggling instructions |
+| `outputLanguage` | single line, ≤20 chars, no backticks, no sentence punctuation | prevents smuggling instructions; language names are short (Chinese / English / English (US)) |
 | `baseRef` | plain ref chars; no leading `-` | interpolated into git commands; a leading `-` becomes a git flag (`git merge-base --output=<file>` writes files), so it is rejected rather than "ignored" |
 | `focus` | single line, ≤2000 chars, no control characters | same |
 
@@ -260,7 +261,7 @@ node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)
 node scripts/cancel-test.mjs <repoPath>         # is the process tree killed right after cancel (billed, a few cents)
 ```
 
-`validation-test.mjs` covers: relative `repoPath` refused, malicious `pr` refused, multi-line `outputLanguage` refused, empty repo refused, non-git directory refused, `maxBudgetUsd=0` accepted by the schema, `baseRef` starting with `-` refused, `focus` with control characters / oversized refused, both tools fail-closed when the guard is off, and the explicit `CLAUDE_REVIEW_ALLOW_UNGUARDED=1` unlock. Everything returns before any paid call — the one exception is the "clean repo passes preflight" check, which really starts a budget-capped paid run and is therefore **skipped by default**; set `CC_REVIEW_ALLOW_PAID_PROBE=1` to include it.
+`validation-test.mjs` covers: relative `repoPath` refused, malicious `pr` (including a leading `-`) refused, `outputLanguage` over 20 chars / sentence punctuation / multi-line refused, `focus` with a newline or tab refused, an oversized followup message (>100000 chars) refused, `claude_review_status` cancel without a jobId refused, empty repo refused, non-git directory refused, `maxBudgetUsd=0` accepted by the schema, `baseRef` starting with `-` refused, `focus` with control characters / oversized refused, both tools fail-closed when the guard is off, and the explicit `CLAUDE_REVIEW_ALLOW_UNGUARDED=1` unlock. Everything returns before any paid call — the one exception is the "clean repo passes preflight" check, which really starts a budget-capped paid run and is therefore **skipped by default**; set `CC_REVIEW_ALLOW_PAID_PROBE=1` to include it.
 
 `shell-guard-test.mjs` covers: chained/redirected/substituted commands must be blocked, `find -delete/-exec/-fprintf` and `rg --pre` must be blocked while plain `find`/`rg` reads must pass, quoted separators like `git log --format="%h; %s"` must pass, unbalanced quotes fail closed, the hook process's stdin→deny contract, the repo boundary and `.git/`/secret-path interception for Edit/Write/Read, in-repo junction/symlink escapes (realpath containment), and a real review's 17-command replay (confirming blocked commands are not misreported as escapes).
 
@@ -277,6 +278,6 @@ node scripts/cancel-test.mjs <repoPath>         # is the process tree killed rig
 ## License & acknowledgments
 
 - This project is open source under the [MIT](LICENSE) license.
-- The bundled code-review skill (`assets/skills/code-review/SKILL.md`) is adapted from Anthropic's official code-review plugin pipeline (5-way parallel review + confidence filtering), further adapted here for headless invocation and the read-only boundary.
+- The bundled code-review skill (`assets/skills/code-review/SKILL.md`) is adapted from Anthropic's official code-review plugin pipeline (8/10 parallel finders driven by 5 briefs + confidence filtering), further adapted here for headless invocation and the read-only boundary.
 - Thanks to the Claude Code team and to the CC Switch / claude-code-router gateway projects for making "reviews without an account login" possible.
 - The security model has been through multiple rounds of independent cross-audits (Windows / macOS / auth-gateway / install-forms / regression perspectives) — see above and [SECURITY.md](SECURITY.md). Please report vulnerabilities via private advisories, not public issues.

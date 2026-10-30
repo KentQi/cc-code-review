@@ -6,6 +6,10 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { policyFingerprint } from "./shell-guard.js";
+// One implementation of the config-dir rule (skill.js resolves relative
+// CLAUDE_CONFIG_DIR values; a second copy here drifted and could point the
+// skill path and the child-process env at different directories — P3-10).
+import { claudeConfigDir } from "./skill.js";
 
 const execFileAsync = promisify(execFile);
 const IS_WIN = process.platform === "win32";
@@ -47,11 +51,13 @@ export function resolveClaudeCli({ refresh = false } = {}) {
   // switch, an upgrade that rewrites the path, or an uninstall would otherwise
   // keep returning a path that no longer spawns, and every review would fail
   // with ENOENT until the MCP server is restarted. (`refresh` forces a re-scan.)
-  if (!refresh && cachedCli && !cachedCli.error) {
+  // (The cache only ever holds successes — see the assignment below — so there is
+  // no error entry to test for here; R-17.)
+  if (!refresh && cachedCli) {
     if (cliPathStillThere(cachedCli)) return cachedCli;
     cachedCli = undefined;
   }
-  prefetchNpmGlobalRoot(); // non-blocking: the value is only needed on the fallback path
+  prefetchNpmGlobalRoot({ refresh }); // non-blocking: the value is only needed on the fallback path
   const r = resolveNow();
   // Only cache successes — a later install/upgrade should be picked up without a restart.
   if (r && !r.error) cachedCli = r;
@@ -69,18 +75,6 @@ function isExecutableFile(p) {
     if (st.size === 0) return false;
     if (!IS_WIN) fs.accessSync(p, fs.constants.X_OK);
     return true;
-  } catch {
-    return false;
-  }
-}
-
-function hasShebang(p) {
-  try {
-    const fd = fs.openSync(p, "r");
-    const buf = Buffer.alloc(2);
-    fs.readSync(fd, buf, 0, 2, 0);
-    fs.closeSync(fd);
-    return buf[0] === 0x23 && buf[1] === 0x21; // "#!"
   } catch {
     return false;
   }
@@ -191,14 +185,29 @@ function classifySpawnTarget(p, low) {
  * attempt (or a `refresh`) picks the value up.
  */
 let npmRootCache; // string | null | undefined (undefined = not resolved yet)
+let npmRootCacheAt = 0;
 let npmRootInflight;
 
-function queryNpmGlobalRootAsync() {
-  // Memoised INCLUDING the terminal failure (`null`): without this, every
-  // resolveClaudeCli() on an npm-less machine re-spawned `npm root -g` and
-  // waited out its 10s timeout in the background — the exact behaviour the
-  // `break` below was meant to prevent.
-  if (npmRootCache !== undefined) return Promise.resolve(npmRootCache);
+/**
+ * How long a FAILED probe stays memoised.
+ *
+ * The failure is memoised at all because otherwise every resolveClaudeCli() on an
+ * npm-less machine re-spawned `npm root -g` and waited out its 10s timeout in the
+ * background. Caching it FOREVER was the bug (R-8): one cold-cache timeout at
+ * startup — exactly what the settled resolve below exists to survive — left this
+ * process answering NOT_FOUND for the rest of its life, and `refresh` did not
+ * clear it either. Success stays memoised until the path stops existing; only the
+ * failure expires.
+ */
+const NPM_ROOT_FAILURE_TTL_MS = 60 * 1000;
+
+function queryNpmGlobalRootAsync({ refresh = false } = {}) {
+  if (refresh && npmRootCache === null) npmRootCache = undefined; // explicit re-probe
+  if (npmRootCache !== undefined) {
+    if (npmRootCache !== null) return Promise.resolve(npmRootCache);
+    if (Date.now() - npmRootCacheAt < NPM_ROOT_FAILURE_TTL_MS) return Promise.resolve(null);
+    npmRootCache = undefined; // the cached failure expired: probe again
+  }
   if (npmRootInflight) return npmRootInflight;
   const exeDir = path.dirname(process.execPath);
   const candidates = [
@@ -213,19 +222,20 @@ function queryNpmGlobalRootAsync() {
           encoding: "utf8", timeout: 10000, windowsHide: true, env: buildClaudeEnv(),
         });
         const root = (stdout || "").trim().split(/\r?\n/).pop().trim();
-        if (root && fs.existsSync(root)) { npmRootCache = root; return root; }
+        if (root && fs.existsSync(root)) { npmRootCache = root; npmRootCacheAt = Date.now(); return root; }
       } catch { /* try the next candidate */ }
       break; // npm-cli.js exists but could not be run: no point retrying every call
     }
-    npmRootCache = null;
+    npmRootCache = null;         // a failure, NOT a verdict: it expires after the TTL
+    npmRootCacheAt = Date.now();
     return null;
   })().finally(() => { npmRootInflight = undefined; });
   return npmRootInflight;
 }
 
 /** Fire-and-forget: start the npm root query so a later call finds it cached. */
-function prefetchNpmGlobalRoot() {
-  void queryNpmGlobalRootAsync().catch(() => {});
+function prefetchNpmGlobalRoot({ refresh = false } = {}) {
+  void queryNpmGlobalRootAsync({ refresh }).catch(() => {});
 }
 
 /**
@@ -238,7 +248,7 @@ function prefetchNpmGlobalRoot() {
 export async function resolveClaudeCliSettled() {
   const first = resolveClaudeCli();
   if (first || !npmRootInflight) return first;
-  await npmRootInflight.catch(() => { /* probe failure = null, already memoised */ });
+  await npmRootInflight.catch(() => { /* probe failure = null, memoised with a TTL */ });
   return resolveClaudeCli();
 }
 
@@ -286,18 +296,8 @@ function desktopAppCli() {
 /* Claude config / env                                                */
 /* ------------------------------------------------------------------ */
 
-function claudeConfigDir() {
-  const home = os.homedir();
-  const expand = (p) => (p.startsWith("~/") || p.startsWith("~\\") ? path.join(home, p.slice(2)) : p);
-  // CLAUDE_CONFIG_DIR can come from the process env or from the user settings' env block
-  if (process.env.CLAUDE_CONFIG_DIR) return expand(process.env.CLAUDE_CONFIG_DIR);
-  try {
-    const f = path.join(home, ".claude", "settings.json");
-    const j = JSON.parse(fs.readFileSync(f, "utf8"));
-    if (j?.env?.CLAUDE_CONFIG_DIR) return expand(j.env.CLAUDE_CONFIG_DIR);
-  } catch { /* no user settings */ }
-  return path.join(home, ".claude");
-}
+// claudeConfigDir() lives in skill.js and is imported above: one implementation
+// for the process env, the settings.json env block and relative-path resolution.
 
 /**
  * Read the effective settings.json `env` block fresh (CC Switch rewrites it; never cache).
@@ -339,8 +339,36 @@ function mergedAuthEnv() {
   return { ...process.env, ...peekSettingsEnvInner() };
 }
 
+/**
+ * True for a host literal that can only mean "this machine".
+ *
+ * Normalise first: Node's URL.hostname keeps the brackets on an IPv6 literal
+ * ("http://[::1]:8080" -> "[::1]") and keeps the trailing dot of an absolute
+ * name ("localhost."), and neither form matched the old three-way test — so a
+ * loopback gateway was routed through the host's HTTP proxy together with its
+ * Bearer token (SEC-09). IPv4-mapped loopback ("::ffff:127.0.0.1", what a
+ * dual-stack listener reports) counts as loopback too.
+ */
 function isLoopbackHost(h) {
-  return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+  let host = String(h ?? "").trim().toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1); // IPv6 literal
+  if (host.endsWith(".")) host = host.replace(/\.+$/, "");                 // absolute-dot form
+  if (!host) return false;
+  if (host === "localhost") return true;
+  const v4 = host.includes("%") ? host.slice(0, host.indexOf("%")) : host; // drop an IPv6 zone id
+  if (v4 === "::1" || v4 === "0:0:0:0:0:0:0:1") return true;
+  // IPv4-mapped loopback. Both spellings occur: the literal "::ffff:127.0.0.1" a
+  // dual-stack listener reports, and "::ffff:7f00:1", which is how URL normalizes
+  // the same address ("http://[::ffff:127.0.0.1]/" → hostname "[::ffff:7f00:1]").
+  const mapped = /^::ffff:(.+)$/.exec(v4);
+  if (mapped) {
+    const tail = mapped[1];
+    if (tail.includes(".")) return isLoopbackHost(tail);
+    const hex = /^([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(tail);
+    return hex ? Number.parseInt(hex[1], 16) >> 8 === 0x7f : false; // 127.0.0.0/8
+  }
+  if (net.isIP(v4) === 6) return false;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
 }
 
 /**
@@ -550,11 +578,15 @@ function reapExitedGroup(child) {
 
 // Node's default SIGTERM handling exits WITHOUT firing "exit" — on unix a detached
 // claude would survive the server and keep burning credits. Handle signals explicitly.
+// Exit with 128+signum (SIGTERM 143, SIGINT 130, SIGHUP 129) instead of 0 (R-21):
+// exiting 0 on a signal told the supervising host this was a normal shutdown, so an
+// interrupted server was indistinguishable from a clean one.
+const SIGNAL_EXIT_CODES = { SIGTERM: 143, SIGINT: 130, SIGHUP: 129 };
 for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   process.on(sig, () => {
     for (const c of liveChildren) { try { killTree(c); } catch { /* best effort */ }
     }
-    process.exit(0);
+    process.exit(SIGNAL_EXIT_CODES[sig] ?? 128 + (os.constants.signals?.[sig] || 0));
   });
 }
 process.on("exit", () => {
@@ -569,9 +601,36 @@ process.on("exit", () => {
   }
 });
 
+/**
+ * Index of the `}` that closes the `{` at `open`, or -1 when it never closes.
+ * String- and escape-aware: braces inside a JSON string ("a}b{c") are content,
+ * not structure — the reason a non-greedy regex truncates nested payloads.
+ */
+function matchBrace(text, open) {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) return i;
+  }
+  return -1;
+}
+
 /** Parse the final `{"type":"result",...}` JSON object from claude stdout. */
 export function parseResultJson(stdout) {
-  const lines = stdout.split(/\r?\n/);
+  const text = String(stdout ?? "");
+  const lines = text.split(/\r?\n/);
+  // Fast path, unchanged: the result event on one line (the normal
+  // `--output-format json` shape).
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
     if (!line.startsWith("{")) continue;
@@ -579,6 +638,30 @@ export function parseResultJson(stdout) {
       const obj = JSON.parse(line);
       if (obj && typeof obj === "object" && obj.type === "result") return obj;
     } catch { /* partial/banner line, keep scanning */ }
+  }
+  // Fallback (R-15): a PRETTY-PRINTED result — a wrapper or gateway may re-format
+  // the output, and the single-line scan returned null for every multi-line
+  // object, turning a successful run into "no parseable result JSON". Walk the
+  // opening braces backwards, brace-match each block and keep the one carrying
+  // type:"result"; nested objects are skipped harmlessly because they are tried
+  // first and rejected by the type test.
+  const starts = [];
+  for (let at = 0, i = 0; i < lines.length; i++) {
+    starts.push({ at, line: lines[i] });
+    at += lines[i].length;
+    while (at < text.length && (text[at] === "\r" || text[at] === "\n")) at++;
+  }
+  let tries = 0;
+  for (let i = starts.length - 1; i >= 0 && tries < 64; i--) {
+    if (starts[i].line.trim() !== "{") continue; // a pretty-printed object opens a line
+    tries++;
+    const open = starts[i].at + starts[i].line.indexOf("{");
+    const end = matchBrace(text, open);
+    if (end < 0) continue;
+    try {
+      const obj = JSON.parse(text.slice(open, end + 1));
+      if (obj && typeof obj === "object" && obj.type === "result") return obj;
+    } catch { /* not a standalone object, keep scanning */ }
   }
   return null;
 }
@@ -691,31 +774,48 @@ export function streamEventFacts(obj) {
  */
 export function parseUnrecognizedModels(stderr) {
   const out = [];
-  const re = /\[claude-code:unrecognized_model\]\s*(\{.*?\})/g;
-  let m;
-  while ((m = re.exec(String(stderr || "")))) {
-    try {
-      const j = JSON.parse(m[1]);
-      if (j?.model) out.push({ model: String(j.model), querySource: String(j.query_source ?? "") });
-    } catch { /* malformed line — skip it */ }
+  const text = String(stderr || "");
+  const MARKER = "[claude-code:unrecognized_model]";
+  // Brace-BALANCED scan instead of the old non-greedy /(\{.*?\})/: a nested
+  // payload ({"model":"x","meta":{"a":1}}) was cut at the inner "}" and then
+  // dropped as malformed, silently losing the only evidence of a substitution
+  // (R-14). A handful of "{" retries per marker keeps a broken opener from
+  // hiding a well-formed object that follows it.
+  for (let from = 0; ; ) {
+    const at = text.indexOf(MARKER, from);
+    if (at < 0) break;
+    from = at + MARKER.length;
+    let open = text.indexOf("{", from);
+    for (let tries = 0; open >= 0 && tries < 4; tries++) {
+      const end = matchBrace(text, open);
+      if (end < 0) break;
+      try {
+        const j = JSON.parse(text.slice(open, end + 1));
+        if (j?.model) out.push({ model: String(j.model), querySource: String(j.query_source ?? "") });
+        break;
+      } catch { open = text.indexOf("{", open + 1); /* broken opener: try the next one */ }
+    }
   }
   return out;
 }
 
-/**
- * An async Agent dispatch's tool_result is only a launch acknowledgement
- * ("Async agent launched successfully. … output_file: <path> …"). Detect that
- * shape and pull the transcript path out of it: when the agent never reports
- * (killed by a 429 / budget halt / timeout), that file is the only place its
- * partial work still exists.
- */
-/**
- * An async Agent dispatch's tool_result is only a launch acknowledgement
- * ("Async agent launched successfully. … output_file: <path> …"). Detect that
- * shape and pull the transcript path out of it: when the agent never reports
- * (killed by a 429 / budget halt / timeout), that file is the only place its
- * partial work still exists.
- */
+/** realpath() of the nearest EXISTING ancestor, with the missing tail appended. */
+function realpathNearest(p) {
+  let cur = path.resolve(p);
+  const missing = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync(cur);
+      return missing.length ? path.join(real, ...missing.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return path.resolve(p); // nothing on this path exists
+      missing.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
 /**
  * A path the CLI itself could have written an agent transcript to: under the
  * OS temp dir, inside a claude* directory, under a tasks/ segment, ending in
@@ -725,8 +825,15 @@ export function parseUnrecognizedModels(stderr) {
  */
 export function isAllowedTranscriptPath(filePath) {
   try {
-    const p = path.resolve(String(filePath));
-    const tmp = path.resolve(os.tmpdir());
+    // Both sides go through realpath (R-7): the CLI names the REAL path, while
+    // os.tmpdir() is the symlinked spelling on macOS ($TMPDIR is /var/…, the real
+    // path is /private/var/…), so a plain string compare refused every genuine
+    // transcript there and 429 recovery silently never fired. A path that does not
+    // (yet) exist is resolved through its nearest existing ancestor, and the
+    // containment rule is unchanged: the result must still live under the temp
+    // root, so realpath can only ever make the check stricter about escapes.
+    const p = realpathNearest(String(filePath));
+    const tmp = realpathNearest(os.tmpdir());
     const rel = path.relative(tmp, p);
     if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return false;
     if (!/\.output$/i.test(p)) return false;
@@ -743,13 +850,56 @@ export function isAllowedTranscriptPath(filePath) {
  * the two identifying lines, but NOT the transcript path (older CLI shapes omit
  * it). Used only to avoid filing an ack as a report; it never authorises a file
  * read, so the weaker check cannot widen the read surface.
+ *
+ * It is still a BLOCK, not a phrase: the ack sentence has to fill the first line
+ * and everything after it has to be ack metadata. A report that merely STARTS
+ * with the ack sentence used to be dropped as an ack (R-19) — losing the
+ * findings AND leaving only the strict ack's `output_file` as a fallback.
  */
+const ACK_HEAD = /^\s*Async agent launched successfully\.?/i;
+const ACK_TAIL_LINE = [
+  /^agentId\s*:\s*\S+/i,
+  /^output_file\s*:\s*\S+/i,
+  /^task_?id\s*:/i,
+  /^\(?internal ID\b/i,
+  /^Do NOT (?:Read|read) or tail\b/i,
+  /^This tool result is internal metadata\b/i,
+  /working in the background/i,
+  /notified automatically/i,
+  /^You can continue\b/i,
+  /^Use the (?:TaskOutput|BashOutput|Agent) tool\b/i,
+];
 export function looksLikeLaunchAck(text) {
   const s = String(text ?? "");
-  if (!/^\s*Async agent launched successfully/.test(s)) return false;
-  return /agentId:\s*\S+/.test(s) || /working in the background/i.test(s);
+  const nl = s.indexOf("\n");
+  const firstLine = nl < 0 ? s : s.slice(0, nl);
+  const head = ACK_HEAD.exec(firstLine);
+  if (!head) return false;
+  // The rest of the FIRST line must be ack-shaped too: nothing, or a
+  // parenthetical ("(This tool result is internal metadata…)"). Trailing prose
+  // ("…successfully? No — the real finding is: …") means the sentence is part of
+  // a REPORT, and treating it as an ack would silently drop the report.
+  const rest = firstLine.slice(head[0].length).trim();
+  if (rest && !/^\([^)]*\)?$/.test(rest)) return false;
+  if (!/agentId:\s*\S+/.test(s) && !/working in the background/i.test(s)) return false;
+  // Every following line must be ack metadata. A substantive line means this is
+  // a real report that merely opened with the ack sentence (repo content can
+  // prompt-inject that opening), so it must not be filed away as an ack.
+  if (nl < 0) return true;
+  for (const line of s.slice(nl + 1).split(/\r?\n/)) {
+    const l = line.trim();
+    if (l && !ACK_TAIL_LINE.some((re) => re.test(l))) return false;
+  }
+  return true;
 }
 
+/**
+ * An async Agent dispatch's tool_result is only a launch acknowledgement
+ * ("Async agent launched successfully. … output_file: <path> …"). Detect that
+ * shape and pull the transcript path out of it: when the agent never reports
+ * (killed by a 429 / budget halt / timeout), that file is the only place its
+ * partial work still exists.
+ */
 export function parseAgentLaunchAck(text) {
   const s = String(text ?? "");
   // The ack is a CLI-SHAPED block, not a phrase: it starts with the ack line,
@@ -919,14 +1069,34 @@ function execTarget(cli) {
     : { cmd: cli.path, baseArgs: [] };
 }
 
-const versionCache = new Map();
+const versionCache = new Map(); // path -> { value, at }
 const versionInflight = new Map();
-const helpCache = new Map();
+const helpCache = new Map();    // path -> { text, at }
 const helpInflight = new Map();
+
+/**
+ * How long a `--version` / `--help` answer stays authoritative (R-9).
+ *
+ * A long-lived MCP server outlives an in-place upgrade (npm reinstall into the
+ * same prefix, brew upgrade, a version-manager switch), and the file-existence
+ * check in resolveClaudeCli() cannot see it because the path did not change. An
+ * untimed cache then kept the OLD verdicts forever: the version floors in
+ * index.js could permanently skip `--permission-mode manual` (silent hardening
+ * downgrade) or keep a newly supported flag disabled. Same 5-minute window as
+ * the guard self-test, which exists for exactly the same drift.
+ */
+const CLI_PROBE_TTL_MS = 5 * 60 * 1000;
+
+/** The cached entry for `key` while it is still inside the TTL, else undefined. */
+function freshProbe(cache, key) {
+  const hit = cache.get(key);
+  return hit && Date.now() - hit.at < CLI_PROBE_TTL_MS ? hit : undefined;
+}
 
 /** `claude --version` (async so the MCP event loop is never blocked). Cached, in-flight deduped. */
 export async function claudeVersion(cli) {
-  if (versionCache.has(cli.path)) return versionCache.get(cli.path);
+  const hit = freshProbe(versionCache, cli.path);
+  if (hit) return hit.value;
   if (versionInflight.has(cli.path)) return versionInflight.get(cli.path);
   const { cmd, baseArgs } = execTarget(cli);
   const p = (async () => {
@@ -934,7 +1104,7 @@ export async function claudeVersion(cli) {
       timeout: 30000, windowsHide: true, env: buildClaudeEnv(),
     });
     const v = (stdout || "").trim();
-    versionCache.set(cli.path, v);
+    versionCache.set(cli.path, { value: v, at: Date.now() });
     return v;
   })().finally(() => versionInflight.delete(cli.path));
   versionInflight.set(cli.path, p);
@@ -969,15 +1139,16 @@ export function versionAtLeast(version, min) {
 
 /** Full `claude --help` text (async, cached, in-flight deduped). Rejects if claude can't run. */
 export async function claudeHelp(cli) {
-  if (helpCache.has(cli.path)) return helpCache.get(cli.path);
+  const hit = freshProbe(helpCache, cli.path);
+  if (hit) return hit.text;
   if (helpInflight.has(cli.path)) return helpInflight.get(cli.path);
   const { cmd, baseArgs } = execTarget(cli);
   const p = (async () => {
     const { stdout } = await execFileAsync(cmd, [...baseArgs, "--help"], {
       timeout: 30000, windowsHide: true, env: buildClaudeEnv(), maxBuffer: 8 * 1024 * 1024,
     });
-    helpCache.set(cli.path, stdout || "");
-    return helpCache.get(cli.path);
+    helpCache.set(cli.path, { text: stdout || "", at: Date.now() });
+    return stdout || "";
   })().finally(() => helpInflight.delete(cli.path));
   helpInflight.set(cli.path, p);
   return p;
@@ -1054,10 +1225,13 @@ export function cleanupGuardSettings() {
 let sweptTempArtifacts = false;
 function sweepTempArtifacts(dir) {
   if (sweptTempArtifacts) return;
-  sweptTempArtifacts = true;
   const cutoff = Date.now() - 2 * 60 * 60 * 1000;
   let names;
+  // The one-shot flag is latched AFTER the read (R-16). Setting it first meant a
+  // single transient EACCES/ENOENT disabled this process's cleanup forever, so
+  // every artifact it was meant to reclaim leaked until the process exited.
   try { names = fs.readdirSync(dir); } catch { return; }
+  sweptTempArtifacts = true;
   for (const name of names) {
     const p = path.join(dir, name);
     try {
@@ -1467,7 +1641,6 @@ export function runClaude({
     let resultEvent = null;
     const bashCommands = [];
     const agentDispatches = [];
-    const agentResults = new Map();
     const toolNames = new Map(); // tool_use id -> tool name (Agent/Task/Monitor/…)
     const taskNotifications = new Map();
     const workflowDispatches = [];
@@ -1536,9 +1709,11 @@ export function runClaude({
       if (facts.toolUses) for (const t of facts.toolUses) toolNames.set(t.id, t.name);
       if (facts.agentDispatches) agentDispatches.push(...facts.agentDispatches);
       if (facts.agentResults) for (const r of facts.agentResults) {
-        agentResults.set(r.id, r.text);
         // An async launch ack carries the agent's transcript path — remember it
-        // for the recovery pass if this agent never reports.
+        // for the recovery pass if this agent never reports. The tool_result TEXT
+        // itself is deliberately not retained (R-11): nothing ever read it back,
+        // and one entry per tool_result pinned every multi-MB diff for the whole
+        // run. The durable record is the per-subagent JSONL below.
         if (r.ack?.outputFile) dispatchOutputFiles.set(r.id, r.ack.outputFile);
       }
       const n = facts.taskNotification;
@@ -1858,11 +2033,9 @@ export function gitSpawnOpts(cwd, extraEnv = {}) {
 }
 
 /**
- * Does the repository's own git config / attributes try to run a program?
- *
- * `-c` overrides neutralise the keys we know about, but `.gitattributes` can name
- * an arbitrary filter driver (`*.foo diff=evil`), and `diff.evil.command` then
- * executes. That surface cannot be closed with `-c`, so it is refused instead.
+ * Degraded LINE-SCAN patterns — the fallback used only when git itself cannot
+ * normalize a config file. repoRunsGitPrograms() (below) owns the design note
+ * (why `-c` is not a boundary) and the primary `git config --list -z` path.
  *
  * Two passes, because neither alone is enough:
  *  - config keys whose VALUE is a command (fsmonitor/textconv/external/driver/
@@ -1874,16 +2047,12 @@ export function gitSpawnOpts(cwd, extraEnv = {}) {
  * Only the repo's own files are read, so an ordinary LFS repo (filter defined in
  * the user's global config, not in `.git/config`) is not flagged.
  *
- * Since 1.18.2 the config keys are NOT decided by this table when git is
- * available: repoRunsGitPrograms asks git itself for the normalized keys
- * (git config --file <cfg> --list -z) and classifies them against
- * CONFIG_EXEC_KEYS / CONFIG_DRIVER_KEY below. A line table cannot model
- * case-insensitive names, quoting, comments, dotted subsections or same-line
- * section headers — which is exactly how core.sshCommand slipped past
- * command-equals (no word boundary before the capital C) and how
+ * A line table cannot model case-insensitive names, quoting, comments, dotted
+ * subsections or same-line section headers — which is exactly how core.sshCommand
+ * slipped past command-equals (no word boundary before the capital C) and how
  * core.attributesFile matched nothing at all, while git executed both (P0-8,
- * P0-9). These patterns remain the DEGRADED fallback for a host without a
- * usable git, so they carry the same keys.
+ * P0-9). These patterns remain the DEGRADED fallback for a host without a usable
+ * git, so they carry the same keys.
  */
 const CONFIG_CMD_PATTERNS = [
   /\btextconv\s*=/i,

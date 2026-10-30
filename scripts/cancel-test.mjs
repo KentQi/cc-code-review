@@ -24,11 +24,12 @@
  * resolveClaudeCli() picked for this run (plus its realpath), so an unrelated
  * claude session on the machine is not mistaken for ours.
  */
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveClaudeCli } from "../src/claude.js";
+import { connectServer } from "./lib/mcp-client.mjs";
 
 const repoPath = process.argv[2];
 if (!repoPath) { console.error("usage: node cancel-test.mjs <repoPath>"); process.exit(2); }
@@ -132,51 +133,24 @@ const waitGone = async (baseline, limitMs) => {
 const before = claudeProcs();
 console.log(`[${process.platform}] ${processProbe.label} before: ${before} (pre-existing processes are excluded from the assertion)`);
 
-const child = spawn(process.execPath, [serverPath], { stdio: ["pipe", "pipe", "inherit"] });
-
-let nextId = 1;
-const pending = new Map();
-let buf = Buffer.alloc(0);
-child.stdout.on("data", (d) => {
-  buf = Buffer.concat([buf, d]);
-  let idx;
-  while ((idx = buf.indexOf(0x0a)) >= 0) {
-    const line = buf.subarray(0, idx).toString("utf8").trim();
-    buf = buf.subarray(idx + 1);
-    if (!line) continue;
-    try {
-      const msg = JSON.parse(line);
-      if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
-    } catch { /* ignore */ }
-  }
+// Shared stdio client (audit Q20): framing/timeout/pending-map live in
+// scripts/lib/mcp-client.mjs. startRequest() is used instead of request()
+// because a cancelled request's response is legitimately dropped by the SDK —
+// the promise must resolve null, not reject.
+const srv = connectServer({
+  args: [serverPath],
+  timeoutMs: 60_000,
+  clientInfo: { name: "cancel-test", version: "0.0.1" },
 });
-const send = (obj) => child.stdin.write(JSON.stringify(obj) + "\n");
-const request = (method, params) => new Promise((resolve, reject) => {
-  const id = nextId++;
-  const t = setTimeout(() => reject(new Error(`timeout: ${method}`)), 60_000);
-  pending.set(id, (msg) => { clearTimeout(t); resolve(msg); });
-  send({ jsonrpc: "2.0", id, method, params });
-});
+await srv.request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "cancel-test", version: "0.0.1" } });
+srv.notify("notifications/initialized");
 
-await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "cancel-test", version: "0.0.1" } });
-send({ jsonrpc: "2.0", method: "notifications/initialized" });
-
-const callId = nextId++;
 // A response may legitimately never arrive (SDK drops it for cancelled requests),
 // so this promise is only informational — the real assertions are on processes.
-let callSettled = false;
-let callTimer;
-const callPromise = new Promise((resolve) => {
-  pending.set(callId, (msg) => { callSettled = true; resolve(msg); });
-  callTimer = setTimeout(() => resolve(null), 90_000);
-});
-send({
-  jsonrpc: "2.0", id: callId, method: "tools/call",
-  params: {
-    name: "claude_code_review",
-    arguments: { repoPath, waitForResult: true, scope: "auto", effort: "high", timeoutMinutes: 10, maxBudgetUsd: 5, maxTurns: 100 },
-  },
-});
+const { id: callId, response: callPromise } = srv.startRequest("tools/call", {
+  name: "claude_code_review",
+  arguments: { repoPath, waitForResult: true, scope: "auto", effort: "high", timeoutMinutes: 10, maxBudgetUsd: 5, maxTurns: 100 },
+}, { timeoutMs: 90_000 });
 
 // wait until THIS review's claude process is actually alive (count grew past baseline)
 const startedMs = await waitForMoreThan(before, 40_000);
@@ -184,7 +158,7 @@ const during = claudeProcs();
 console.log(`${processProbe.label} during review: ${during}`);
 const started = startedMs >= 0;
 console.log("sending notifications/cancelled ...");
-send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: callId, reason: "cancel-test" } });
+srv.notify("notifications/cancelled", { requestId: callId, reason: "cancel-test" });
 
 const killMs = await waitGone(before, 30_000);
 console.log(`processes back to baseline ${killMs >= 0 ? `after ${Math.round(killMs / 1000)}s` : "STILL RUNNING after 30s"}`);
@@ -199,13 +173,12 @@ const res = await Promise.race([
   new Promise((resolve) => { graceTimer = setTimeout(() => resolve(null), 10_000); }),
 ]);
 clearTimeout(graceTimer);
-clearTimeout(callTimer);
-pending.delete(callId);
+const callSettled = res != null;
 const text = res?.result?.content?.[0]?.text ?? "";
 if (res) console.log(`response arrived (isError=${!!res.result?.isError}): ${text.slice(0, 200)}`);
 else console.log("no response arrived (expected: the SDK drops responses for cancelled requests)");
 
-child.kill();
+srv.close();
 const killedFast = killMs >= 0 && killMs < 30_000;
 // A run that never showed up cannot prove cancellation. A response is acceptable
 // only when it is an error or explicitly mentions cancellation.

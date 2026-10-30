@@ -5,11 +5,12 @@
  * paid end-to-end and only runs with --paid (CC_LOOP_PAID=1).
  * Exit 0 iff every executed case passes.
  */
-import { spawn, spawnSync, execFileSync } from "node:child_process";
+import { spawnSync, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { connectServer } from "./lib/mcp-client.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const STUB = path.join(ROOT, "scripts", "stub-claude.mjs");
@@ -69,44 +70,25 @@ const gitRepo2 = (name) => {
 };
 
 /* ---------- server harness ---------- */
+// The stdio client lives in scripts/lib/mcp-client.mjs (audit Q20). The wrapper
+// keeps this suite's historical surface ({ child, req, call, ready, kill }) so
+// every case below is untouched: stderr is inherited, no env is passed when the
+// case did not ask for an override, and stdout lines that do not start with "{"
+// are ignored (the host may print banners before the JSON-RPC stream).
 function startServer(envExtra = {}) {
-  // Mirrors smoke-test.mjs exactly (stderr inherit, no env/windowsHide tweaks):
-  // a piped-and-forwarded stderr correlated with a stalled first stdout chunk
-  // on this Windows box; the proven-shape spawn is stable.
-  const child = spawn(process.execPath, [path.join(ROOT, "src", "index.js")], {
+  const srv = connectServer({
+    args: [path.join(ROOT, "src", "index.js")],
     stdio: ["pipe", "pipe", "inherit"],
     ...(Object.keys(envExtra).length ? { env: { ...process.env, ...envExtra } } : {}),
+    timeoutMs: 90_000,
+    clientInfo: { name: "ccloop", version: "0" },
+    requireJsonObjectPrefix: true,
   });
-  let buf = Buffer.alloc(0);
-  const pending = new Map();
-  let id = 0;
-  child.stdout.on("data", (d) => {
-    buf = Buffer.concat([buf, d]);
-    let i;
-    while ((i = buf.indexOf(0x0a)) >= 0) {
-      const line = buf.subarray(0, i).toString("utf8").trim();
-      buf = buf.subarray(i + 1);
-      if (!line.startsWith("{")) continue;
-      try {
-        const m = JSON.parse(line);
-        if (pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
-      } catch { /* ignore */ }
-    }
-  });
-  child.stdin.on("error", () => {});
-  child.on("exit", (c, s) => { if (process.env.CCLOOP_DEBUG) console.error("[DBG] server exited:", c, s); });
-  const req = (method, params) => new Promise((resolve, reject) => {
-    const n = ++id;
-    const t = setTimeout(() => reject(new Error(`timeout: ${method} (len=${buf.length})`)), 90_000);
-    pending.set(n, (m) => { clearTimeout(t); resolve(m); });
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: n, method, params }) + "\n");
-  });
-  const call = (name, args) => req("tools/call", { name, arguments: args });
-  const ready = (async () => {
-    await req("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "ccloop", version: "0" } });
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
-  })();
-  return { child, req, call, ready, kill: () => child.kill() };
+  srv.child.on("exit", (c, s) => { if (process.env.CCLOOP_DEBUG) console.error("[DBG] server exited:", c, s); });
+  const req = srv.request;
+  const call = (name, args) => srv.call(name, args);
+  const ready = srv.initialize();
+  return { child: srv.child, req, call, ready, kill: () => srv.close() };
 }
 const textOf = (r) => r?.result?.content?.[0]?.text ?? "";
 

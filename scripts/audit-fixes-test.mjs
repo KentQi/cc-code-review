@@ -21,13 +21,14 @@ import {
   streamEventFacts, parseUnrecognizedModels, buildModelProvenance, resultFacts,
   parseAgentLaunchAck, looksLikeLaunchAck, recoverReportFromTranscript, analyseCommand,
 } from "../src/claude.js";
+import { guardVerdict } from "../src/shell-guard.js";
 import { codeDrift } from "../src/version.js";
 import { skillStatus, skillSync, installBundledSkill, bundledSkillFile } from "../src/skill.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 let pass = 0, fail = 0;
 const check = (label, actual, expected) => {
@@ -69,14 +70,18 @@ for (const readRule of ["Bash(git remote -v)", "Bash(git remote show:*)", "Bash(
   "Bash(git branch -a)", "Bash(git branch --show-current)", "Bash(git branch -vv)"]) {
   check(`allow list contains ${readRule}`, allowed0.includes(readRule), true);
 }
-// a write form must still lose against the allowlist
-const deniedByRule = (cmd) => [...denied].some((r) => {
-  const m = /^Bash\((.*)[:=]\*\)$/.exec(r);
-  return m ? cmd.startsWith(m[1]) : false;
-});
+// a write form must still lose at the layer the product actually enforces.
+// Q7: this check used to re-implement Claude Code's prefix matching inside the
+// test (cmd.startsWith(rulePrefix)) and then assert its own model — it proved
+// the test, not the product. The permission engine is the CLI's, not this
+// package's, so its glob semantics cannot be executed from here; what CAN be
+// executed is resolveClaudeCli()'s deterministic sibling, guardVerdict(), which
+// is the layer that refuses the write forms the permission engine grants by
+// prefix. (The deny-table entries themselves are asserted above.)
 for (const cmd of ["git remote add x http://evil", "git remote set-url o http://evil",
   "git branch -D main", "git tag -a v1 -m x"]) {
-  check(`write form denied: ${cmd}`, deniedByRule(cmd), true);
+  check(`write form refused by the live guard policy: ${cmd}`,
+    guardVerdict(cmd, { repoRoot: os.tmpdir() }).ok, false);
 }
 
 // The old `:` forms matched nothing (git uses `=`). The anchored `=` forms are
@@ -100,6 +105,12 @@ const allowedByRule = (cmd) => allowed.some((r) => {
   const m = /^Bash\((.*):\*\)$/.exec(r);
   return m ? cmd.startsWith(m[1]) : r === `Bash(${cmd})`;
 });
+// Q7: `matchesDeny` is the documented PREFIX MODEL of how the CLI applies a
+// deny rule (the whole command must start with the rule text) — it is a
+// policy-TABLE consistency check, not evidence about the engine. Each command is
+// therefore also asserted against the layer this package really owns
+// (guardVerdict), so a rule that stops being enforced by the hook fails here
+// even if the table text is unchanged.
 for (const cmd of [
   // NB: `git diff HEAD --output=/tmp/x` is NOT here. No deny rule can reach it by
   // prefix matching (the unanchored `Bash(git * --output=*)` form depends on
@@ -113,7 +124,10 @@ for (const cmd of [
   "gh pr review 1 --approve",
   "gh run rerun 1",
   "gh variable set A B",
-]) check(`deny glob matches: ${cmd}`, matchesDeny(cmd), true);
+]) {
+  check(`deny-rule prefix model matches: ${cmd}`, matchesDeny(cmd), true);
+  check(`live guard policy also refuses it: ${cmd}`, guardVerdict(cmd, { repoRoot: os.tmpdir() }).ok, false);
+}
 check("anchored rule still matches the bare form", matchesDeny("git diff --output=/tmp/x"), true);
 // `git tag v1` (create) and `git branch x` (create) carry no write FLAG, so no
 // deny rule matches them — they are refused by the allowlist instead, which is
@@ -188,7 +202,20 @@ check("floor boundary is inclusive", versionAtLeast(PERMISSION_MODE_MANUAL_MIN, 
 check("four-component version", versionAtLeast("2.1.200.1", PERMISSION_MODE_MANUAL_MIN), true);
 check("unknown version is null, not a guess", versionAtLeast(null, PERMISSION_MODE_MANUAL_MIN), null);
 check("two-component version", versionAtLeast("2.2", PERMISSION_MODE_MANUAL_MIN), true);
-check("floor constants", [PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN], ["2.1.200", "2.1.259"]);
+// Q18: the old check was `check("floor constants", [A,B], ["2.1.200","2.1.259"])` —
+// it copied the definitions and could never fail. What actually matters is the
+// RELATION (the permission-prompts floor cannot be older than the manual-mode
+// floor) and the documented prerelease policy, so assert those.
+check("permission floors are ordered (prompts floor >= manual-mode floor)",
+  versionAtLeast(PERMISSION_PROMPTS_MIN, PERMISSION_MODE_MANUAL_MIN), true);
+check("permission floors are plain semver",
+  [PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN].every((v) => /^\d+\.\d+\.\d+$/.test(v)), true);
+// Same-baseline prerelease: cmpVer drops the suffix, so a "-beta.1" of the floor
+// counts as the floor. That is a deliberate policy (a beta that advertises the
+// flag is usable); lock it so a future strict-semver change is a conscious
+// behavior change rather than a silent flip.
+check("a prerelease of the floor satisfies the floor (documented policy)",
+  versionAtLeast(`${PERMISSION_PROMPTS_MIN}-beta.1`, PERMISSION_PROMPTS_MIN), true);
 
 /* ---------------- git hardening args (C1) ---------------- */
 for (const key of ["core.fsmonitor=", "diff.external=", "credential.helper=", "core.hooksPath=", "core.pager=cat"]) {
@@ -362,10 +389,56 @@ try {
 }
 fs.rmSync(wtRoot, { recursive: true, force: true });
 
+/* ---------------- SEC-09: loopback host normalization ---------------- */
+// isLoopbackHost is module-private, and gatewayTarget() exposes only the parsed
+// host, not the verdict. Assert the OBSERVABLE consequence instead: with a
+// clean HOME (no ~/.claude/settings.json override) probeGateway() must ATTEMPT
+// a TCP probe for every spelling of loopback and skip ONLY non-loopback hosts.
+// Before SEC-09, "[::1]" (URL.hostname keeps the brackets) and "localhost."
+// both fell through to { skipped: true }, so a local gateway could be routed
+// through an HTTP proxy while the env tool reported nothing wrong.
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "loopback-home-"));
+  const claudeUrl = pathToFileURL(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "claude.js"),
+  ).href;
+  const probe = (baseUrl) => {
+    const env = { ...process.env, HOME: home, USERPROFILE: home, ANTHROPIC_BASE_URL: baseUrl };
+    delete env.CLAUDE_CONFIG_DIR; // isolation: the settings dir must be the empty temp HOME
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e",
+      `import { probeGateway } from ${JSON.stringify(claudeUrl)}; process.stdout.write(JSON.stringify(await probeGateway(150)));`],
+      { env, encoding: "utf8", timeout: 30000, windowsHide: true });
+    try { return JSON.parse(String(r.stdout || "").trim()); } catch { return { parseError: String(r.stderr || r.stdout).slice(0, 200) }; }
+  };
+  for (const [label, url] of [
+    ["IPv6 literal [::1]", "http://[::1]:9"],
+    ["absolute-dot localhost.", "http://localhost.:9"],
+    ["plain localhost", "http://localhost:9"],
+    ["127.0.0.1", "http://127.0.0.1:9"],
+  ]) check(`probeGateway probes the loopback spelling: ${label}`, probe(url).skipped !== true, true);
+  // A non-loopback host must NOT be probed (offline test: TEST-NET-1 is never
+  // contacted; skipped:true proves no TCP attempt was made).
+  check("probeGateway skips a non-loopback host", probe("http://192.0.2.1:9").skipped, true);
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 /* ---------------- guard wiring ---------------- */
-check("guard hook command quotes both paths", /^".+" ".+"$/.test(guardHookCommand()), true);
-check("guard hook path is inside the package", hookScriptPath().includes(path.join("scripts", "pre-tool-hook.js")), true);
-check("guard state is one of on/off/failed", ["on", "off", "failed"].includes(guardState().state), true);
+// Q18: the old checks only validated the SHAPE of the command ("quoted quoted")
+// and that the path CONTAINS scripts/pre-tool-hook.js — a hookScriptPath()
+// pointing at a deleted file still matched, and "state is one of on/off/failed"
+// is true on a machine where the guard is off. Assert what must hold on a
+// working install: the file exists, the registered command names that exact
+// file with this node, and the guard is actually ON.
+{
+  const hookPath = hookScriptPath();
+  check("guard hook file exists on disk", fs.existsSync(hookPath), true);
+  check("guard hook is the packaged scripts/pre-tool-hook.js",
+    [path.basename(hookPath), path.basename(path.dirname(hookPath))], ["pre-tool-hook.js", "scripts"]);
+  check("guard hook command names this node and that exact hook",
+    guardHookCommand(),
+    `"${process.execPath.replace(/\\/g, "/")}" "${hookPath.replace(/\\/g, "/")}"`);
+  check("guard state is on", guardState().state, "on");
+}
 // The self-test cache carries a TTL now (a long-lived server outlives any one
 // install), and TTL re-verification goes through the same {refresh:true} path
 // claude_review_env uses — lock that it re-probes and agrees with the cached
@@ -652,9 +725,25 @@ check("effort xhigh maps to review level max (same native playbook as max)", der
   check("effort low maps to review level low", deriveReviewLevel("low"), "low");
   check("unknown effort defaults to high", deriveReviewLevel("bogus"), "high");
   check("fleet rule: low has no fleet", finderFleetRule("low"), { finders: 0, candidates: 0, cap: 4, angles: "one careful diff pass" });
-  // Read out of claude 2.1.311: max = "5+5 angles x 8 candidates", i.e. 10 finders.
-check("fleet rule at max is the native 10 finders", finderFleetRule("max").finders, 10);
-check("fleet rule at high is the native 8 finders", finderFleetRule("high").finders, 8);
+  // Q18: medium used to be COMPLETELY untested and max/high only asserted
+  // `finders`, so the candidate/cap/angles half of the native playbook (the part
+  // CHANGELOG 1.18.0 claims to have fixed per level) could regress unnoticed.
+  // Read out of claude 2.1.311: medium/high = "3+5 angles x 6 candidates",
+  // max = "5+5 angles x 8 candidates" with the report capped at 15.
+  // The numeric half is exact; the angle text is prose copied from the native
+  // playbook and has been reworded once already, so lock its SHAPE ("3+5" for
+  // medium/high, "5+5" for max) rather than a sentence that would fail on a
+  // harmless wording change.
+  const nums = (r) => ({ finders: r.finders, candidates: r.candidates, cap: r.cap });
+  const medium = finderFleetRule("medium");
+  const high = finderFleetRule("high");
+  const max = finderFleetRule("max");
+  check("fleet rule at medium is the native 8 finders x 6 candidates, cap 8", nums(medium), { finders: 8, candidates: 6, cap: 8 });
+  check("fleet rule at high matches medium", nums(high), { finders: 8, candidates: 6, cap: 8 });
+  check("medium/high angles carry the native 3+5 split", [/3\+5/.test(medium.angles), /3\+5/.test(high.angles)], [true, true]);
+  check("fleet rule at max is the native 10 finders x 8 candidates, cap 15", nums(max), { finders: 10, candidates: 8, cap: 15 });
+  check("max angles carry the native 5+5 split", /5\+5/.test(max.angles), true);
+  check("an unknown level falls back to the max fleet", nums(finderFleetRule("turbo")), nums(max));
   // The prompt must carry the fleet rule and the level, so the model sizes the
   // fleet from the diff instead of always dispatching five.
   const prompt = buildReviewPrompt({
@@ -855,6 +944,59 @@ check("fleet rule at high is the native 8 finders", finderFleetRule("high").find
   check("init.mjs exits 1 on a config.json directory", r.status, 1);
   check("init.mjs names the problem instead of crashing", /not a regular file/.test(out), true);
   check("init.mjs did not throw an uncaught EISDIR stack", /\bEISDIR\b[\s\S]*\n\s+at /.test(out), false);
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+/* ---------------- SEC-16: init.mjs writes the config atomically ----------------
+ * The registration file carries the gateway credential and every MCP host
+ * re-reads it while the server runs. writeFileSync() truncates it before the
+ * first byte, so a crash/ENOSPC mid-write leaves unparsable JSON and takes out
+ * every server in the file. The fix writes a same-dir temp file + rename; the
+ * inode therefore CHANGES on an update (in-place writes keep it). The env merge
+ * is locked in the same run: user keys survive, derived keys win by name. */
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ccinit-atomic-"));
+  const cfgDir = path.join(home, ".zcode", "cli");
+  fs.mkdirSync(cfgDir, { recursive: true });
+  const cfgPath = path.join(cfgDir, "config.json");
+  fs.writeFileSync(cfgPath, JSON.stringify({
+    mcp: { servers: {
+      "cc-code-review": {
+        command: "/old/node", args: ["/old/index.js"], timeoutMs: 999,
+        env: { HTTP_PROXY: "http://proxy.local:8080", MY_KEY: "keep-me", ANTHROPIC_AUTH_TOKEN: "old-token" },
+      },
+      other: { command: "untouched" },
+    } },
+  }, null, 2));
+  const inoBefore = fs.statSync(cfgPath).ino;
+  const env = {
+    ...process.env, HOME: home, USERPROFILE: home,
+    ANTHROPIC_BASE_URL: "http://127.0.0.1:9", ANTHROPIC_AUTH_TOKEN: "fresh-token",
+  };
+  delete env.ANTHROPIC_API_KEY; // keep the real key out of the throwaway config
+  const r = spawnSync(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "init.mjs")], {
+    env, encoding: "utf8", timeout: 120000,
+  });
+  let written = null;
+  try { written = JSON.parse(fs.readFileSync(cfgPath, "utf8")); } catch { /* asserted below */ }
+  const entry = written?.mcp?.servers?.["cc-code-review"] ?? {};
+  check("init.mjs exits cleanly (0 ok / 2 self-check failures, never a crash)", [0, 2].includes(r.status), true);
+  check("init.mjs replaces config.json atomically (new inode)", fs.statSync(cfgPath).ino !== inoBefore, true);
+  // NTFS has no POSIX mode bits: Windows protects this file with ACLs, and the
+  // 0600 request is documented as best-effort there (SECURITY.md). Assert the
+  // real permission bits on POSIX only; on Windows assert the file exists.
+  check("init.mjs keeps the credential file at 0600",
+    process.platform === "win32"
+      ? (fs.existsSync(cfgPath) ? "exists (NTFS ACLs)" : "missing")
+      : (fs.statSync(cfgPath).mode & 0o777).toString(8),
+    process.platform === "win32" ? "exists (NTFS ACLs)" : "600");
+  check("init.mjs leaves no temp file behind", fs.readdirSync(cfgDir), ["config.json"]);
+  check("init.mjs keeps user env keys and their values",
+    [entry.env?.HTTP_PROXY, entry.env?.MY_KEY], ["http://proxy.local:8080", "keep-me"]);
+  check("init.mjs lets a derived env key win on a name collision", entry.env?.ANTHROPIC_AUTH_TOKEN, "fresh-token");
+  check("init.mjs preserves a user timeoutMs", entry.timeoutMs, 999);
+  check("init.mjs leaves unrelated servers untouched", written?.mcp?.servers?.other, { command: "untouched" });
+  fs.rmSync(home, { recursive: true, force: true });
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed`);

@@ -107,6 +107,25 @@ truthy("the bin still points at src/index.js", pkg.bin?.["cc-code-review"] === "
 check("package.json scripts.init points at scripts/init.mjs",
   /scripts[\\/]init\.mjs/.test(String(pkg.scripts?.init || "")), true);
 
+/* ---- 1b. the lockfile must pin the public npm registry ---- */
+// The lockfile is a supply-chain decision that survives every future
+// `npm install`: a tarball host written here is the host CI and users fetch
+// from. It used to send 94/95 tarballs to registry.npmmirror.com while the
+// project declared no such registry (audit P2-22). Lock the host, not just the
+// absence of the one mirror name.
+const lock = JSON.parse(fs.readFileSync(path.join(ROOT, "package-lock.json"), "utf8"));
+const lockPackages = lock.packages || {};
+const resolved = Object.values(lockPackages)
+  .map((p) => p?.resolved)
+  .filter((u) => typeof u === "string");
+check("package-lock.json version matches package.json", lock.version, pkg.version);
+check("package-lock.json root package version matches package.json", lockPackages[""]?.version, pkg.version);
+check("the lockfile pins every tarball on registry.npmjs.org",
+  resolved.filter((u) => !u.startsWith("https://registry.npmjs.org/")), []);
+check("the lockfile contains no registry.npmmirror.com URL",
+  JSON.stringify(lock).includes("registry.npmmirror.com"), false);
+truthy(`the lockfile lists the dependency tree (${resolved.length} resolved tarballs)`, resolved.length >= 90);
+
 /* ---- 2. npm's own file list (dry run) ---- */
 const packJson = (args, opts = {}) =>
   JSON.parse(execFileSync(NPM, ["pack", "--json", ...args], {

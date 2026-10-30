@@ -35,3 +35,15 @@
 - **Windows 的 git config 转义**：hooksPath/fsmonitor fixture 把 `C:\...` 原样写进 `.git/config`，反斜杠是转义符 → `bad config line`，而扫描器现在 fail-closed 拒绝（此前 fallback line-scan 会通过）。fixture 改用 `cfgPath()` 正斜杠（git 全平台接受）。
 
 这两个都是测试 fixture 的平台问题，不是产品缺陷；修复后 CI 6/6。
+
+## 收编的增量（A/B 组在 Lead 核心实现之上完成）
+
+Lead 先落地了 round-6 的核心（单表固定键、fail-closed、P1-4 窄规则、package.json Edit、指纹子集、P2-3 的 realpathNearest/repoRelative/isInsideRepo）。随后两个 subagent 在此基础上补齐了完整性：
+
+- **P2-1 全量单表**：扫描侧的通配/正则族（`url.*.insteadOf`、`remote.*.vcs`、`diff|filter.<name>.*`、`pager.<cmd>`、`credential[.<url>].helper`、`merge.<name>.driver`、`include[If].path`）也进入 `GIT_HARDENING` 的 `pattern` 字段，由 `scanPattern()`/`scanKeyOfKind()` 派生；原有 8 个手工常量删除。加载期断言扩展：pattern 禁 env/args、禁 `g`/`y`、id 唯一、transport 必须有 refuse。env 16 键 / args 16 对与重构前逐字节一致，28 个真实仓库 fixture 的 refusals+notes 完全一致。
+- **P2-3 完整收口**：`readRepoFile` + `MAX_REPO_METADATA_BYTES` 移入 `src/shell-guard.js`（唯一实现），`claude.js` 改为 import；`isInsideRepo` 默认 `allowRoot=false`（仓库根默认不算内部），新增 `shellSyntax` 选项区分 Bash 词元与工具字面路径（修掉"仓库内 `a$b.txt` 被 hook 误拒"）。hook 的 Write/Read 用 `allowRoot:false`、Grep/Glob 用 `allowRoot:true`，两侧判定一致（130/130 矩阵）。
+- **P1-4 残余补强**：grep 的规范化根（`.//`、`src/..`、仓库根绝对路径）与 GNU `-d recurse` 别名也拒绝；`--` 之后的 token 不再当 flag（`rg -n -- --hidden .` ALLOW）；`grep -rn x -- .` 仍 DENY。
+- **P1-13 完整覆盖**：指纹 canon 纳入全部 22 个规则函数源码（`parseCommand`/`matchPolicy`/`cdProblem`/`analyseCommand` 等），不只 7 个。
+- **fail-closed 加固**：不依赖 git 英文报错文本（本地化 shim 仍 refusal；旧 git 缺 `--no-includes` 仍走行扫描不误拒）；`spawnSync` 抛异常也 refusal。
+
+验证：shell-guard 298、audit-fixes 313、p0-regression 204、validation 30、pack 48、cross-cases 154/154、smoke PASS；`npm test` 7/7（本机 + 克隆各一次）；Lead 探针 20/20。

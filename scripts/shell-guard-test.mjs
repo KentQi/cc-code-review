@@ -509,6 +509,8 @@ check("replay: an escaped unlisted command is reported",
 // rg honours .gitignore by default; --hidden/--no-ignore/-u/--unrestricted
 // switch that off, so a recursive search reads ignored secrets (.env, keys).
 for (const c of [
+  "rg --hidden -n x .",
+  "rg --no-ignore -n x .",
   "rg --hidden -n API_KEY .",
   "rg --no-ignore -n API_KEY .",
   "rg -u -n x .",
@@ -523,7 +525,10 @@ for (const c of ["rg -n x src", "rg -n x file.ts", "rg -n TODO src/", "rg -n '.*
 }
 // grep has no .gitignore awareness at all: a recursive grep rooted at the repo
 // reads every ignored secret file.
-for (const c of ['grep -rn "" .', "grep -R x .", "grep -r x", "grep -rE x .", "grep --recursive x .", "grep -Hrn x ./"]) {
+for (const c of ['grep -rn "" .', "grep -R x .", "grep -r x", "grep -rE x .", "grep --recursive x .", "grep -Hrn x ./",
+  // Any spelling that RESOLVES to the repository root is the same recursive
+  // scan; a literal "." comparison missed these normalized/absolute forms.
+  "grep -rn x .//", "grep -rn x ././", "grep -rn x src/..", "grep -rn x " + REPO]) {
   check(`P1-4: refuses recursive grep ${c}`, analyseCommand(c, { repoRoot: REPO }).ok, false);
 }
 for (const c of ["grep -rn x src", "grep -n x file.ts"]) {

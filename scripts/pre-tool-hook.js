@@ -285,7 +285,33 @@ process.stdin.on("end", async () => {
       const added = tool === "Write"
         ? payload?.tool_input?.content
         : [payload?.tool_input?.new_string, ...edits.map((e) => e?.new_string)].filter((s) => typeof s === "string").join("\n");
-      if (packageJsonAddsInstallScript(added)) {
+      // Result-level check (P1-4 residual, second pass): a rename such as
+      // "preinstal" -> "preinstall" never appears as an install key in the
+      // replacement text, but the RESULT is one. Reconstruct the file the tool
+      // would leave behind and parse that. If the current body cannot be read or
+      // the edit does not match it, fall back to the replacement text (the old
+      // check) — never to "allow".
+      let candidate = added;
+      try {
+        const abs = path.join(root, relSlash);
+        const before = tool === "Write" ? "" : fs.readFileSync(abs, "utf8");
+        if (tool === "Write") {
+          candidate = payload?.tool_input?.content;
+        } else if (tool === "Edit") {
+          const oldS = payload?.tool_input?.old_string;
+          const newS = payload?.tool_input?.new_string;
+          candidate = typeof oldS === "string" && typeof newS === "string" && before.includes(oldS)
+            ? before.replace(oldS, newS)
+            : added;
+        } else {
+          let body = before;
+          for (const e of edits) {
+            if (typeof e?.old_string === "string" && body.includes(e.old_string)) body = body.replace(e.old_string, e?.new_string ?? "");
+          }
+          candidate = body;
+        }
+      } catch { candidate = added; }
+      if (packageJsonAddsInstallScript(candidate)) {
         deny(`${tool} blocked: ${relSlash} would gain an install hook (scripts.preinstall/install/postinstall), which runs the next time anyone runs npm install. fix mode may change package metadata, not plant an install-time command. Write the package.json without that script; install hooks are not permitted in fix mode.`);
       }
     }

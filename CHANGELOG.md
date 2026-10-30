@@ -11,7 +11,7 @@ Closes the residuals left by 1.18.5 (audit P2-1, P2-3, P2-22 and the documented 
 - **Policy fingerprint covers rule code (P1-13 residual).** The fingerprint hashed the tables but not the inline rules, so an upgrade that changed `segmentProblem`/`dotGlobProblem`/`isInsideRepo` without touching a table passed the stale-policy check. The in-memory source of those functions is now part of the policy identity.
 - **Fail-closed scanner.** A repository whose `.git/config` git itself cannot parse is refused (it used to fall back to a line scan while git commands in that repo fail anyway), and an attribute enumeration that cannot run (e.g. a corrupt index) is refused instead of noted — attribute files under the pruned `node_modules/` would otherwise be unverified.
 - **Lockfile registry (P2-22).** All 94 `resolved` tarball URLs pointed at `registry.npmmirror.com`; they now point at `registry.npmjs.org` (same paths and integrity hashes), so CI and consumers no longer depend on a third-party mirror.
-- Suites: shell-guard 292, audit-fixes 313, p0-regression 181, validation 30, pack 43, cross-cases 154/154, smoke PASS — `npm test` green (7 suites).
+- Suites: shell-guard 298, audit-fixes 314, p0-regression 206, validation 30, pack 48, cross-cases 154/154, smoke PASS — `npm test` green (7 suites).
 - **Behaviour changes:** `rg --hidden/--no-ignore/-u` and root-recursive `grep` are now refused (use scoped paths); a corrupt `.git/config` or index refuses the review instead of degrading; the child git env pins seven more keys (a repo can no longer select an editor/diff-filter/gpg program for the reviewer); restart the MCP host (policy fingerprint changed).
 
 ## 1.18.5 — 2026-10-30

@@ -1,7 +1,7 @@
 # 修复报告（第六轮）— v1.18.6
 
 **基线**：v1.18.5（第三轮审计的残余：P2-1 / P2-3 / P2-22 + FIXES-round5 的 P1-4、P1-13、fail-closed 缺口）
-**结果**：v1.18.6（`npm test` 7 套件全绿：shell-guard 292 / audit-fixes 313 / p0-regression 181 / validation 30 / pack 43 / cross-cases 154 / smoke）
+**结果**：v1.18.6（`npm test` 7 套件全绿：shell-guard 298 / audit-fixes 314 / p0-regression 206 / validation 30 / pack 48 / cross-cases 154 / smoke）
 **PR**：[#6](https://github.com/KentQi/cc-code-review/pull/6)（stacked on [#5](https://github.com/KentQi/cc-code-review/pull/5)）
 **CI**：ubuntu/macos/windows × node 18/22 **6/6 全绿**（run [40992030320](https://github.com/KentQi/cc-code-review/actions/runs/40992030320)）
 **方式**：subagent 运行时本轮不可用（3 个全部异常终止且未改任何文件），由 Lead 直接逐项修复并补回归。
@@ -27,7 +27,7 @@
 ## 验证
 
 - Lead 独立探针 `/tmp/verify-round6.mjs`：**20/20**（P1-4 矩阵、package.json Edit、共享 containment、坏 config fail-closed、指纹内联规则）。
-- `npm test` 7/7、exit 0；新增回归：shell-guard 272→292、audit-fixes 305→313、p0 163→181。
+- `npm test` 7/7、exit 0；新增回归：shell-guard 272→298、audit-fixes 305→314、p0 163→206、pack 43→48。
 - 环境限制：subagent 工具本轮不可用，全部改动由 Lead 完成（无并行写冲突）。
 ## CI 抓到的两个 fixture 问题（已修）
 
@@ -46,4 +46,9 @@ Lead 先落地了 round-6 的核心（单表固定键、fail-closed、P1-4 窄�
 - **P1-13 完整覆盖**：指纹 canon 纳入全部 22 个规则函数源码（`parseCommand`/`matchPolicy`/`cdProblem`/`analyseCommand` 等），不只 7 个。
 - **fail-closed 加固**：不依赖 git 英文报错文本（本地化 shim 仍 refusal；旧 git 缺 `--no-includes` 仍走行扫描不误拒）；`spawnSync` 抛异常也 refusal。
 
-验证：shell-guard 298、audit-fixes 313、p0-regression 204、validation 30、pack 48、cross-cases 154/154、smoke PASS；`npm test` 7/7（本机 + 克隆各一次）；Lead 探针 20/20。
+验证：shell-guard 298、audit-fixes 314、p0-regression 206、validation 30、pack 48、cross-cases 154/154、smoke PASS；`npm test` 7/7（本机 + 克隆各一次）；Lead 探针 20/20。
+
+## 收尾时又修的两处（scripts 组报告的残余）
+
+- **package.json 的 Edit 结果级校验**：只查 `new_string` 时，`"preinstal"` → `"preinstall"` 这种两步改名可以绕过（每个 new_string 都不含 install 键）。hook 现在读当前文件、应用 old→new 重建结果再解析；读不到/不匹配时回退到 new_string（绝不放行）。p0 新增两步改名 DENY / 无害改名 ALLOW。
+- **`core.attributesFile` 的 containment**：claude.js 里最后一处手写 `path.relative(realpath(...))` 改为共享 `repoRelative`（P2-3 同类收口）；audit-fixes 新增源级断言。

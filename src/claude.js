@@ -2798,11 +2798,10 @@ function repoAttributeFiles(repoPath, attributeSources = []) {
         " does not exist on this machine, so git reads no attributes file from it; proceeding");
       continue;
     }
-    let inside = false;
-    try {
-      const relToRoot = path.relative(fs.realpathSync(repoPath), fs.realpathSync(abs));
-      inside = relToRoot !== "" && !relToRoot.startsWith("..") && !path.isAbsolute(relToRoot);
-    } catch { inside = false; }
+    // Shared containment (audit P2-3): no local realpath/path.relative copy.
+    // rel "" means the attributes file IS the repository root — not a file.
+    const relToRoot = repoRelative(repoPath, abs);
+    const inside = relToRoot !== null && relToRoot !== "" && !relToRoot.startsWith("..") && !path.isAbsolute(relToRoot);
     if (!inside) {
       refusals.push(label + ": core.attributesFile = " + raw.slice(0, 120) +
         " points outside the repository — git applies attributes from that file on every diff/log, so a driver " +

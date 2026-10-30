@@ -1092,6 +1092,7 @@ console.log("-- P2-1/P2-3/P1-13 single sources and fingerprint coverage");
   check("P2-3: the hook no longer carries a private containment copy",
     fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "pre-tool-hook.js"), "utf8").includes("realContainment"), false);
   check("P2-3: the metadata reader delegates containment", claudeSrc.includes("fs.realpathSync(root)"), false);
+  check("P2-3: core.attributesFile containment delegates too", claudeSrc.includes("fs.realpathSync(repoPath), fs.realpathSync(abs)"), false);
   // P1-13 residual: an inline RULE change (tables unchanged) must still change
   // the fingerprint, otherwise an upgraded hook and an old server would agree.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "af-fp-"));

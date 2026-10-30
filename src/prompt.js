@@ -865,11 +865,17 @@ export const FIX_PROTECTED_WRITE_GLOBS = Object.freeze([
   "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx", "**/*.keystore", "**/*.jks",
   "**/id_rsa*", "**/id_dsa*", "**/id_ecdsa*", "**/id_ed25519*",
   "**/.ssh/**", "**/.aws/**", "**/.gnupg/**", "**/.netrc", "**/.pgpass",
-  // Self-review (repo == this package): anything in the guard/spawn pipeline
-  // can disarm every later run — index.js spawns the reviewer, claude.js builds
-  // the child git env, prompt.js renders the permission rules, skill.js writes
-  // the installed skill (R-2). The hook enforces the same classes from
-  // PROTECTED_WRITE; these globs are the permission-engine half.
+]);
+
+/**
+ * Pipeline files that may only be denied when the reviewed repository IS this
+ * package (self-review). Editing a FOREIGN repository's copy of them has no
+ * effect — the hook and the server always load from the package install
+ * directory — so a path-shape rule denied fix mode its whole purpose in
+ * ordinary projects (audit round 8; the R-2 scope regression).
+ * Rendered only when fixDisallowedTools({ selfReview: true }) is called.
+ */
+export const FIX_SELF_REVIEW_GLOBS = Object.freeze([
   "scripts/pre-tool-hook.js", "**/scripts/pre-tool-hook.js",
   "scripts/init.mjs", "**/scripts/init.mjs",
   "scripts/lib/**", "**/scripts/lib/**",
@@ -877,9 +883,16 @@ export const FIX_PROTECTED_WRITE_GLOBS = Object.freeze([
   "assets/skills/**", "**/assets/skills/**",
 ]);
 
-/** Render FIX_PROTECTED_WRITE_GLOBS as the fix-mode write deny rules. */
-export function fixDisallowedTools() {
-  return FIX_PROTECTED_WRITE_GLOBS.flatMap((r) => [`Edit(${r})`, `Write(${r})`, `NotebookEdit(${r})`]);
+/**
+ * Render the fix-mode write deny rules.
+ *
+ * `selfReview` must be true only when the reviewed repository is this package
+ * (shell-guard's isSelfReview()); otherwise the pipeline globs above would
+ * block ordinary fixes in unrelated projects.
+ */
+export function fixDisallowedTools({ selfReview = false } = {}) {
+  const globs = selfReview ? [...FIX_PROTECTED_WRITE_GLOBS, ...FIX_SELF_REVIEW_GLOBS] : FIX_PROTECTED_WRITE_GLOBS;
+  return globs.flatMap((r) => [`Edit(${r})`, `Write(${r})`, `NotebookEdit(${r})`]);
 }
 
 /**

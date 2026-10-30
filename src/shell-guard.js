@@ -42,6 +42,39 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
+
+/** This package's own root — the tree the guard and the server load from. */
+const PACKAGE_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Is the reviewed repository this very package?
+ *
+ * R-2 follow-up: the pipeline patterns below only matter when the reviewed
+ * tree IS the package, because the hook and the server always load from the
+ * package install directory (src/claude.js resolves the hook relative to its
+ * own module URL) — editing a foreign repository's src/index.js has no effect
+ * on the running guard. Matching by path shape (^src/...) denied fix mode the
+ * one thing it exists for in ordinary projects (audit round 8).
+ */
+export function isSelfReview(repoRoot) {
+  const raw = String(repoRoot || "").trim();
+  // A relative/empty root resolves against the process cwd; if the server was
+  // launched from the package root that would read as a self-review and block
+  // ordinary writes. The tool layer already rejects a relative repoPath, so this
+  // is belt-and-braces (audit round 8, independent check).
+  if (!raw || !path.isAbsolute(raw)) return false;
+  try {
+    const pkg = fs.statSync(PACKAGE_ROOT);
+    const repo = fs.statSync(raw);
+    // Compare the FILESYSTEM identity (dev+ino), not the path spelling: a bind
+    // mount or an alternate path to the same tree would pass a realpath string
+    // comparison, and writing through that path would still disarm later runs.
+    return pkg.dev === repo.dev && pkg.ino === repo.ino;
+  } catch {
+    return false;
+  }
+}
 
 /** Tools that only read their stdin: allowed after a pipe, never as command 1.
  *  No sed: its script language writes (w/W), executes (e) and reads (r) files in
@@ -135,6 +168,9 @@ export function policyFingerprint() {
     // changed only a protected path or a secret pattern is still a different
     // policy (audit P1-13).
     protectedWrite: PROTECTED_WRITE.map((re) => re.source + "/" + re.flags),
+    // Self-review-only classes are part of the policy identity too: which files
+    // a self-review may not write is a decision the hook enforces.
+    selfReviewPipeline: SELF_REVIEW_PIPELINE.map((re) => re.source + "/" + re.flags),
     secretRead: SECRET_READ.map((re) => re.source + "/" + re.flags),
     secretEnv: SECRET_ENV.source + "/" + SECRET_ENV.flags,
     secretEnvAllow: SECRET_READ_ALLOW.source + "/" + SECRET_READ_ALLOW.flags,
@@ -540,14 +576,22 @@ export const PROTECTED_WRITE = [
   /(^|\/)\.gitmodules$/i,
   /(^|\/)\.gitattributes$/i,
   /(^|\/)\.gitconfig$/i,
-  // Self-review: the reviewed repository can be this very package. Anything in
-  // the guard/spawn pipeline can disarm every later run — not only the hook
-  // itself: src/index.js spawns the reviewer, src/claude.js builds the child
-  // git environment, src/prompt.js renders the permission rules, src/skill.js
-  // writes the installed skill. R-2: the old list protected two files and
-  // documented "other src/* files stay editable", which left the promise half
-  // true. The whole pipeline is protected now; fix mode on THIS package is a
-  // manual-edit job by design.
+];
+
+/**
+ * Pipeline files that only matter when the reviewed repository IS this
+ * package (self-review). Editing a FOREIGN repository's copy of these files
+ * has no effect: the hook and the server always load from the package install
+ * directory, so protecting them by path shape denied fix mode the one thing it
+ * exists for in ordinary projects (audit round 8 — the R-2 scope regression).
+ *
+ * Applied only when isSelfReview(CLAUDE_REVIEW_REPO_ROOT) is true. When it is
+ * true, fixing this package in fix mode is a manual-edit job by design:
+ * src/index.js spawns the reviewer, src/claude.js builds the child git
+ * environment, src/prompt.js renders the permission rules, src/skill.js writes
+ * the installed skill — any of them can disarm every later run.
+ */
+export const SELF_REVIEW_PIPELINE = [
   /^src\/[^/]+\.js$/i,
   /^scripts\/pre-tool-hook\.js$/i,
   /^scripts\/init\.mjs$/i,

@@ -33,6 +33,7 @@ import {
   buildClaudeEnv, repoRunsGitPrograms, gitSpawnOpts, GIT_HARDENING_ARGS,
   buildModelProvenance, resultFacts,
 } from "./claude.js";
+import { isSelfReview } from "./shell-guard.js";
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt, buildNativeCommand, buildNativeAppendix,
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools, postPROnlyTools,
@@ -2120,7 +2121,10 @@ registerTool(
     // deny list may only include them when fix is off. postToPR must be passed
     // through too, otherwise `Bash(gh pr comment:*)` stays in the deny list and
     // (deny beats allow) the PR-comment feature is dead code.
-    const disallowedTools = [...reviewDisallowedTools({ fix, postToPR }), ...(fix ? fixDisallowedTools() : [])];
+    // The pipeline write-deny list applies only when the reviewed repository is
+    // this very package (self-review); a foreign repo's src/*.js is ordinary
+    // source and must stay editable in fix mode (audit round 8).
+    const disallowedTools = [...reviewDisallowedTools({ fix, postToPR }), ...(fix ? fixDisallowedTools({ selfReview: isSelfReview(repoPath) }) : [])];
 
     // gh preflight (D6): a PR scope or postToPR without a usable gh fails deep
     // inside the run, after the model has already spent turns. Both branches

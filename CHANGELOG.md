@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.18.8 — 2026-10-30
+
+Fixes a regression introduced by 1.18.7: the self-review pipeline protection was scoped by PATH SHAPE, so fix mode could not edit `src/*.js` in any repository.
+
+- **[regression] Pipeline write protection is identity-scoped.** 1.18.7 added `^src\/[^/]+\.js$` (and the glob `**/src/*.js`) to `PROTECTED_WRITE` to close R-2 — but the hook and the server always load from the package install directory, so a FOREIGN repository's `src/index.js` is ordinary source and editing it changes nothing. The rule therefore denied fix mode the one thing it exists for in ordinary projects (`src/app.js`, `src/index.ts` were refused). The pipeline patterns now live in `SELF_REVIEW_PIPELINE` and are applied only when the reviewed tree IS this package (`isSelfReview()` compares realpaths of the package root and `CLAUDE_REVIEW_REPO_ROOT`); the permission-engine globs follow the same flag (`fixDisallowedTools({ selfReview })`). A self-review still refuses the pipeline files (manual edit by design); a foreign repo keeps them writable, and the repo-agnostic classes (CI/hook config, secrets, `.git`) are unchanged.
+- `isSelfReview()` compares the **filesystem identity** (dev+ino) of the package root and the reviewed root, not path spellings: an alternate path or bind mount of the same tree is still a self-review (a realpath string compare would let a write through that path disarm later runs). A relative or empty root is never a self-review.
+- Tests: shell-guard adds `isSelfReview()` + table-separation assertions (including empty/relative roots and a symlink to the package); p0 asserts foreign repos allow the pipeline names while a self-review denies them (live hook process, both layers), and the cross-layer test now checks both scopes.
+- Suites: shell-guard 324, audit-fixes 318, p0-regression 256, validation 31, pack 52, cross-cases 156/156, smoke PASS — `npm test` green (7 suites).
+- **Behaviour change:** in fix mode, `src/*.js` / `scripts/init.mjs` / `scripts/lib/**` / `assets/skills/**` are writable again in foreign repositories; they stay read-only when reviewing this package itself. Restart the MCP host (policy fingerprint changed).
+
 ## 1.18.7 — 2026-10-30
 
 Closes the re-check of 1.18.6 (R-1/R-2/R-3/N-1) and the final audit of PR #5/#6 (1 P1 + 6 P2 + 5 P3). No new feature; behaviour changes at the end.

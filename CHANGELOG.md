@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.18.6 — 2026-10-30
+
+Closes the residuals left by 1.18.5 (audit P2-1, P2-3, P2-22 and the documented P1-4/P1-13 gaps). No new feature; the behaviour changes are listed at the end.
+
+- **One git-hardening table (P2-1).** The child-env overrides, the `-c` args for the server's own git spawns and the scanner's exec-key list were three hand-written tables and had already drifted: a key added to `-c` alone never reached the claude child — exactly the class that produced the `protocol.ext.allow` RCE. They are now generated from a single `GIT_HARDENING` table, and a module-load assertion refuses to start if a key is protected for the server/scanner but not for the child. The child env grew from 9 to 16 pinned keys (the editor/diffFilter/gpg/merge/gitProxy/askPass/sequence keys were `-c`-only before).
+- **One containment primitive (P2-3).** Five copies of the realpath/containment logic had diverged (the hook refused the repo root, the guard allowed it). `realpathNearest`, `repoRelative` and `isInsideRepo(root, token, {allowRoot})` now live in `src/shell-guard.js`; the hook, the guard and the repository-metadata reader all call them.
+- **Recursive scans that defeat `.gitignore` (P1-4 residual).** `rg --hidden`, `--no-ignore*`, `-u/-uu/-uuu`, `--unrestricted`, and recursive `grep -r/-R` rooted at the repository (or with no path) are refused: those forms read ignored secret files (`.env`, keys) and print them into the transcript. Scoped searches (`rg -n x src`, `grep -rn x src`) stay allowed.
+- **`package.json` Edit install hooks.** The hook checked only `Write` content; an `Edit`/`MultiEdit` could add `scripts.postinstall` one line at a time. Both tools are checked now (metadata edits stay allowed).
+- **Policy fingerprint covers rule code (P1-13 residual).** The fingerprint hashed the tables but not the inline rules, so an upgrade that changed `segmentProblem`/`dotGlobProblem`/`isInsideRepo` without touching a table passed the stale-policy check. The in-memory source of those functions is now part of the policy identity.
+- **Fail-closed scanner.** A repository whose `.git/config` git itself cannot parse is refused (it used to fall back to a line scan while git commands in that repo fail anyway), and an attribute enumeration that cannot run (e.g. a corrupt index) is refused instead of noted — attribute files under the pruned `node_modules/` would otherwise be unverified.
+- **Lockfile registry (P2-22).** All 94 `resolved` tarball URLs pointed at `registry.npmmirror.com`; they now point at `registry.npmjs.org` (same paths and integrity hashes), so CI and consumers no longer depend on a third-party mirror.
+- Suites: shell-guard 298, audit-fixes 314, p0-regression 206, validation 30, pack 48, cross-cases 154/154, smoke PASS — `npm test` green (7 suites).
+- **Behaviour changes:** `rg --hidden/--no-ignore/-u` and root-recursive `grep` are now refused (use scoped paths); a corrupt `.git/config` or index refuses the review instead of degrading; the child git env pins seven more keys (a repo can no longer select an editor/diff-filter/gpg program for the reviewer); restart the MCP host (policy fingerprint changed).
+
 ## 1.18.5 — 2026-10-30
 
 Third audit of the stacked PRs (#1–#4): 7 P0 / 14 P1 / 22 P2 / 8 P3, every P0 reproduced against real git, real hook processes and a real stdio server before counting. This release fixes all 7 P0 and all 14 P1, plus the selected P2/P3 items below.

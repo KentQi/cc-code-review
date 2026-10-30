@@ -175,6 +175,15 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 - **读边界覆盖 Grep/Glob 与 Bash**：hook 的 matcher 改为 catch-all，`Grep`/`Glob` 的 `path` 与 `Read` 同样受仓内约束与密钥黑名单约束；Bash 命令里引用 `.env`/`id_rsa`/`.ssh/`/`credentials`/`.npmrc`/`.git-credentials` 等密钥路径同样被拒（此前只有 `Read` 工具受限）。
 - **fix 模式的持久化拒绝扩表**：`.husky/**`、`.github/actions/**`、`.gitlab-ci.yml`、`Jenkinsfile`、`Makefile`、`.pre-commit-config.yaml`、`.devcontainer/**`、`.cargo/config(.toml)`、`.circleci/**`、`.npmrc` 与密钥文件均不可写；`package.json` 只在写入内容含 `scripts`/`postinstall`/`preinstall` 时拒绝（普通依赖改动仍允许）。
 - **策略指纹现在覆盖 hook 的两张表**（`PROTECTED_WRITE`/`SECRET_READ` 移入 `shell-guard.js` 并纳入哈希），升级只改了 hook 策略时 stale-policy 自检同样会拒绝。
+**v1.18.6 收口（结构性与残余）**
+
+- **git 加固只有一张表**：子进程 env、服务器自己的 `-c`、扫描器的键表由 `GIT_HARDENING` 单一来源生成，启动时断言"服务器/扫描器保护的键必须在子进程 env 里"——杜绝 1.18.5 P0-1 那类"加错表"回归。
+- **containment 只有一份实现**：`realpathNearest`/`repoRelative`/`isInsideRepo(..., {allowRoot})` 在 `src/shell-guard.js`，hook、guard 与仓库元数据读取共用。
+- **递归扫描的读边界**：`rg --hidden/--no-ignore/-u/--unrestricted` 与根级递归 `grep -r/-R` 被拒（它们会读到 `.env` 等被忽略的密钥）；scoped 搜索（`rg -n x src`）保持可用。
+- **fail-closed**：仓库的 `.git/config` 不可解析、或 `git ls-files` 无法枚举 attributes（如坏 index）时直接拒绝评审，不再只记 note。
+- **`package.json` 的 Edit/MultiEdit** 同样检查 install 钩子（此前只查 Write）。
+- **策略指纹**现在覆盖内联规则函数的源码：只改规则、不改表的升级也会触发 stale-policy 拒绝。
+- **lockfile** 的 94 个 tarball URL 从 `registry.npmmirror.com` 改为 `registry.npmjs.org`（路径与 integrity 不变）。
 
 hook 还有第二条确定性规则：**git 的 `--output=` / `--output-directory=` 会让"只读"命令写文件**（`git diff/show/log --output=<file>`、`git format-patch --output-directory=` 实测都会落盘；`--output-to=` 不是真实旗标）。deny glob 对这条无能为力——Bash 规则是整条命令前缀匹配，`Bash(git diff --output=*)` 拦不住 `git diff HEAD --output=x`，而中间带 `*` 的规则语义无法从 CLI 外验证——所以这一条由 hook 直接判掉。注意 `grep --output`、`find -print` 等非 git 的 `--output` 不受影响。
 

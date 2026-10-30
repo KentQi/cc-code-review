@@ -52,6 +52,13 @@ try {
 }
 const PROTECTED_WRITE = guardPolicy?.PROTECTED_WRITE;
 const isSecretPath = guardPolicy?.isSecretPath;
+// P2-3: the containment primitives are shared with the server/guard module —
+// this hook used to carry a fifth copy, and the copies had already diverged
+// (guard treated the repo root as inside, hook as outside). repoRelative()
+// still supplies the relative spelling the secret checks print; isInsideRepo()
+// is the actual boundary decision.
+const repoRelative = guardPolicy?.repoRelative;
+const isInsideRepo = guardPolicy?.isInsideRepo;
 
 /**
  * Info mode (CC_REVIEW_GUARD_INFO=1): print the policy fingerprint and exit.
@@ -74,10 +81,11 @@ if (process.env.CC_REVIEW_GUARD_INFO === "1") {
 /**
  * package.json is not wholesale protected: fix mode legitimately edits its
  * metadata (dependencies, scripts.test). What must never be planted is an
- * install hook, which runs the next time anyone runs npm install. Only the
- * Write tool carries the full new body, so only Write is checked here; an Edit
- * or MultiEdit can still introduce the same key one line at a time (documented
- * residual — the permission engine denies the file name, not the content).
+ * install hook, which runs the next time anyone runs npm install. Every
+ * content-carrying write tool is checked: Write's whole body, and Edit's /
+ * MultiEdit's new_string replacement text (the old Write-only check let an Edit
+ * add scripts.postinstall one line at a time). An unparseable fragment falls
+ * back to the literal key, so a partial body cannot slip through either.
  */
 const PACKAGE_INSTALL_SCRIPT = /["'](?:pre|post)?install["']\s*:/;
 
@@ -204,47 +212,18 @@ process.stdin.on("end", async () => {
   // cannot load it has no policy at all: fail closed for every payload shape,
   // including one we would otherwise treat as "not ours" and pass through.
   if (guardPolicyError || !PROTECTED_WRITE || typeof isSecretPath !== "function" ||
-    typeof guardPolicy?.dotGlobProblem !== "function") {
+    typeof guardPolicy?.dotGlobProblem !== "function" || typeof repoRelative !== "function" ||
+    typeof isInsideRepo !== "function") {
     emitDeny(
       "the shell policy failed to load (" + (guardPolicyError?.message || "missing exports") + "); refusing the tool call (fail closed)",
       1,
     );
   }
 
-  /**
-   * Lexical containment (path.relative) can be escaped by a directory junction
-   * or symlink inside the repo: `repo/link -> C:\Users\victim\.ssh` is
-   * "inside the repo" lexically but resolves elsewhere. Realpath both sides —
-   * the root, and for a not-yet-existing target the deepest existing ancestor —
-   * so the comparison happens on where the path actually leads on disk.
-   */
-  const realContainment = (root, target) => {
-    const realRoot = fs.realpathSync(root);
-    let realTarget;
-    try {
-      realTarget = fs.realpathSync(target);
-    } catch {
-      // target does not exist yet (the common Write case): anchor on its
-      // nearest existing ancestor. A dangling junction ancestor still realpaths
-      // to its target or throws — both are handled honestly here.
-      let dir = path.dirname(path.resolve(target));
-      for (;;) {
-        let realDir;
-        try {
-          realDir = fs.realpathSync(dir);
-        } catch {
-          const parent = path.dirname(dir);
-          if (parent === dir) return null; // nothing exists up to the fs root
-          dir = parent;
-          continue;
-        }
-        const tail = path.relative(dir, path.resolve(target));
-        realTarget = tail ? path.join(realDir, tail) : realDir;
-        break;
-      }
-    }
-    return path.relative(realRoot, realTarget);
-  };
+  // Containment comes from shell-guard's isInsideRepo()/repoRelative() (audit
+  // P2-3): one realpath implementation for the hook, the guard and the metadata
+  // reader. Tool payload paths are literal argv values, not shell words, so the
+  // shell-token heuristics (~, $, braces) are disabled.
 
   let payload;
   try {
@@ -267,14 +246,16 @@ process.stdin.on("end", async () => {
     );
     let rel;
     try {
-      rel = realContainment(root, target);
+      rel = repoRelative(root, target);
     } catch {
       deny(`${tool} blocked: cannot resolve the target path against the repository root`);
     }
     if (rel === null) {
       deny(`${tool} blocked: cannot resolve the target path against the repository root`);
     }
-    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+    // The boundary decision is the shared primitive (P2-3), with the policy
+    // difference spelled out: a write target can never BE the repository root.
+    if (!rel || !isInsideRepo(root, target, { allowRoot: false, shellSyntax: false })) {
       deny(`${tool} blocked: fix mode may only write inside the reviewed repository (${root}), not ${target}`);
     }
     // Compare on a forward-slash form and case-insensitively: macOS and Windows
@@ -295,9 +276,44 @@ process.stdin.on("end", async () => {
     if (secret) deny(secret);
     // package.json is only special-cased for the keys that make npm RUN
     // something on the next install. Metadata edits stay allowed (audit P1-3).
-    if (tool === "Write" && /(^|\/)package\.json$/i.test(relSlash) &&
-      packageJsonAddsInstallScript(payload?.tool_input?.content)) {
-      deny(`${tool} blocked: ${relSlash} would gain an install hook (scripts.preinstall/install/postinstall), which runs the next time anyone runs npm install. fix mode may change package metadata, not plant an install-time command. Write the package.json without that script; install hooks are not permitted in fix mode.`);
+    if (/(^|\/)package\.json$/i.test(relSlash)) {
+      // The Write tool carries the whole new body; Edit/MultiEdit carry only the
+      // replacement text. Both are checked now (P1-4 residual): an Edit that adds
+      // scripts.postinstall plants the same install-time command one line at a
+      // time.
+      const edits = Array.isArray(payload?.tool_input?.edits) ? payload.tool_input.edits : [];
+      const added = tool === "Write"
+        ? payload?.tool_input?.content
+        : [payload?.tool_input?.new_string, ...edits.map((e) => e?.new_string)].filter((s) => typeof s === "string").join("\n");
+      // Result-level check (P1-4 residual, second pass): a rename such as
+      // "preinstal" -> "preinstall" never appears as an install key in the
+      // replacement text, but the RESULT is one. Reconstruct the file the tool
+      // would leave behind and parse that. If the current body cannot be read or
+      // the edit does not match it, fall back to the replacement text (the old
+      // check) — never to "allow".
+      let candidate = added;
+      try {
+        const abs = path.join(root, relSlash);
+        const before = tool === "Write" ? "" : fs.readFileSync(abs, "utf8");
+        if (tool === "Write") {
+          candidate = payload?.tool_input?.content;
+        } else if (tool === "Edit") {
+          const oldS = payload?.tool_input?.old_string;
+          const newS = payload?.tool_input?.new_string;
+          candidate = typeof oldS === "string" && typeof newS === "string" && before.includes(oldS)
+            ? before.replace(oldS, newS)
+            : added;
+        } else {
+          let body = before;
+          for (const e of edits) {
+            if (typeof e?.old_string === "string" && body.includes(e.old_string)) body = body.replace(e.old_string, e?.new_string ?? "");
+          }
+          candidate = body;
+        }
+      } catch { candidate = added; }
+      if (packageJsonAddsInstallScript(candidate)) {
+        deny(`${tool} blocked: ${relSlash} would gain an install hook (scripts.preinstall/install/postinstall), which runs the next time anyone runs npm install. fix mode may change package metadata, not plant an install-time command. Write the package.json without that script; install hooks are not permitted in fix mode.`);
+      }
     }
     process.exit(0);
   }
@@ -314,14 +330,16 @@ process.stdin.on("end", async () => {
     // only boundary — it must deny instead of passing the call (audit P0-3).
     let rel;
     try {
-      rel = realContainment(root, target);
+      rel = repoRelative(root, target);
     } catch {
       deny("Read blocked: cannot resolve the target path against the repository root (fail closed)");
     }
     if (rel === null) {
       deny("Read blocked: cannot resolve the target path against the repository root (fail closed)");
     }
-    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+    // Shared containment (P2-3), keep hook policy: Read has no use for "the
+    // directory as a file", so the repository root itself is outside.
+    if (!rel || !isInsideRepo(root, target, { allowRoot: false, shellSyntax: false })) {
       deny(`Read blocked: the review may only read inside the reviewed repository (${root}), not ${target}`);
     }
     // A secret inside the repo is still a secret: refuse it before the path is
@@ -346,7 +364,7 @@ process.stdin.on("end", async () => {
     if (!target) process.exit(0);
     let rel;
     try {
-      rel = realContainment(root, target);
+      rel = repoRelative(root, target);
     } catch {
       deny(`${tool} blocked: cannot resolve the target path against the repository root (fail closed)`);
     }
@@ -354,8 +372,9 @@ process.stdin.on("end", async () => {
       deny(`${tool} blocked: cannot resolve the target path against the repository root (fail closed)`);
     }
     // The root itself is a legitimate search root for both tools (rel is ""),
-    // unlike Read, which has no use for "the directory as a file" (audit P2-3).
-    if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    // unlike Read, which has no use for "the directory as a file" — the one
+    // policy difference allowRoot exists to express (audit P2-3).
+    if (!isInsideRepo(root, target, { allowRoot: true, shellSyntax: false })) {
       deny(`${tool} blocked: the review may only search inside the reviewed repository (${root}), not ${target}`);
     }
     if (rel) {

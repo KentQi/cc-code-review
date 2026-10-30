@@ -5,7 +5,7 @@ import net from "node:net";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { policyFingerprint } from "./shell-guard.js";
+import { policyFingerprint, readRepoFile, realpathNearest, repoRelative } from "./shell-guard.js";
 // One implementation of the config-dir rule (skill.js resolves relative
 // CLAUDE_CONFIG_DIR values; a second copy here drifted and could point the
 // skill path and the child-process env at different directories — P3-10).
@@ -372,6 +372,164 @@ function isLoopbackHost(h) {
 }
 
 /**
+ * Single source for git hardening (audit P2-1).
+ *
+ * Three consumers used to keep their own hand-written list and they drifted:
+ * a key added to the -c list alone never reached the claude child (the P0-1
+ * class), a key added to the child env alone never reached this server's own
+ * git calls, and a key added to the scanner alone was refused without being
+ * neutralised. Every entry now lives here once:
+ *
+ *   env   - GIT_CONFIG_KEY_n/VALUE_n for the claude child. This is the ONLY
+ *           list that protects the reviewer's own git, because the scanner
+ *           cannot predict every command the model will run.
+ *   args  - `-c key=value` for this server's git spawns.
+ *   scan  - the scanner has a handler for this entry. A fixed `key` is checked
+ *           against the normalized config; a `pattern` is the scanner-only
+ *           family whose subsection name is not knowable in advance
+ *           (url.*.insteadOf, remote.*.vcs, diff.<name>.textconv, ...).
+ *   scanKind - how the scanner handles a scanned entry: "exec" (refuse a live
+ *           value), "transport" (refuse, with `refuse` as the reason; an empty
+ *           value is inert), "driver" (collect and cross-check .gitattributes),
+ *           "include", "notes" (core.hooksPath), "attribute"
+ *           (core.attributesFile).
+ *
+ * A `pattern` cannot be spelled as a GIT_CONFIG_KEY, so it protects the
+ * scanner side only - the assertions below refuse one that claims env/args
+ * instead of silently accepting a protection it cannot provide.
+ *
+ * The load-time assertions below are not documentation: a table that violates
+ * them is a protection hole, so the process must not start.
+ */
+const GIT_HARDENING = [
+  // Values git executes (or that decide what executes).
+  { key: "core.sshCommand", value: "", env: true, args: true, scan: true, scanKind: "exec" },
+  { key: "core.fsmonitor", value: "", env: true, args: true, scan: true, scanKind: "exec" },
+  { key: "core.pager", value: "cat", env: true, args: true, scan: true, scanKind: "exec" },
+  { key: "core.hooksPath", value: "", env: true, args: true, scan: true, scanKind: "notes" },
+  { key: "diff.external", value: "", env: true, args: true, scan: true, scanKind: "exec" },
+  { key: "credential.helper", value: "", env: true, args: true, scan: false },
+  { key: "core.attributesFile", value: "", env: true, args: true, scan: true, scanKind: "attribute" },
+  { key: "interactive.diffFilter", value: "", env: true, args: true, scan: false },
+  { key: "core.editor", value: "", env: true, args: true, scan: false },
+  { key: "gpg.program", value: "", env: true, args: true, scan: false },
+  { key: "merge.tool", value: "", env: true, args: true, scan: false },
+  { key: "core.gitProxy", value: "", env: true, args: true, scan: true, scanKind: "exec" },
+  { key: "core.askPass", value: "", env: true, args: true, scan: true, scanKind: "exec" },
+  { key: "sequence.editor", value: "", env: true, args: true, scan: true, scanKind: "exec" },
+  // The transport family (P0-1): ext:: runs an external command as the
+  // remote URL transport; protocol.file re-enables file:// URLs.
+  { key: "protocol.ext.allow", value: "never", env: true, args: true, scan: true, scanKind: "transport",
+    refuse: "it chooses git's transport policy (the ext:: transport runs an external command)" },
+  { key: "protocol.file.allow", value: "never", env: true, args: true, scan: true, scanKind: "transport",
+    refuse: "it chooses git's transport policy (the ext:: transport runs an external command)" },
+  // Scanner-only families. `id` is the stable handle the scanner derives its
+  // named patterns from, so each regex is written here and nowhere else.
+  { id: "url-rewrite", pattern: /^url\..+\.insteadof$/, scan: true, scanKind: "transport",
+    refuse: "it rewrites the URL git fetches, so a transport this scan did not verify can be reached" },
+  { id: "remote-vcs", pattern: /^remote\..+\.vcs$/, scan: true, scanKind: "transport",
+    refuse: "it selects a remote-helper program git runs for that remote" },
+  // A NAMED driver's command (diff.<name>.textconv, filter.<name>.process, ...).
+  // Collected, not refused on sight: git runs a named driver only when an
+  // attributes file references it, and that cross-check is what keeps an
+  // unreferenced definition inert (and an ordinary global-config LFS filter
+  // from flagging every repo). diff.external has no name, so it is a fixed key.
+  { id: "named-driver", pattern: /^(diff|filter)\.(.+)\.(textconv|external|command|difffilter|clean|smudge|process)$/, scan: true, scanKind: "driver" },
+  // `pager.<cmd>` (exactly one subcommand name): git resolves it before
+  // core.pager, so the hardened `-c core.pager=cat` does not neutralise it. A
+  // boolean value is git's enable/disable form, not a program.
+  { id: "pager-subcommand", pattern: /^pager\.[^.]+$/, scan: true, scanKind: "exec" },
+  // credential.helper, plain and in the credential.<url>.helper form.
+  { id: "credential-helper", pattern: /^credential(?:\..+)?\.helper$/, scan: true, scanKind: "exec" },
+  // A merge driver's command, refused like the other executable values.
+  { id: "merge-driver", pattern: /^merge\..+\.driver$/, scan: true, scanKind: "exec" },
+  // [include]/[includeIf] path is not execution, but the included file is.
+  { id: "include-path", pattern: /^include(?:if\..+)?\.path$/, scan: true, scanKind: "include" },
+];
+
+/**
+ * Load-time invariants (audit P2-1). A violation means the process must not
+ * start: the table is the only place the three layers can disagree.
+ */
+const HARDENING_SCAN_KINDS = new Set(["exec", "transport", "driver", "include", "notes", "attribute"]);
+{
+  const keysSeen = new Set();
+  const patternsSeen = new Set();
+  const idsSeen = new Set();
+  for (const entry of GIT_HARDENING) {
+    const hasKey = typeof entry.key === "string" && entry.key.length > 0;
+    const hasPattern = entry.pattern instanceof RegExp;
+    if (hasKey === hasPattern) {
+      throw new Error("GIT_HARDENING: every entry needs exactly one of key|pattern");
+    }
+    if (typeof entry.scan !== "boolean") {
+      throw new Error("GIT_HARDENING: " + (entry.key || entry.pattern) + " must spell scan:true/false");
+    }
+    if (hasKey) {
+      if (typeof entry.env !== "boolean" || typeof entry.args !== "boolean") {
+        throw new Error("GIT_HARDENING: " + entry.key + " must spell env:true/false and args:true/false");
+      }
+      // The P0-1 invariant: whatever protects the server or the scanner must
+      // also protect the reviewer child - that is the list nobody predicts.
+      if ((entry.args || entry.scan) && !entry.env) {
+        throw new Error("GIT_HARDENING: " + entry.key + " must set env:true (the claude child is the layer that cannot be predicted)");
+      }
+      const lower = entry.key.toLowerCase();
+      if (keysSeen.has(lower)) throw new Error("GIT_HARDENING: duplicate key " + entry.key);
+      keysSeen.add(lower);
+      if (entry.scan && !HARDENING_SCAN_KINDS.has(entry.scanKind || "exec")) {
+        throw new Error("GIT_HARDENING: " + entry.key + " has unknown scanKind " + entry.scanKind);
+      }
+      if (entry.scanKind === "transport" && !entry.refuse) {
+        throw new Error("GIT_HARDENING: " + entry.key + " is a transport key without refuse text");
+      }
+    } else {
+      // A wildcard family has no literal key, so it can never be pinned in the
+      // child env or in -c: accepting env/args would promise a protection it
+      // cannot give (and re-create exactly the P0-1 blindness).
+      if (entry.env === true || entry.args === true) {
+        throw new Error("GIT_HARDENING: " + entry.pattern + " is a pattern; only a fixed key can be pinned in env/-c");
+      }
+      if (!entry.scan) throw new Error("GIT_HARDENING: " + entry.pattern + " is a pattern and must be scanned");
+      // A stateful regex would consume lastIndex across unrelated keys.
+      if (/[gy]/.test(entry.pattern.flags)) {
+        throw new Error("GIT_HARDENING: " + entry.pattern + " is stateful (g/y) and cannot be reused for scanning");
+      }
+      if (typeof entry.id !== "string" || !entry.id) {
+        throw new Error("GIT_HARDENING: pattern " + entry.pattern + " needs an id");
+      }
+      if (idsSeen.has(entry.id)) throw new Error("GIT_HARDENING: duplicate pattern id " + entry.id);
+      idsSeen.add(entry.id);
+      const sig = entry.pattern.source + "/" + entry.pattern.flags;
+      if (patternsSeen.has(sig)) throw new Error("GIT_HARDENING: duplicate pattern " + entry.pattern);
+      patternsSeen.add(sig);
+      if (!HARDENING_SCAN_KINDS.has(entry.scanKind)) {
+        throw new Error("GIT_HARDENING: pattern " + entry.pattern + " has unknown scanKind " + entry.scanKind);
+      }
+      if (entry.scanKind === "transport" && !entry.refuse) {
+        throw new Error("GIT_HARDENING: pattern " + entry.pattern + " is a transport pattern without refuse text");
+      }
+    }
+  }
+  // The scanner's dedicated key handlers read these spellings; keep them tied
+  // to the table so a remove/rename fails at load instead of silently no-oping.
+  for (const required of ["core.hooksPath", "core.attributesFile"]) {
+    if (!keysSeen.has(required.toLowerCase())) {
+      throw new Error("GIT_HARDENING: " + required + " is required by the scanner");
+    }
+  }
+}
+
+/** The table itself (exported so the self-test can prove the three views agree). */
+export { GIT_HARDENING };
+
+/**
+ * The `-c key=value` pairs this server passes to its own git spawns.
+ * Derived from GIT_HARDENING so the two lists cannot drift.
+ */
+export const GIT_HARDENING_ARGS = GIT_HARDENING.filter((e) => e.args).flatMap((e) => ["-c", e.key + "=" + e.value]);
+
+/**
  * Environment for the claude child process:
  *  - drop our own entrypoint marker so claude's telemetry sees a standard CLI session
  *  - macOS/Linux: APPEND (never prepend) common tool dirs missing from the host
@@ -434,23 +592,9 @@ export function buildClaudeEnv() {
   // transport (protocol.ext/protocol.file, P0-1).
   // A host-provided GIT_CONFIG_COUNT is preserved (entries are appended after
   // it) so the server never silently drops config the caller injected.
-  const gitOverrides = [
-    ["core.sshCommand", ""],
-    ["core.fsmonitor", ""],
-    ["core.pager", "cat"], // a pager is a program; "cat" is the inert one
-    ["core.hooksPath", ""],
-    ["diff.external", ""],
-    ["credential.helper", ""],
-    // P0-9: attributesFile is a THIRD attributes source that can activate a
-    // live textconv driver on a plain `git log -p`; an empty value removes it.
-    ["core.attributesFile", ""],
-    // P0-1: the transport family is an execution surface too. `ext::` runs an
-    // external command as the remote URL's transport, and protocol.file
-    // re-enables file:// URLs (and the local clone helpers) a repo can name.
-    // command-scope "never" beats any protocol.* block in the repo's config.
-    ["protocol.ext.allow", "never"],
-    ["protocol.file.allow", "never"],
-  ];
+  // P2-1: derived from GIT_HARDENING (the single table) instead of a second
+  // hand-written list. Anything in that table with env:true protects the child.
+  const gitOverrides = GIT_HARDENING.filter((e) => e.env).map((e) => [e.key, e.value]);
   const hostCount = /^\d+$/.test(String(env.GIT_CONFIG_COUNT ?? "")) ? Number(env.GIT_CONFIG_COUNT) : 0;
   gitOverrides.forEach(([key, value], i) => {
     env["GIT_CONFIG_KEY_" + (hostCount + i)] = key;
@@ -813,22 +957,7 @@ export function parseUnrecognizedModels(stderr) {
   return out;
 }
 
-/** realpath() of the nearest EXISTING ancestor, with the missing tail appended. */
-function realpathNearest(p) {
-  let cur = path.resolve(p);
-  const missing = [];
-  for (;;) {
-    try {
-      const real = fs.realpathSync(cur);
-      return missing.length ? path.join(real, ...missing.reverse()) : real;
-    } catch {
-      const parent = path.dirname(cur);
-      if (parent === cur) return path.resolve(p); // nothing on this path exists
-      missing.push(path.basename(cur));
-      cur = parent;
-    }
-  }
-}
+// realpathNearest() is imported from shell-guard.js (audit P2-3: one copy).
 
 /**
  * A path the CLI itself could have written an agent transcript to: under the
@@ -2098,21 +2227,7 @@ export function runClaude({
  * command line beats every config file, including the repo's own, and the env
  * vars cut off the system/global config and the pager and credential helpers.
  */
-export const GIT_HARDENING_ARGS = [
-  "-c", "core.fsmonitor=",
-  "-c", "diff.external=",
-  "-c", "interactive.diffFilter=",
-  "-c", "core.pager=cat",
-  "-c", "core.editor=",
-  "-c", "core.sshCommand=",
-  "-c", "credential.helper=",
-  "-c", "gpg.program=",
-  "-c", "merge.tool=",
-  "-c", "core.hooksPath=",
-  // P0-1: the same transport pair buildClaudeEnv() pins for the reviewer child.
-  "-c", "protocol.ext.allow=never",
-  "-c", "protocol.file.allow=never",
-];
+// GIT_HARDENING_ARGS is defined once, next to the GIT_HARDENING table (P2-1).
 
 /** git spawn options shared by every git call this server makes. */
 let gitEmptyHome;
@@ -2209,32 +2324,39 @@ const INCLUDE_PATH = /^\s*path\s*=\s*(.+?)\s*$/i;
  * compared case-insensitively below), so these are the spellings to match.
  */
 
-/** Keys whose VALUE git executes. */
-const CONFIG_EXEC_KEYS = new Set([
-  "core.sshcommand",
-  "core.fsmonitor",
-  "core.pager",
-  "core.gitproxy",
-  "diff.external",
-  // Round-2 scanner gap: a credential challenge runs core.askPass, and an interactive rebase
-  // runs sequence.editor. The read allowlist does not reach the operations that
-  // trigger them today, but "not reachable today" is not a boundary: both are
-  // repo-controlled programs and the review must not run them by accident.
-  "core.askpass",
-  "sequence.editor",
-]);
 /**
- * P0-1: the TRANSPORT family. These keys are not values git executes directly,
- * but they choose what will execute or where a fetch goes: `ext::` runs an
- * external command, protocol.file re-enables file:// URLs, url.<base>.insteadOf
- * rewrites the URL every fetch sees, and remote.<name>.vcs selects a
- * remote-helper program. buildClaudeEnv() neutralises the two protocol keys for
- * the reviewer's git, but the scanner must still refuse a repo that sets them —
- * and the subsection forms cannot be expressed as a GIT_CONFIG_KEY wildcard.
+ * Keys whose VALUE git executes — derived from GIT_HARDENING (P2-1) so a key
+ * that the child env neutralises and the scanner refuses is spelled once.
+ * Entries with a dedicated handler (core.hooksPath, core.attributesFile), a
+ * scanner-side `pattern`, or scan:false are not part of this Set.
  */
-const CONFIG_TRANSPORT_KEYS = new Set(["protocol.ext.allow", "protocol.file.allow"]);
-const CONFIG_URL_REWRITE_KEY = /^url\..+\.insteadof$/;
-const CONFIG_REMOTE_VCS_KEY = /^remote\..+\.vcs$/;
+const CONFIG_EXEC_KEYS = new Set(
+  GIT_HARDENING.filter((e) => e.key && e.scan && (!e.scanKind || e.scanKind === "exec"))
+    .map((e) => e.key.toLowerCase()),
+);
+/**
+ * P0-1: the TRANSPORT family. These entries are not values git executes
+ * directly, but they choose what will execute or where a fetch goes: `ext::`
+ * runs an external command, protocol.file re-enables file:// URLs,
+ * url.<base>.insteadOf rewrites the URL every fetch sees, and remote.<name>.vcs
+ * selects a remote-helper program. buildClaudeEnv() neutralises the two
+ * protocol keys for the reviewer's git, but the scanner must still refuse a
+ * repo that sets them — and the subsection forms cannot be expressed as a
+ * GIT_CONFIG_KEY wildcard, which is why they are `pattern` entries.
+ */
+const CONFIG_TRANSPORT_RULES = GIT_HARDENING.filter((e) => e.scan && e.scanKind === "transport");
+/** The scanner-side patterns, each looked up by the table's stable `id`. */
+const scanPattern = (id) => {
+  const entry = GIT_HARDENING.find((e) => e.pattern && e.id === id);
+  if (!entry) throw new Error("GIT_HARDENING: missing scan pattern " + id);
+  return entry.pattern;
+};
+/** A dedicated-handler key, looked up by its scanKind instead of re-spelled. */
+const scanKeyOfKind = (kind) => {
+  const entries = GIT_HARDENING.filter((e) => e.key && e.scanKind === kind);
+  if (entries.length !== 1) throw new Error("GIT_HARDENING: expected exactly one key with scanKind " + kind);
+  return entries[0].key.toLowerCase();
+};
 /**
  * `pager.<cmd>` (exactly one subcommand name, no further dots). git resolves
  * the pager for a subcommand from this key BEFORE falling back to core.pager, so
@@ -2242,9 +2364,9 @@ const CONFIG_REMOTE_VCS_KEY = /^remote\..+\.vcs$/;
  * git's enable/disable form (false disables the pager, true uses the default
  * one) — not a program — so booleans stay inert, exactly like core.fsmonitor.
  */
-const CONFIG_PAGER_KEY = /^pager\.[^.]+$/;
+const CONFIG_PAGER_KEY = scanPattern("pager-subcommand");
 /** credential.helper, plain and in the credential.<url>.helper form. */
-const CONFIG_CREDENTIAL_HELPER = /^credential(?:\..+)?\.helper$/;
+const CONFIG_CREDENTIAL_HELPER = scanPattern("credential-helper");
 /**
  * A NAMED driver's command (diff.<name>.textconv, filter.<name>.process, ...).
  * Not refused on sight: git runs a named driver only when an attributes file
@@ -2252,13 +2374,13 @@ const CONFIG_CREDENTIAL_HELPER = /^credential(?:\..+)?\.helper$/;
  * inert (and what keeps an ordinary global-config LFS filter from flagging
  * every repo). diff.external has no name, so it is in CONFIG_EXEC_KEYS.
  */
-const CONFIG_DRIVER_KEY = /^(diff|filter)\.(.+)\.(textconv|external|command|difffilter|clean|smudge|process)$/;
+const CONFIG_DRIVER_KEY = scanPattern("named-driver");
 /** The old line table refused merge drivers; keep that behaviour. */
-const CONFIG_MERGE_DRIVER = /^merge\..+\.driver$/;
+const CONFIG_MERGE_DRIVER = scanPattern("merge-driver");
 /** core.attributesFile: a PATH, not a command — collected and scanned (P0-9). */
-const CONFIG_ATTR_FILE_KEY = "core.attributesfile";
-const CONFIG_HOOKS_PATH_KEY = "core.hookspath";
-const CONFIG_INCLUDE_PATH_KEY = /^include(?:if\..+)?\.path$/;
+const CONFIG_ATTR_FILE_KEY = scanKeyOfKind("attribute");
+const CONFIG_HOOKS_PATH_KEY = scanKeyOfKind("notes");
+const CONFIG_INCLUDE_PATH_KEY = scanPattern("include-path");
 const CONFIG_BOOLEAN = /^(true|false|1|0|yes|no|on|off)$/i;
 
 /**
@@ -2274,15 +2396,36 @@ const CONFIG_BOOLEAN = /^(true|false|1|0|yes|no|on|off)$/i;
  * labeled (it walked the include graph itself), so a finding can never be
  * attributed to the wrong file.
  *
- * Returns null when git is missing, times out, or refuses the file; the caller
- * then falls back to the line scan — degraded, never silent.
+ * Returns { entries } when git read the file. A failed spawn returns
+ * { error, fallback: true } (no usable git — the documented degraded line
+ * scan), while git refusing THIS file returns { error, fallback: false }: a
+ * config git cannot parse (or read) is repository-controlled, makes every git
+ * command in that repository fail, and is a refusal — never a guess.
  */
 function normalizedConfigEntries(file, repoPath) {
   let res;
   try {
     res = spawnSync("git", [...GIT_HARDENING_ARGS, "config", "--file", file, "--no-includes", "--list", "-z"], gitSpawnOpts(repoPath));
-  } catch { return null; }
-  if (!res || res.error || res.status !== 0 || !Buffer.isBuffer(res.stdout)) return null;
+  } catch (e) {
+    // No usable git at all: the line-scan fallback below is the documented
+    // degraded path, and it still refuses every key it recognises.
+    return { error: String(e?.message || e), fallback: true };
+  }
+  if (!res || res.error || !Buffer.isBuffer(res.stdout)) {
+    return { error: String(res?.stderr || res?.error || "git config failed").trim(), fallback: true };
+  }
+  if (res.status !== 0) {
+    const err = String(res.stderr || "").trim() || "git config --list failed";
+    // Do not classify by git's message text (it can be localized): an exit that
+    // names an option this git does not know is the one case where the QUERY
+    // could not run (git < 2.13 has no --no-includes), so the line table stays
+    // the degraded path. Every other non-zero exit means git refused THIS
+    // repository-controlled file (a parse error, an unreadable config): a config
+    // the scan cannot read is not a config the review can trust, so it is a
+    // refusal rather than a reason to guess (P2 fail-closed).
+    const unsupported = /unknown option|unrecognized option|unknown switch|invalid option|usage:/i.test(err);
+    return { error: err, fallback: unsupported };
+  }
   const entries = [];
   for (const rec of res.stdout.toString("utf8").split("\0")) {
     if (!rec) continue;
@@ -2291,7 +2434,7 @@ function normalizedConfigEntries(file, repoPath) {
       ? { key: rec.toLowerCase(), value: null }
       : { key: rec.slice(0, nl).toLowerCase(), value: rec.slice(nl + 1) });
   }
-  return entries;
+  return { entries };
 }
 
 /**
@@ -2376,81 +2519,13 @@ const isCmdLine = (line) => {
   return CONFIG_CMD_PATTERNS.some((p) => p.test(line));
 };
 
-/**
- * Read one file whose CONTENT the repository controls, without letting that
- * content take the server down.
- *
- * A repository delivered as a zip (or a clone of one) can ship `.gitattributes`
- * or `.git/config` as a symlink to /dev/stdin, a FIFO, or /dev/zero: a plain
- * readFileSync then blocks the event loop forever (the MCP's stdin never closes,
- * so /dev/stdin never reaches EOF) or allocates without bound, and NO timeout can
- * fire while a synchronous read is stuck — the whole server freezes (P0-3).
- * Git's own attr code opens `.gitattributes` with O_NOFOLLOW, so only a PLAIN
- * file is repository content we can safely read in-process.
- *
- * `roots` is the tree the file must really live in (a string or a list). Both
- * sides are realpath'd because the roots may themselves contain symlinks (macOS
- * /tmp -> /private/tmp). That containment check is what stops an `[include] path`
- * from turning the scan into a reader of arbitrary files outside the repo.
- *
- * `followSymlink` is for the config family only: git itself follows a symlinked
- * .git pointer file, .git/config, an [include] target and .git/info/attributes —
- * all verified to execute a repo-chosen textconv — so refusing to follow those
- * would hand a zip-delivered repo a hiding place. The link target is still
- * required to be a REGULAR file inside an owning tree (never a FIFO/device), and
- * worktree .gitattributes is never followed because git opens that with
- * O_NOFOLLOW and a symlinked one is inert.
- *
- * Returns { text } when readable, { refusal } when the file exists but must be
- * rejected with a reason the caller surfaces (oversized), or null when it is not
- * repository-controlled content at all (missing / unreadable / FIFO / device /
- * link target that is not a regular file inside `roots`) — callers skip null
- * exactly like a missing file.
- */
-const MAX_REPO_METADATA_BYTES = 1024 * 1024;
-function readRepoFile(file, roots, { followSymlink = false } = {}) {
-  let target = file;
-  let st;
-  try { st = fs.lstatSync(file); } catch { return null; }
-  if (st.isSymbolicLink()) {
-    // A symlink's target is attacker-chosen and can be a FIFO or a device with no
-    // bounded-read guarantee, so it is only followed where git itself follows it
-    // (see the doc above) — and then only to a regular file inside the owning tree.
-    if (!followSymlink) return null;
-    try { target = fs.realpathSync(file); } catch { return null; } // dangling / link loop
-    try { st = fs.lstatSync(target); } catch { return null; }
-  }
-  if (!st.isFile()) return null;
-  let real;
-  try { real = fs.realpathSync(target); } catch { return null; }
-  const rootList = Array.isArray(roots) ? roots : [roots];
-  const inside = rootList.some((root) => {
-    try {
-      const rel = path.relative(fs.realpathSync(root), real);
-      return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
-    } catch { return false; }
-  });
-  if (!inside) return null;
-  // Real git config/attributes files are a few KiB. A bigger one is not metadata
-  // anyone reviews by eye, so it is refused OUT LOUD rather than skipped: a
-  // silently-ignored file would still drive git on the reviewer's first command.
-  if (st.size > MAX_REPO_METADATA_BYTES) {
-    return {
-      refusal: `file is ${st.size} bytes, over the ${MAX_REPO_METADATA_BYTES}-byte limit for repository git metadata (a real config/attributes file is small) — refusing to read it; shrink or remove it, or review a copy of the repository`,
-    };
-  }
-  try { return { text: fs.readFileSync(real, "utf8") }; } catch { return null; }
-}
-
 /** Is `file` (after resolving links) inside one of `roots`? Missing paths are not. */
 function realPathInside(file, roots) {
   let real;
   try { real = fs.realpathSync(file); } catch { return false; }
   return (Array.isArray(roots) ? roots : [roots]).some((root) => {
-    try {
-      const rel = path.relative(fs.realpathSync(root), real);
-      return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-    } catch { return false; }
+    const rel = repoRelative(root, real);
+    return rel !== null && !rel.startsWith("..") && !path.isAbsolute(rel);
   });
 }
 
@@ -2673,11 +2748,23 @@ function repoAttributeFiles(repoPath, attributeSources = []) {
         add(rel);
       }
     } else if (!/not a git repository/i.test(String(res?.stderr || ""))) {
-      notes.push("the repository's .gitattributes files could not be enumerated (" +
+      // Fail closed: the walk below prunes node_modules, so a git enumeration
+      // that fails leaves attribute files there unverified — and an attribute
+      // file the scan never read can still name a live driver that a plain
+      // `git diff` executes. A note would let the review start anyway.
+      refusals.push("the repository's .gitattributes files could not be enumerated (" +
         String(res?.stderr || res?.error || "git ls-files failed").trim().slice(0, 160) +
-        "); attribute files under pruned directories (node_modules/) are not covered");
+        "); attribute files under pruned directories (node_modules/) would be unverified — refusing to review a repository whose git index cannot be read");
     }
-  } catch { /* the walk below still covers the reviewable tree */ }
+  } catch (e) {
+    // Fail closed even when spawnSync itself throws (invalid option object,
+    // E2BIG, ...): the walk below prunes node_modules, so without this
+    // enumeration attribute files there are unverified and a driver they name
+    // would run from an allowlisted git read.
+    refusals.push("the repository's .gitattributes files could not be enumerated (" +
+      String(e?.message || e).trim().slice(0, 160) +
+      "); attribute files under pruned directories (node_modules/) would be unverified — refusing to review a repository whose git index cannot be read");
+  }
   // P0-9: core.attributesFile is git's THIRD attributes source, and the only one
   // a repository can point at a file it fully controls — yet the scan used to
   // read just the two well-known files. Git applies that file on every diff/log,
@@ -2711,11 +2798,10 @@ function repoAttributeFiles(repoPath, attributeSources = []) {
         " does not exist on this machine, so git reads no attributes file from it; proceeding");
       continue;
     }
-    let inside = false;
-    try {
-      const relToRoot = path.relative(fs.realpathSync(repoPath), fs.realpathSync(abs));
-      inside = relToRoot !== "" && !relToRoot.startsWith("..") && !path.isAbsolute(relToRoot);
-    } catch { inside = false; }
+    // Shared containment (audit P2-3): no local realpath/path.relative copy.
+    // rel "" means the attributes file IS the repository root — not a file.
+    const relToRoot = repoRelative(repoPath, abs);
+    const inside = relToRoot !== null && relToRoot !== "" && !relToRoot.startsWith("..") && !path.isAbsolute(relToRoot);
     if (!inside) {
       refusals.push(label + ": core.attributesFile = " + raw.slice(0, 120) +
         " points outside the repository — git applies attributes from that file on every diff/log, so a driver " +
@@ -2891,14 +2977,13 @@ export function repoRunsGitPrograms(repoPath) {
     // the fetch somewhere this scan never verified. The lowered spelling catches
     // a subsection git preserves in its original case ([`protocol "EXT"`]).
     const transportKey = key.toLowerCase();
-    if (CONFIG_TRANSPORT_KEYS.has(transportKey) || CONFIG_URL_REWRITE_KEY.test(transportKey) || CONFIG_REMOTE_VCS_KEY.test(transportKey)) {
+    // The family (fixed protocol keys + url/remote patterns) comes from the
+    // table, so a transport spelling can never be known to one layer only.
+    const transport = CONFIG_TRANSPORT_RULES.find((e) =>
+      e.key ? transportKey === e.key.toLowerCase() : e.pattern.test(transportKey));
+    if (transport) {
       if (!val.trim()) return;
-      const why = CONFIG_URL_REWRITE_KEY.test(transportKey)
-        ? "it rewrites the URL git fetches, so a transport this scan did not verify can be reached"
-        : CONFIG_REMOTE_VCS_KEY.test(transportKey)
-          ? "it selects a remote-helper program git runs for that remote"
-          : "it chooses git's transport policy (the ext:: transport runs an external command)";
-      refusals.push(shownKey(label, key, val) + " — " + why +
+      refusals.push(shownKey(label, key, val) + " — " + transport.refuse +
         "; remove the key from that config file or review a copy of the repository without it");
       return;
     }
@@ -2951,9 +3036,19 @@ export function repoRunsGitPrograms(repoPath) {
     // dotted subsections and same-line section headers cannot hide a key. Scoped
     // to the file repoConfigFiles() already validated (the include graph is
     // walked and labeled there), so every finding keeps its own label.
-    const entries = normalizedConfigEntries(file, repoPath);
-    if (entries) {
-      for (const { key, value } of entries) scanKey(label, key, value);
+    const parsed = normalizedConfigEntries(file, repoPath);
+    if (parsed.entries) {
+      for (const { key, value } of parsed.entries) scanKey(label, key, value);
+      continue;
+    }
+    // git ran and refused this file: it is repository-controlled, it makes
+    // every git command in this repository fail, and it is the one state where
+    // the scan cannot know which keys exist. Refuse instead of line-scanning a
+    // file whose meaning git disagrees about (fail-closed).
+    if (!parsed.fallback) {
+      refusals.push(label + ": the repository's git config cannot be parsed (" +
+        String(parsed.error).trim().slice(0, 160) +
+        "); git commands in this repository fail, and a config the scan cannot read is not a config the review can trust — fix or remove the malformed line");
       continue;
     }
     // Fallback: no usable git, or this file is not parseable. The line scan knows

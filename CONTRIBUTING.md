@@ -6,12 +6,13 @@
 
 ```bash
 npm install
-npm test                # 两个免费单测套件 + stdio 冒烟（需要本机装有 claude CLI）
-npm run test:e2e        # 桩 claude 端到端套件（免费，无需 claude CLI/网络；CI 也会跑）
-node scripts/validation-test.mjs   # 输入校验路径（免费，不发 API 请求）
+npm test                # 全部免费套件统一汇总（约 2 分钟）：shell-guard 235 + 审计修复 272
+                        # + P0 回归 68 + validation 16 + stdio 冒烟 + cross-cases 136；任一失败即非零退出
+node scripts/p0-regression-test.mjs  # 只跑 2026-10 审计的 P0 形态（68 条，真实 hook 进程，约 2s）
+node scripts/validation-test.mjs     # 只跑输入校验路径（16 条，免费，不发 API 请求）
 ```
 
-- `npm test` 里的 smoke 测试会真实 spawn MCP server 并调用 `claude_review_env`，所以需要本机能解析到 claude（没有也能跑前两个套件：`node scripts/shell-guard-test.mjs && node scripts/audit-fixes-test.mjs`）。
+- `npm test` 里的 smoke 测试会真实 spawn MCP server 并调用 `claude_review_env`，所以需要本机能解析到 claude；CI 用 `CLAUDE_CODE_PATH=scripts/stub-claude.mjs` 指向桩，因此 CI 只验证 stdio 握手/工具面/env 形状，真实 CLI 行为由本机 `npm test` 覆盖。其余套件免费且离线。
 - `scripts/e2e-test.mjs` / `followup-e2e.mjs` / `cancel-test.mjs` 会发起**真实付费**的 review，请勿在 CI 或他人机器上随手运行。
 - `validation-test.mjs` 默认全免费；唯一会付费的检查默认跳过，设 `CC_REVIEW_ALLOW_PAID_PROBE=1` 才执行。
 

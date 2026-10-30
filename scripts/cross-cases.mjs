@@ -392,7 +392,11 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
 
 /* ================= C10 degraded-mode resilience ================= */
 {
-  const s1 = startServer({ CLAUDE_REVIEW_SHELL_GUARD: "0" });
+  // The stub is not optional here: without a resolvable CLI the run refuses with
+  // "Claude Code CLI not found" BEFORE the guard check, so the assertion would
+  // pass on a dev machine (which has claude) and fail on a clean CI runner. This
+  // suite is hermetic by contract — pin the CLI for every server it starts.
+  const s1 = startServer({ CLAUDE_REVIEW_SHELL_GUARD: "0", CLAUDE_CODE_PATH: STUB });
   await s1.ready;
   const r1 = await s1.call("claude_code_review", { repoPath: mkRepo("c10"), scope: "auto" });
   check("C10", "guard off -> review refused (fail closed)", r1.result?.isError === true && /unguarded/i.test(textOf(r1)), textOf(r1).slice(0, 120));

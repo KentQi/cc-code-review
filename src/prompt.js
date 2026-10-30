@@ -155,7 +155,9 @@ export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, p
   if (postToPR) {
     lines.push(`- The final report IS the deliverable. After printing it, post the skill's summary comment to the PR with \`gh pr comment <NUMBER> --repo <REPO> --body "<comment>"\` — inline the body (the Bash tool handles quoting; do not write temp files, file writes are not permitted in this mode). That gh call is the ONLY comment you may post, and nothing else may be written to GitHub.`);
   } else {
-    lines.push(`- The final report IS the deliverable. Do NOT post any comment to GitHub and do not modify anything: this run is read-only.`);
+    lines.push(fix
+      ? `- The final report IS the deliverable. Do NOT post any comment to GitHub. FIX MODE is active: after the report, apply the minimal fixes described below — editing the repository files is the one thing this run is allowed to change.`
+      : `- The final report IS the deliverable. Do NOT post any comment to GitHub and do not modify anything: this run is read-only.`);
   }
   lines.push(`- Tool constraints (enforced by the permission allowlist, not optional): read files with Read/Glob/Grep and ${fix ? "edit them with Edit/Write" : "do not edit anything"}. Shell redirection (\`cat > f\`, \`sed -i\`, \`tee\`, heredoc writes) and interpreters (\`node -e\`, \`python -c\`) are NOT permitted and every such call is denied — use the dedicated tools. Only the git/gh read commands listed above may be run through Bash.`);
   if (cwd) {
@@ -358,7 +360,21 @@ export function fixAllowedTools() {
  */
 export function fixDisallowedTools() {
   const fileRules = [
+    // .git in every case spelling: macOS/Windows resolve .GIT/.Git to .git, so a
+    // lowercase-only glob leaves the hook directory writable in practice. The
+    // PreToolUse hook enforces the same rule case-insensitively (it is the layer
+    // that cannot be bypassed by a glob mismatch).
     ".git", ".git/**", "**/.git", "**/.git/**",
+    ".GIT", ".GIT/**", "**/.GIT", "**/.GIT/**",
+    ".Git", ".Git/**", "**/.Git", "**/.Git/**",
+    // Execution configuration: these run code (or decide what runs) after the
+    // run ends — a planted git hook, a project settings hook, direnv, a CI job,
+    // a diff/filter driver. fix mode edits source; it must not plant persistence.
+    ".claude", ".claude/**", "**/.claude", "**/.claude/**",
+    ".envrc", ".envrc.*", "**/.envrc", "**/.envrc.*",
+    ".github/workflows/**", "**/.github/workflows/**",
+    ".vscode/**", "**/.vscode/**", ".idea/**", "**/.idea/**",
+    "**/.mcp.json", "**/.gitmodules", "**/.gitattributes", "**/.gitconfig",
     ".env", ".env.*", "**/.env", "**/.env.*",
     "**/secrets.*", "**/credentials", "**/credentials.*",
     "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx", "**/*.keystore", "**/*.jks",

@@ -493,6 +493,30 @@ function killTree(child) {
   }
 }
 
+/**
+ * Reap the process group of a child that has JUST emitted 'exit'.
+ *
+ * killTree() deliberately refuses to signal an exited pid (the reuse guard), so
+ * it cannot clean up after a child that exits while descendants it spawned (MCP
+ * servers, shell helpers) are still alive. Those descendants inherit the child's
+ * stdout/stderr: they keep the pipes open, so 'close' never fires and the MCP
+ * call waits for a done run — and the old code then labelled that finished run
+ * timedOut and discarded the report (P1-9). 'exit' is delivered in the same loop
+ * iteration the child is reaped in, so its pid cannot have been reused yet; the
+ * group id is still ours to SIGKILL, which closes the inherited pipes too.
+ */
+function reapExitedGroup(child) {
+  if (!child || !child.pid) return;
+  if (IS_WIN) {
+    // Windows has no process groups; best effort only. The 'exit'-based settle
+    // below still returns the real status even if a survivor keeps a pipe open.
+    try { spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { timeout: 5000, windowsHide: true }); } catch { /* best effort */ }
+    return;
+  }
+  // child was spawned detached -> it led its own process group
+  try { process.kill(-child.pid, "SIGKILL"); } catch { /* no survivors / group already gone */ }
+}
+
 // Node's default SIGTERM handling exits WITHOUT firing "exit" — on unix a detached
 // claude would survive the server and keep burning credits. Handle signals explicitly.
 for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
@@ -1322,6 +1346,15 @@ export function runClaude({
     let timedOut = false;
     let cancelled = false;
     let settled = false;
+    // 'exit' (the child itself is done) is watched separately from 'close' (its
+    // stdio pipes are closed). A descendant that inherited the pipes can delay or
+    // prevent 'close' forever, so exit is what proves the run's work is complete;
+    // the values are kept here so the deadline can settle with the REAL status
+    // instead of a fake timeout (P1-9).
+    let exited = false;
+    let exitedCode = null;
+    let exitedSignal = null;
+    let drainTimer = null;
 
     // stream-json puts the `result` event LAST, so a raw buffer truncated at
     // MAX_STREAM_BYTES would lose exactly the line we need. Parse each line as
@@ -1486,6 +1519,15 @@ export function runClaude({
     });
 
     const timer = setTimeout(() => {
+      // The child already exited: the work is done and only a descendant holding
+      // the inherited stdio keeps 'close' from firing. Settle with the real exit
+      // status instead of throwing a complete, paid-for report away as timedOut.
+      // The short drain lets a final `result` line still sitting in the pipe be
+      // ingested before finish() destroys the streams.
+      if (exited) {
+        drainTimer = setTimeout(() => finish(exitedCode, exitedSignal), 200);
+        return;
+      }
       timedOut = true;
       killTree(child);
     }, timeoutMs);
@@ -1508,8 +1550,15 @@ export function runClaude({
       settled = true;
       clearTimeout(timer);
       clearTimeout(failsafe);
+      if (drainTimer) clearTimeout(drainTimer);
       signal?.removeEventListener("abort", onAbort);
       liveChildren.delete(child);
+      // The run is settled, so drop our ends of the pipes: a descendant that
+      // inherited them can otherwise keep 'close' pending forever (and the fds
+      // alive) even after the result was resolved (P1-9). Everything already read
+      // was captured in soChunks/seChunks; destroy() after EOF/close is a no-op.
+      try { child.stdout?.destroy(); } catch { /* already closed */ }
+      try { child.stderr?.destroy(); } catch { /* already closed */ }
       guardSettingsInFlight.delete(guardSettings); // final unmark point (see the mark site)
       removeGuardSettings(guardSettings);
       // Recovery pass: a subagent the parent never heard from (killed by a 429 /
@@ -1618,6 +1667,16 @@ export function runClaude({
     child.on("error", (err) => {
       seChunks.push(Buffer.from(`\n[spawn error] ${err?.message || err}`));
       finish(-1);
+    });
+    // 'exit' fires when the CHILD is done, regardless of who still holds its
+    // stdio pipes; it is the event that proves the run finished (P1-9). Reap the
+    // group here so the descendants that would hold those pipes do not survive
+    // the run — this, not 'close', is what lets the call settle promptly.
+    child.on("exit", (code, signalName) => {
+      exited = true;
+      exitedCode = code;
+      exitedSignal = signalName;
+      reapExitedGroup(child);
     });
     child.on("close", (code, signalName) => finish(code, signalName));
 
@@ -1782,72 +1841,220 @@ const isCmdLine = (line) => {
   return CONFIG_CMD_PATTERNS.some((p) => p.test(line));
 };
 
-/** `.git/config` plus anything it `[include]s` (a repo-relative include can escape the repo). */
+/**
+ * Read one file whose CONTENT the repository controls, without letting that
+ * content take the server down.
+ *
+ * A repository delivered as a zip (or a clone of one) can ship `.gitattributes`
+ * or `.git/config` as a symlink to /dev/stdin, a FIFO, or /dev/zero: a plain
+ * readFileSync then blocks the event loop forever (the MCP's stdin never closes,
+ * so /dev/stdin never reaches EOF) or allocates without bound, and NO timeout can
+ * fire while a synchronous read is stuck — the whole server freezes (P0-3).
+ * Git's own attr code opens `.gitattributes` with O_NOFOLLOW, so only a PLAIN
+ * file is repository content we can safely read in-process.
+ *
+ * `roots` is the tree the file must really live in (a string or a list). Both
+ * sides are realpath'd because the roots may themselves contain symlinks (macOS
+ * /tmp -> /private/tmp). That containment check is what stops an `[include] path`
+ * from turning the scan into a reader of arbitrary files outside the repo.
+ *
+ * `followSymlink` is for the config family only: git itself follows a symlinked
+ * .git pointer file, .git/config, an [include] target and .git/info/attributes —
+ * all verified to execute a repo-chosen textconv — so refusing to follow those
+ * would hand a zip-delivered repo a hiding place. The link target is still
+ * required to be a REGULAR file inside an owning tree (never a FIFO/device), and
+ * worktree .gitattributes is never followed because git opens that with
+ * O_NOFOLLOW and a symlinked one is inert.
+ *
+ * Returns { text } when readable, { refusal } when the file exists but must be
+ * rejected with a reason the caller surfaces (oversized), or null when it is not
+ * repository-controlled content at all (missing / unreadable / FIFO / device /
+ * link target that is not a regular file inside `roots`) — callers skip null
+ * exactly like a missing file.
+ */
+const MAX_REPO_METADATA_BYTES = 1024 * 1024;
+function readRepoFile(file, roots, { followSymlink = false } = {}) {
+  let target = file;
+  let st;
+  try { st = fs.lstatSync(file); } catch { return null; }
+  if (st.isSymbolicLink()) {
+    // A symlink's target is attacker-chosen and can be a FIFO or a device with no
+    // bounded-read guarantee, so it is only followed where git itself follows it
+    // (see the doc above) — and then only to a regular file inside the owning tree.
+    if (!followSymlink) return null;
+    try { target = fs.realpathSync(file); } catch { return null; } // dangling / link loop
+    try { st = fs.lstatSync(target); } catch { return null; }
+  }
+  if (!st.isFile()) return null;
+  let real;
+  try { real = fs.realpathSync(target); } catch { return null; }
+  const rootList = Array.isArray(roots) ? roots : [roots];
+  const inside = rootList.some((root) => {
+    try {
+      const rel = path.relative(fs.realpathSync(root), real);
+      return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+    } catch { return false; }
+  });
+  if (!inside) return null;
+  // Real git config/attributes files are a few KiB. A bigger one is not metadata
+  // anyone reviews by eye, so it is refused OUT LOUD rather than skipped: a
+  // silently-ignored file would still drive git on the reviewer's first command.
+  if (st.size > MAX_REPO_METADATA_BYTES) {
+    return {
+      refusal: `file is ${st.size} bytes, over the ${MAX_REPO_METADATA_BYTES}-byte limit for repository git metadata (a real config/attributes file is small) — refusing to read it; shrink or remove it, or review a copy of the repository`,
+    };
+  }
+  try { return { text: fs.readFileSync(real, "utf8") }; } catch { return null; }
+}
+
+/**
+ * `.git/config` plus anything it `[include]s` — an include is repo content too:
+ * a repo-relative path can walk to any file in the worktree, and git reads it.
+ * Every read goes through readRepoFile, so a symlink/FIFO include cannot freeze
+ * the scan and an include cannot reach outside the tree that owns it. Returns
+ * { files: [{file,label,text}], refusals: [...] } — a refusal means metadata too
+ * large to read safely, and the caller refuses the review.
+ */
 function repoConfigFiles(repoPath) {
-  const out = [];
+  const files = [];
+  const refusals = [];
   const seen = new Set();
   const gitDir = path.join(repoPath, ".git");
-  const walk = (file, label, depth) => {
+  // `roots` = the tree a config file must really live in. For a normal repo that
+  // is the worktree; for a worktree's `.git` pointer it is the gitdir the pointer
+  // names (a worktree gitdir lives outside the worktree by design).
+  const walk = (file, label, depth, roots) => {
     // Include chains deeper than this are exotic; the cap bounds the read count
     // (seen dedupes) while still following nested includes several levels in,
     // so a live driver cannot hide behind extra indirection.
     if (depth > 5 || seen.has(file)) return;
     seen.add(file);
-    let text;
-    try { text = fs.readFileSync(file, "utf8"); } catch { return; }
-    out.push({ file, label, text });
-    const base = fs.statSync(file).isDirectory() ? file : path.dirname(file);
-    for (const m of text.matchAll(/^\s*path\s*=\s*(.+?)\s*$/gim)) {
+    // followSymlink: git follows a symlinked .git/config or [include] target, and
+    // executes whatever driver the target defines — verified — so the scan must
+    // follow the same links (still only to a regular file inside the tree).
+    const read = readRepoFile(file, roots, { followSymlink: true });
+    if (!read) return; // missing, or not repository-controlled content
+    if (read.refusal) { refusals.push(`${label}: ${read.refusal}`); return; }
+    files.push({ file, label, text: read.text });
+    const base = path.dirname(file); // readRepoFile only ever returns a regular file
+    // The optional bracket part matches a header sharing its line with the key —
+    // `[include] path = ../inc` is the same include as `[include]` + `path = ../inc`,
+    // and git follows it, so the walk must too (P0-5).
+    for (const m of read.text.matchAll(/^\s*(?:\[[^\]]*\]\s*)?path\s*=\s*(.+?)\s*$/gim)) {
       const raw = m[1].trim().replace(/^["']|["']$/g, "");
       if (!raw || raw.startsWith("~/")) continue; // ~ is the user's own config, not repo-controlled
-      walk(path.isAbsolute(raw) ? raw : path.resolve(base, raw), `${label} -> include`, depth + 1);
+      walk(path.isAbsolute(raw) ? raw : path.resolve(base, raw), `${label} -> include`, depth + 1, roots);
     }
   };
-  try {
-    const st = fs.statSync(gitDir);
-    if (st.isDirectory()) {
-      walk(path.join(gitDir, "config"), ".git/config", 0);
-    } else {
-      // A worktree (or submodule): .git is a FILE "gitdir: <path>". The real
-      // config lives in the gitdir — scanning the pointer file scans nothing.
-      const text = fs.readFileSync(gitDir, "utf8");
-      const m = /^gitdir:\s*(.+)$/m.exec(text);
-      if (m) {
-        // Submodules carry a RELATIVE gitdir (`gitdir: ../.git/modules/sub`)
-        // resolved against the superproject (= repoPath here) — resolve against
-        // it, never against this server's cwd.
-        const real = path.resolve(repoPath, m[1].trim());
-        walk(path.join(real, "config"), `${path.basename(repoPath)}/.git -> gitdir/config`, 0);
-        const wtCfg = path.join(real, "config.worktree");
-        if (fs.existsSync(wtCfg)) walk(wtCfg, `${path.basename(repoPath)}/.git -> config.worktree`, 0);
-        // By default `git config` inside a worktree writes the COMMON config;
-        // the gitdir's `commondir` file names it (relative to the gitdir).
-        try {
-          const cd = fs.readFileSync(path.join(real, "commondir"), "utf8").trim();
-          if (cd) walk(path.join(real, cd, "config"), `${path.basename(repoPath)}/.git -> commondir/config`, 0);
-        } catch { /* no commondir file: not a worktree gitdir */ }
+  let st = null;
+  try { st = fs.lstatSync(gitDir); } catch { /* no .git: nothing repo-controlled to scan */ }
+  // A symlinked .git is followed like git follows it (user setup, not cloned
+  // content). A link to a FIFO/device is not a directory, so it falls through to
+  // the read-guarded pointer-file branch below instead of being stat'd forever.
+  if (st && st.isSymbolicLink()) {
+    try { st = fs.statSync(gitDir); } catch { st = null; }
+  }
+  if (st && st.isDirectory()) {
+    walk(path.join(gitDir, "config"), ".git/config", 0, [repoPath, gitDir]);
+  } else if (st) {
+    // A worktree (or submodule): .git is a FILE "gitdir: <path>". The real
+    // config lives in the gitdir — scanning the pointer file scans nothing.
+    // git follows a symlinked .git pointer file too (verified): read the resolved
+    // regular file, so `.git -> ptr` cannot hide the gitdir config from the scan.
+    const pointer = readRepoFile(gitDir, repoPath, { followSymlink: true });
+    if (pointer?.refusal) refusals.push(`.git: ${pointer.refusal}`);
+    const m = pointer?.text ? /^gitdir:\s*(.+)$/m.exec(pointer.text) : null;
+    if (m) {
+      // Submodules carry a RELATIVE gitdir (`gitdir: ../.git/modules/sub`)
+      // resolved against the superproject (= repoPath here) — resolve against
+      // it, never against this server's cwd.
+      const real = path.resolve(repoPath, m[1].trim());
+      const roots = [repoPath, real];
+      walk(path.join(real, "config"), `${path.basename(repoPath)}/.git -> gitdir/config`, 0, roots);
+      const wtCfg = path.join(real, "config.worktree");
+      if (fs.existsSync(wtCfg)) walk(wtCfg, `${path.basename(repoPath)}/.git -> config.worktree`, 0, roots);
+      // By default `git config` inside a worktree writes the COMMON config; the
+      // gitdir's `commondir` file names it (relative to the gitdir).
+      const cdRead = readRepoFile(path.join(real, "commondir"), real);
+      const cd = cdRead?.text ? cdRead.text.trim() : "";
+      if (cd) {
+        // The common dir is the main repo's .git — outside the worktree and
+        // outside the worktree gitdir, but named by repo-controlled metadata.
+        const commonDir = path.resolve(real, cd);
+        walk(path.join(commonDir, "config"), `${path.basename(repoPath)}/.git -> commondir/config`, 0, [...roots, commonDir]);
       }
     }
-  } catch { /* no .git: nothing repo-controlled to scan */ }
-  return out;
+  }
+  return { files, refusals };
 }
 
-/** Attribute files that can name a driver: root, .git/info, and one directory deep. */
+/**
+ * Attribute files that can name a driver.
+ *
+ * Git applies `.gitattributes` per directory, so a driver reference in
+ * `src/deep/.gitattributes` activates a repo-defined textconv for the reviewer's
+ * `git diff` exactly like the root file does — the old "root + one directory
+ * deep" scan never looked, so depth>=2 references were invisible (P0-4). The walk
+ * is bounded (depth and file count) so an adversarial tree cannot turn this
+ * pre-spawn scan into a denial of service of its own. Same
+ * { files, refusals } shape as repoConfigFiles.
+ */
+const MAX_ATTR_DEPTH = 16;
+const MAX_ATTR_FILES = 4000;
 function repoAttributeFiles(repoPath) {
-  const rels = [".gitattributes", path.join(".git", "info", "attributes")];
-  try {
-    for (const e of fs.readdirSync(repoPath, { withFileTypes: true })) {
-      if (e.isDirectory() && e.name !== ".git" && e.name !== "node_modules") rels.push(path.join(e.name, ".gitattributes"));
+  const files = [];
+  const refusals = [];
+  const seenRels = new Set();
+  let seen = 0;
+  // A truncated walk is a hole, not a performance detail: an attribute file the
+  // scan never read can still name a live driver, and git would execute it from
+  // an allowlisted `git diff`. So hitting either bound refuses the review instead
+  // of quietly scanning "most" of the tree.
+  let truncated = false;
+  // `followSymlink` is true only for .git/info/attributes: git re-reads that
+  // through a link (verified to execute a textconv), while worktree .gitattributes
+  // is opened with O_NOFOLLOW, so a symlinked one there is inert and is skipped.
+  const add = (rel, followSymlink = false) => {
+    if (seenRels.has(rel)) return; // the root file is added explicitly AND seen by the walk
+    seenRels.add(rel);
+    const read = readRepoFile(path.join(repoPath, rel), repoPath, { followSymlink });
+    if (!read) return;
+    if (read.refusal) { refusals.push(`${rel}: ${read.refusal}`); return; }
+    files.push({ file: path.join(repoPath, rel), label: rel, text: read.text });
+  };
+  // The worktree root plus git's own per-repo file (not cloned, but a zip can ship it).
+  add(".gitattributes");
+  add(path.join(".git", "info", "attributes"), true);
+  const walk = (dirRel, depth) => {
+    if (depth > MAX_ATTR_DEPTH || seen >= MAX_ATTR_FILES) { truncated = true; return; }
+    let entries;
+    try { entries = fs.readdirSync(path.join(repoPath, dirRel), { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      // .git (also a FILE in a worktree) and node_modules are never reviewed
+      // content; descending them would only slow the pre-spawn scan down.
+      if (e.name === ".git" || e.name === "node_modules") continue;
+      const rel = dirRel ? path.join(dirRel, e.name) : e.name;
+      // A symlinked directory is not descended: readdir reports the link itself,
+      // so a link can never lead the walk outside the repository tree.
+      if (e.isDirectory()) { walk(rel, depth + 1); continue; }
+      if (e.name !== ".gitattributes") continue;
+      // Hard cap, checked BEFORE the read: an adversarial tree cannot make this
+      // pre-spawn scan read an unbounded number of files.
+      if (seen >= MAX_ATTR_FILES) return;
+      seen++;
+      add(rel);
     }
-  } catch { /* unreadable dir: the top-level scans still ran */ }
-  const out = [];
-  for (const rel of rels) {
-    const file = path.join(repoPath, rel);
-    let text;
-    try { text = fs.readFileSync(file, "utf8"); } catch { continue; }
-    out.push({ file, label: rel, text });
+  };
+  walk("", 0);
+  if (truncated) {
+    refusals.push(
+      "the repository tree is deeper than " + MAX_ATTR_DEPTH + " directories or has more than " + MAX_ATTR_FILES +
+      " .gitattributes files, so every attribute file could not be verified — a driver reference hidden past " +
+      "the scan bound would run a repo-chosen command from an allowlisted git read. Review a copy with a " +
+      "shallower tree, or remove the excess attribute files.",
+    );
   }
-  return out;
+  return { files, refusals };
 }
 
 /**
@@ -1870,18 +2077,34 @@ function repoAttributeFiles(repoPath) {
  * and surfaces notes in the report.
  */
 export function repoRunsGitPrograms(repoPath) {
-  const refusals = [];
   const notes = [];
   const configs = repoConfigFiles(repoPath);
+  // Oversized repo metadata is a refusal, not a note: we could not read it, so
+  // we cannot vouch that it does not run a program (see readRepoFile).
+  const refusals = [...configs.refusals];
 
   // Split a config file's text into sections keyed by header, so a driver's
   // command lines can be attributed to that driver for the attributes cross-check.
+  // A git-config header may SHARE its line with the first key — `[diff "evil"]
+  // textconv = cmd` is valid git config and `git diff` executes it — so the
+  // text after the closing bracket belongs to the NEW section and is re-emitted as
+  // one of its lines. The old header regex demanded a line of its own, so that
+  // line was attributed to the PREVIOUS section (and, when that was a dead
+  // driver, `continue`d as harmless): the driver was never registered and its
+  // command never scanned (P0-5).
   const sectionsOf = (text) => {
     const out = [];
     let cur = { header: null, lines: [] };
     for (const line of text.split(/\r?\n/)) {
-      const h = /^\s*\[\s*([^\]]+?)\s*\]\s*$/.exec(line);
-      if (h) { out.push(cur); cur = { header: h[1], lines: [] }; } else cur.lines.push(line);
+      const h = /^\s*\[\s*([^\]]+?)\s*\]\s*(.*)$/.exec(line);
+      if (h) {
+        out.push(cur);
+        cur = { header: h[1], lines: [] };
+        // `[core] # note` is a valid header-only line; only real content joins.
+        if (h[2] && !/^\s*[#;]/.test(h[2])) cur.lines.push(h[2]);
+      } else {
+        cur.lines.push(line);
+      }
     }
     out.push(cur);
     return out;
@@ -1901,9 +2124,14 @@ export function repoRunsGitPrograms(repoPath) {
 
   // driver name -> does its section (across ALL config files) carry a LIVE command?
   const driverLive = new Map();
-  for (const { label, text } of configs) {
+  for (const { label, text } of configs.files) {
     for (const sec of sectionsOf(text)) {
-      const dm = /^\s*(?:diff|filter)\s+"([^"]+)"\s*$/i.exec(sec.header || "");
+      // Three legal spellings name a driver: [diff "evil"], [diff.evil] (dotted,
+      // equivalent per git-config), and the filter twin. Only the quoted form used
+      // to be recognised, so a dotted header registered nothing and the attributes
+      // cross-check silently passed.
+      const dm = /^\s*(?:diff|filter)\s*(?:"([^"]+)"|\.([\w.-]+))\s*$/i.exec(sec.header || "");
+      const dmName = dm ? (dm[1] || dm[2]) : null;
       for (const line of sec.lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
@@ -1929,21 +2157,29 @@ export function repoRunsGitPrograms(repoPath) {
         }
         if (!isCmdLine(line)) continue;
         const val = rhs(line) ?? "";
-        if (dm) {
+        if (dmName) {
           const dead = deadPathOnThisMachine(val, repoPath);
-          if (!dead) driverLive.set(dm[1].toLowerCase(), true);
-          else if (!driverLive.has(dm[1].toLowerCase())) driverLive.set(dm[1].toLowerCase(), false);
+          if (!dead) driverLive.set(dmName.toLowerCase(), true);
+          else if (!driverLive.has(dmName.toLowerCase())) driverLive.set(dmName.toLowerCase(), false);
           continue;
         }
         classify(label, line, val);
       }
     }
-    for (const m of text.matchAll(/^\s*\[\s*(?:diff|filter)\s+"([^"]+)"\s*\]\s*$/gim)) {
-      if (!driverLive.has(m[1].toLowerCase())) driverLive.set(m[1].toLowerCase(), false);
+    // No trailing `$`: the header may share its line with the first key, and a
+    // driver whose section was only ever seen that way must still be registered,
+    // or a .gitattributes reference to it would be silently ignored (P0-5).
+    for (const m of text.matchAll(/^\s*\[\s*(?:diff|filter)\s*(?:"([^"]+)"|\.([\w.-]+))\s*\]/gim)) {
+      const name = (m[1] || m[2]).toLowerCase();
+      if (!driverLive.has(name)) driverLive.set(name, false);
     }
   }
 
-  for (const { label: aLabel, text: aText } of repoAttributeFiles(repoPath)) {
+  const attrs = repoAttributeFiles(repoPath);
+  // An attribute file too large to read is a refusal: not reading it means not
+  // knowing which driver it activates (see readRepoFile).
+  refusals.push(...attrs.refusals);
+  for (const { label: aLabel, text: aText } of attrs.files) {
     // EVERY driver reference on EVERY line matters (H2): stopping at the first
     // match let a live driver hide behind a dead one listed earlier.
     for (const line of aText.split(/\r?\n/)) {

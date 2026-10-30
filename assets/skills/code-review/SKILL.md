@@ -67,14 +67,15 @@ branch, (3) the last commit.
    > there, so never prefix a command with `cd`, `git -C`, or an absolute path.
    > Allowed Bash programs: git status/diff/show/log/blame/rev-parse/ls-files,
    > git branch -a|--show-current|-vv, git remote -v|get-url|show, git stash
-   > list|show, find, rg, and gh pr view|diff|list|checks / gh repo view.
+   > list|show, find, rg, ls, grep, and gh pr view|diff|list|checks / gh repo view.
    > Commands may be combined with `&&`, `;` or `|` as long as EVERY part is one
    > of those read-only commands (after a pipe: head, tail, cat, wc, uniq, cut,
-   > tr, grep, sort, sed -n; `echo` is allowed anywhere). No redirection (`>`,
-   > `>>`, `<`), no `$(...)` or backticks, no `&`. Reads must stay inside the
-   > repository: `rg`/`find` with an outside path (`~`, `..`, an absolute path
-   > elsewhere) is refused, so search from `.`. For file contents prefer the
-   > Read/Grep/Glob tools.
+   > tr, grep, sort; `echo` is allowed anywhere). No redirection (`>`,
+   > `>>`, `<`), no `$(...)` or backticks, no `&`, and no ANSI-C quoting
+   > (`$'...'`). Reads must stay inside the repository: `rg`/`find` with an
+   > outside path (`~`, `..`, an absolute path elsewhere) is refused, so search
+   > from `.`. For file contents and line ranges prefer the Read/Grep/Glob tools
+   > (sed is not a permitted sink).
 
    Every subagent returns ONLY a JSON list of candidate issues — the same shape
    claude's own playbook uses:

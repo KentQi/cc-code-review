@@ -211,10 +211,12 @@ for (const c of ["ls /etc", "ls -la ../other"]) {
   // arguments: bash runs  git status <paths>  — still read-only, allowed.
   check("continuation into git status pathspecs is allowed",
     analyseCommand(cont("git status | sed -n|-i s/a/b/ README.md"), OPTS).ok, true);
-  // A doubled backslash is a literal backslash: the token becomes a
-  // drive-root-relative path (dir), which is outside the repo — denied.
+  // A doubled backslash is a literal backslash. On Windows the token becomes a
+  // drive-root-relative path (dir), which is outside the repo — denied. On
+  // POSIX there is no drive root: \dir is a legal filename *inside* the repo,
+  // so denying it would be a false positive on a read the model may run.
   check("double backslash is a literal root-relative path (outside)",
-    analyseCommand("rg -n x " + BS + BS + "dir", OPTS).ok, false);
+    analyseCommand("rg -n x " + BS + BS + "dir", OPTS).ok, process.platform !== "win32");
 }
 
 /* ---- brace expansion hides outside paths inside one token (audit H3) ---- */
@@ -403,21 +405,24 @@ const REAL_BASH = [
 check("replay: all 17 real review calls are allowed now", detectShellChaining(REAL_BASH).clean, 17);
 check("replay: nothing from a real review is reported as an escape", shellChainingNote(REAL_BASH), null);
 
-// The exact four calls the guard blocked in a real run (turns burned). They are
-// the reason this module exists in its current form; all four must now pass.
-const REAL_CD = [
-  `cd "C:/Users/admin/AppData/Local/Temp/cc-paid-smoke-pI0twf" && git show HEAD`,
-  `cd "C:/Users/admin/AppData/Local/Temp/cc-paid-smoke-pI0twf" && ls -R`,
-];
-for (const c of REAL_CD.slice(0, 1)) {
-  const fake = path.join(os.tmpdir(), "cc-paid-smoke-pI0twf");
-  fs.mkdirSync(fake, { recursive: true });
-  check("replay: the cd+git chain from a real run is allowed",
-    analyseCommand(c, { repoRoot: fake }).ok, true);
-  fs.rmSync(fake, { recursive: true, force: true });
-}
-check("replay: ls -R inside a chain is still refused (use Glob/Read)",
-  analyseCommand(`cd "C:/x" && ls -R`, { repoRoot: "C:/x" }).ok, false);
+// The call the guard blocked in a real run (turns burned) was
+//   cd "<repo>" && git show HEAD
+// and it is the reason this module exists in its current form, so it must keep
+// passing. Build the path from this host's tmpdir: replaying the recorded
+// Windows path verbatim on POSIX compares the command against a different root,
+// which tests the platform, not the behaviour under test.
+const fake = path.join(os.tmpdir(), "cc-paid-smoke-pI0twf");
+fs.mkdirSync(fake, { recursive: true });
+check("replay: the cd+git chain from a real run is allowed",
+  analyseCommand(`cd "${fake}" && git show HEAD`, { repoRoot: fake }).ok, true);
+fs.rmSync(fake, { recursive: true, force: true });
+// The old form of this check (`cd "C:/x" && ls -R` with repoRoot "C:/x") denied
+// for the wrong reason: the cd could not resolve, so it said nothing about
+// `ls -R` itself. Both halves are now asserted for what they actually are.
+check("replay: cd to a root that does not resolve is refused",
+  analyseCommand(`cd "C:/x" && git show HEAD`, { repoRoot: "C:/x" }).ok, false);
+check("replay: ls -R is a permitted read (the listing is read-only)",
+  analyseCommand(`ls -R`, { repoRoot: process.cwd() }).ok, true);
 
 // A command that ran and should have been blocked is still reported as an escape.
 check("replay: an escaped unlisted command is reported",

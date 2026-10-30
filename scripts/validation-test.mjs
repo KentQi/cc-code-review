@@ -106,10 +106,15 @@ check("non-repo directory refused", r.result?.isError === true && /not a version
 
 // 6. maxBudgetUsd=0 must be accepted by the schema (0 = disable cap). Verified
 //    for free: a nonexistent absolute path fails the existence check, so any
-//    zod complaint about the budget would be the only possible error.
-r = await call("claude_code_review", { repoPath: "C:/no/such/repo/xyz", maxBudgetUsd: 0 });
+//    zod complaint about the budget would be the only possible error. The path
+//    is built from this host's tmpdir — "C:/..." is absolute only on Windows,
+//    so the old form tripped the "must be absolute" preflight on POSIX and
+//    never reached the existence check this case is about. The pid keeps the
+//    path collision-free while still guaranteeing it does not exist.
+const missingRepo = path.join(os.tmpdir(), "no-such-repo-" + process.pid);
+r = await call("claude_code_review", { repoPath: missingRepo, maxBudgetUsd: 0 });
 check("maxBudgetUsd=0 accepted (not a zod error)", r.result?.isError === true && /does not exist/i.test(textOf(r)), textOf(r).slice(0, 200));
-r = await call("claude_review_followup", { sessionId: "00000000-0000-0000-0000-000000000000", message: "hi", repoPath: "C:/no/such/repo/xyz", maxBudgetUsd: 0 });
+r = await call("claude_review_followup", { sessionId: "00000000-0000-0000-0000-000000000000", message: "hi", repoPath: missingRepo, maxBudgetUsd: 0 });
 check("followup maxBudgetUsd=0 accepted", r.result?.isError === true && /does not exist/i.test(textOf(r)), textOf(r).slice(0, 200));
 
 // 7. env tool exposes a machine-readable verdict
@@ -162,7 +167,10 @@ const withServer = async (env, fn) => {
   }
 };
 
-const bogusRepo = "C:/no/such/repo/for/guard-test";
+// Same host-relative rule as check 6: an absolute path that is guaranteed not
+// to exist, so the guard-gate assertions below are not decided by a platform
+// path-parse accident.
+const bogusRepo = path.join(os.tmpdir(), "no-such-repo-for-guard-test-" + process.pid);
 await withServer({ CLAUDE_REVIEW_SHELL_GUARD: "0" }, async (call2) => {
   const rr = await call2("claude_code_review", { repoPath: bogusRepo, scope: "last-commit" });
   const t2 = rr.result?.content?.[0]?.text ?? "";

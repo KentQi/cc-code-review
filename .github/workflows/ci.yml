@@ -25,6 +25,9 @@ jobs:
       # so they stay as local commands (see CONTRIBUTING.md).
       - run: node scripts/shell-guard-test.mjs
       - run: node scripts/audit-fixes-test.mjs
+      # The P0 regression suite from the 2026-10 audit: real hook process, no
+      # claude CLI, no network — same hermetic contract as the two above.
+      - run: node scripts/p0-regression-test.mjs
       # The stub-driven end-to-end suite: async job lifecycle, reviewer-report
       # and model-provenance extraction, the error path, ultracode/Workflow.
       # Hermetic too (stub claude via CLAUDE_CODE_PATH; the paid C9 stays opt-in).

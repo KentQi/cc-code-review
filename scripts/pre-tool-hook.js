@@ -52,13 +52,12 @@ try {
 }
 const PROTECTED_WRITE = guardPolicy?.PROTECTED_WRITE;
 const isSecretPath = guardPolicy?.isSecretPath;
-// P2-3: the containment primitives are shared with the server/guard module —
-// this hook used to carry a fifth copy, and the copies had already diverged
-// (guard treated the repo root as inside, hook as outside). repoRelative()
-// still supplies the relative spelling the secret checks print; isInsideRepo()
-// is the actual boundary decision.
+// P2-3: the containment primitive is shared with the server/guard module — this
+// hook used to carry a fifth copy, and the copies had already diverged (guard
+// treated the repo root as inside, hook as outside). repoRelative() supplies
+// both the relative spelling the secret checks print and the boundary decision
+// (one realpath pass; the old code recomputed the same rel via isInsideRepo).
 const repoRelative = guardPolicy?.repoRelative;
-const isInsideRepo = guardPolicy?.isInsideRepo;
 
 /**
  * Info mode (CC_REVIEW_GUARD_INFO=1): print the policy fingerprint and exit.
@@ -212,27 +211,41 @@ process.stdin.on("end", async () => {
   // cannot load it has no policy at all: fail closed for every payload shape,
   // including one we would otherwise treat as "not ours" and pass through.
   if (guardPolicyError || !PROTECTED_WRITE || typeof isSecretPath !== "function" ||
-    typeof guardPolicy?.dotGlobProblem !== "function" || typeof repoRelative !== "function" ||
-    typeof isInsideRepo !== "function") {
+    typeof guardPolicy?.dotGlobProblem !== "function" || typeof repoRelative !== "function") {
     emitDeny(
       "the shell policy failed to load (" + (guardPolicyError?.message || "missing exports") + "); refusing the tool call (fail closed)",
       1,
     );
   }
 
-  // Containment comes from shell-guard's isInsideRepo()/repoRelative() (audit
-  // P2-3): one realpath implementation for the hook, the guard and the metadata
-  // reader. Tool payload paths are literal argv values, not shell words, so the
-  // shell-token heuristics (~, $, braces) are disabled.
+  // Containment comes from shell-guard's repoRelative() (audit P2-3): one
+  // realpath implementation for the hook, the guard and the metadata reader.
+  // A tool payload path is a literal argv value, not a shell word, so the
+  // shell-token heuristics (~, $, braces) do not apply to it.
+  // `allowRoot` is the one policy difference between callers: Write/Read refuse
+  // the repository root itself, Grep/Glob accept it as a search root.
+  const insideFromRel = (rel, allowRoot) =>
+    rel !== null && (rel === "" ? allowRoot : !rel.startsWith("..") && !path.isAbsolute(rel));
 
+  // N-1: a payload we cannot parse is a payload we cannot judge. The old
+  // `catch { process.exit(0) }` was fail-OPEN, contradicting this file's own
+  // contract ("a broken guard must fail closed") and the explicit fail-closed
+  // check above. A malformed envelope, an empty stdin, a non-object or a
+  // missing tool_name now denies; a parsed payload naming a tool this hook
+  // does not police (TodoWrite, Task, ...) still passes — those are governed
+  // by the server's --allowedTools, and denying them would break every run.
   let payload;
   try {
-    payload = JSON.parse(raw || "{}");
-  } catch {
-    process.exit(0); // not our payload shape; let the normal permission path decide
+    payload = JSON.parse(raw);
+  } catch (err) {
+    deny("the guard could not parse the tool payload (" + String(err?.message || err).slice(0, 120) + "); refusing the tool call (fail closed)");
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
+    typeof payload.tool_name !== "string" || !payload.tool_name) {
+    deny("the guard received a tool payload without a tool_name; refusing the tool call (fail closed)");
   }
 
-  const tool = payload?.tool_name;
+  const tool = payload.tool_name;
 
   // ---- write tools: scope to the reviewed repository ----
   if (WRITE_TOOLS.has(tool)) {
@@ -244,18 +257,13 @@ process.stdin.on("end", async () => {
     const target = String(
       payload?.tool_input?.file_path ?? payload?.tool_input?.notebook_path ?? payload?.tool_input?.path ?? "",
     );
-    let rel;
-    try {
-      rel = repoRelative(root, target);
-    } catch {
-      deny(`${tool} blocked: cannot resolve the target path against the repository root`);
-    }
+    const rel = repoRelative(root, target);
     if (rel === null) {
       deny(`${tool} blocked: cannot resolve the target path against the repository root`);
     }
-    // The boundary decision is the shared primitive (P2-3), with the policy
-    // difference spelled out: a write target can never BE the repository root.
-    if (!rel || !isInsideRepo(root, target, { allowRoot: false, shellSyntax: false })) {
+    // One realpath pass: the boundary decision is the rel it already returned.
+    // A write target can never BE the repository root.
+    if (!insideFromRel(rel, false)) {
       deny(`${tool} blocked: fix mode may only write inside the reviewed repository (${root}), not ${target}`);
     }
     // Compare on a forward-slash form and case-insensitively: macOS and Windows
@@ -328,18 +336,13 @@ process.stdin.on("end", async () => {
     // unreadable), and the old `catch { rel = null }` let that through as ALLOW.
     // Read is granted as a bare rule with no path constraint, so this hook is the
     // only boundary — it must deny instead of passing the call (audit P0-3).
-    let rel;
-    try {
-      rel = repoRelative(root, target);
-    } catch {
-      deny("Read blocked: cannot resolve the target path against the repository root (fail closed)");
-    }
+    const rel = repoRelative(root, target);
     if (rel === null) {
       deny("Read blocked: cannot resolve the target path against the repository root (fail closed)");
     }
-    // Shared containment (P2-3), keep hook policy: Read has no use for "the
-    // directory as a file", so the repository root itself is outside.
-    if (!rel || !isInsideRepo(root, target, { allowRoot: false, shellSyntax: false })) {
+    // One realpath pass (audit P2): Read has no use for "the directory as a
+    // file", so the repository root itself is outside.
+    if (!insideFromRel(rel, false)) {
       deny(`Read blocked: the review may only read inside the reviewed repository (${root}), not ${target}`);
     }
     // A secret inside the repo is still a secret: refuse it before the path is
@@ -362,19 +365,13 @@ process.stdin.on("end", async () => {
     // repository root. That is inside the boundary, so only check it when the
     // caller names one.
     if (!target) process.exit(0);
-    let rel;
-    try {
-      rel = repoRelative(root, target);
-    } catch {
-      deny(`${tool} blocked: cannot resolve the target path against the repository root (fail closed)`);
-    }
+    const rel = repoRelative(root, target);
     if (rel === null) {
       deny(`${tool} blocked: cannot resolve the target path against the repository root (fail closed)`);
     }
     // The root itself is a legitimate search root for both tools (rel is ""),
-    // unlike Read, which has no use for "the directory as a file" — the one
-    // policy difference allowRoot exists to express (audit P2-3).
-    if (!isInsideRepo(root, target, { allowRoot: true, shellSyntax: false })) {
+    // unlike Read — the one policy difference allowRoot expresses.
+    if (!insideFromRel(rel, true)) {
       deny(`${tool} blocked: the review may only search inside the reviewed repository (${root}), not ${target}`);
     }
     if (rel) {

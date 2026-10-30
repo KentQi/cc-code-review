@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyseCommand, bashAllowRules, isInsideRepo, policyFingerprint } from "../src/shell-guard.js";
-import { postPROnlyTools } from "../src/prompt.js";
+import { postPROnlyTools, FIX_PROTECTED_WRITE_GLOBS } from "../src/prompt.js";
 import { buildClaudeEnv, repoRunsGitPrograms, writeGuardSettings } from "../src/claude.js";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -185,9 +185,12 @@ for (const rel of [
 ]) {
   check("Write DENY: " + rel, write(rel), "DENY");
 }
-for (const rel of ["src/index.js", "package.json", "README.md", "src/.gitignore", "docs/notes.md"]) {
+// R-2: src/*.js is the guard/spawn pipeline now, so it is DENY; ordinary
+// manifests/docs stay writable.
+for (const rel of ["package.json", "README.md", "src/.gitignore", "docs/notes.md"]) {
   check("Write ALLOW: " + rel, write(rel), "ALLOW");
 }
+check("Write DENY (pipeline): src/index.js", write("src/index.js"), "DENY");
 
 /* ------------------------------------------------------------------ */
 /* analyseCommand unit level (fast, no spawn): the same guarantees must */
@@ -436,8 +439,16 @@ console.log("-- round-4: upstream writes, guard-file writes, secret reads, noteb
     check("  ...and explains it is execution configuration: " + rel, /execution configuration/.test(v.reason), true);
   }
   // Ordinary source stays editable in fix mode -- the deny must be exact.
-  check("write ALLOW ordinary source: src/index.js", write("src/index.js"), "ALLOW");
-  check("write ALLOW a new file: src/new-module.js", write("src/new-module.js"), "ALLOW");
+  // R-2: the whole guard/spawn pipeline is protected in a self-review — index.js
+  // spawns the reviewer, claude.js builds the child git env, prompt.js renders
+  // the permission rules, skill.js writes the installed skill. Ordinary source
+  // and docs stay editable.
+  for (const rel of ["src/index.js", "src/claude.js", "src/prompt.js", "src/skill.js", "src/version.js", "scripts/init.mjs", "scripts/lib/mcp-client.mjs", "assets/skills/code-review/SKILL.md"]) {
+    check("write DENY pipeline file: " + rel, write(rel), "DENY");
+  }
+  for (const rel of ["src/features/new-module.js", "docs/notes.md", "tests/example.test.js"]) {
+    check("write ALLOW ordinary source: " + rel, write(rel), "ALLOW");
+  }
 
   // SEC-23: review mode must not copy repo secrets into the transcript.
   const READ = (rel) => hookDetail("Read", { file_path: path.join(REPO, rel) });
@@ -520,7 +531,8 @@ console.log("-- P1-3 fix mode cannot write a git hook");
 for (const rel of [".husky/pre-commit", ".husky/_/husky.sh"]) {
   check("Write DENY: " + rel, write(rel), "DENY");
 }
-check("Write ALLOW after the hook rule: src/index.js", write("src/index.js"), "ALLOW");
+check("Write DENY after the hook rule: src/index.js", write("src/index.js"), "DENY");
+check("Write ALLOW after the hook rule: docs/notes.md", write("docs/notes.md"), "ALLOW");
 
 /* P0-2 / P0-3 / P1-1 / P1-12: what git READS must be what the scanner reads.
  * The scanner enumerated .git/config by hand, pruned node_modules while git
@@ -794,6 +806,35 @@ console.log("-- fail-closed: unparseable repository config / unreadable index / 
     }
     fs.rmSync(real, { recursive: true, force: true });
   }
+}
+console.log("-- P2-1: hook and permission globs cover the same protected classes");
+{
+  // The two layers are written in different dialects (regex in shell-guard,
+  // globs in prompt.js) and cannot import each other; this test is what keeps
+  // them aligned. Every path the hook refuses as execution configuration must
+  // also be refused by the permission engine, and vice versa (templates aside).
+  const globToRe = (g) => new RegExp("^" + g.split("**").map((part) =>
+    part.split("*").map((t) => t.replace(/[.+^${}()|[\]\\?]/g, "\\$&")).join("[^/]*")).join(".*") + "$");
+  const globs = FIX_PROTECTED_WRITE_GLOBS.map(globToRe);
+  const globCovers = (rel) => globs.some((re) => re.test(rel));
+  const pipeline = [
+    ".husky/pre-commit", ".github/workflows/ci.yml", ".github/actions/x/action.yml",
+    ".gitlab-ci.yml", "Jenkinsfile", "Makefile", ".pre-commit-config.yaml",
+    ".pre-commit-config.yml", ".devcontainer/devcontainer.json", ".cargo/config.toml",
+    ".circleci/config.yml", ".npmrc", ".env", ".env.local", ".ssh/id_rsa",
+    "scripts/pre-tool-hook.js", "src/index.js", "src/claude.js", "scripts/init.mjs",
+    "scripts/lib/mcp-client.mjs", "assets/skills/code-review/SKILL.md",
+  ];
+  for (const rel of pipeline) {
+    // check() compares with ===, so the pair is joined into one string.
+    check("hook DENY and permission glob both cover " + rel,
+      [hook("Write", { file_path: path.join(REPO, rel) }), globCovers(rel)].join("|"), "DENY|true");
+  }
+  // The documented template exception: the hook allows it, the permission glob
+  // is broader by design (over-block, not a hole) — locked so a future change
+  // is a conscious decision.
+  check("hook allows .env.example (documented template exception)",
+    hook("Write", { file_path: path.join(REPO, ".env.example") }), "ALLOW");
 }
 try { fs.rmSync(REPO, { recursive: true, force: true }); } catch { /* ignore */ }
 if (failures.length) {

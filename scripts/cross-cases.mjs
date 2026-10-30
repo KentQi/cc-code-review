@@ -1022,6 +1022,22 @@ if (process.argv.includes("--paid") && process.env.CC_LOOP_PAID === "1") {
   check("C27", "postToPR without a PR is refused before any run (P1-10)",
     r2.result?.isError === true && /postToPR/i.test(t2) && /(?<!postTo)\bPR\b/i.test(t2) && /requir/i.test(t2),
     t2.slice(0, 240));
+
+  // postToPR + a BARE number: gh would resolve "123" against the reviewed
+  // repository's own remote (untrusted), so the comment target is
+  // repository-controlled. Refused before any run; a full selector passes this
+  // specific gate (whatever the gh preflight says afterwards).
+  const r2b = await s2.call("claude_code_review", {
+    repoPath: gitRepo("c27c"), scope: "auto", pr: "123", postToPR: true, waitForResult: false,
+  });
+  const t2b = textOf(r2b);
+  check("C27", "postToPR with a bare PR number is refused (full selector required)",
+    r2b.result?.isError === true && /fully-qualified/i.test(t2b), t2b.slice(0, 240));
+  const r2c = await s2.call("claude_code_review", {
+    repoPath: gitRepo("c27d"), scope: "auto", pr: "owner/repo#123", postToPR: true, waitForResult: false,
+  });
+  check("C27", "postToPR with owner/repo#N passes the qualification gate",
+    !/fully-qualified/i.test(textOf(r2c)), textOf(r2c).slice(0, 240));
   s2.kill();
 
   // P1-7: the sync path stamped the result BEFORE settling the job, so a failure

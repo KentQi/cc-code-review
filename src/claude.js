@@ -403,25 +403,25 @@ function isLoopbackHost(h) {
  */
 const GIT_HARDENING = [
   // Values git executes (or that decide what executes).
-  { key: "core.sshCommand", value: "", env: true, args: true, scan: true, scanKind: "exec" },
-  { key: "core.fsmonitor", value: "", env: true, args: true, scan: true, scanKind: "exec" },
-  { key: "core.pager", value: "cat", env: true, args: true, scan: true, scanKind: "exec" },
-  { key: "core.hooksPath", value: "", env: true, args: true, scan: true, scanKind: "notes" },
-  { key: "diff.external", value: "", env: true, args: true, scan: true, scanKind: "exec" },
-  { key: "credential.helper", value: "", env: true, args: true, scan: false },
-  { key: "core.attributesFile", value: "", env: true, args: true, scan: true, scanKind: "attribute" },
-  { key: "interactive.diffFilter", value: "", env: true, args: true, scan: false },
-  { key: "core.editor", value: "", env: true, args: true, scan: false },
-  { key: "gpg.program", value: "", env: true, args: true, scan: false },
-  { key: "merge.tool", value: "", env: true, args: true, scan: false },
-  { key: "core.gitProxy", value: "", env: true, args: true, scan: true, scanKind: "exec" },
-  { key: "core.askPass", value: "", env: true, args: true, scan: true, scanKind: "exec" },
-  { key: "sequence.editor", value: "", env: true, args: true, scan: true, scanKind: "exec" },
+  { key: "core.sshCommand", value: "", harden: true, scan: true, scanKind: "exec" },
+  { key: "core.fsmonitor", value: "", harden: true, scan: true, scanKind: "exec" },
+  { key: "core.pager", value: "cat", harden: true, scan: true, scanKind: "exec" },
+  { key: "core.hooksPath", value: "", harden: true, scan: true, scanKind: "notes" },
+  { key: "diff.external", value: "", harden: true, scan: true, scanKind: "exec" },
+  { key: "credential.helper", value: "", harden: true, scan: false },
+  { key: "core.attributesFile", value: "", harden: true, scan: true, scanKind: "attribute" },
+  { key: "interactive.diffFilter", value: "", harden: true, scan: false },
+  { key: "core.editor", value: "", harden: true, scan: false },
+  { key: "gpg.program", value: "", harden: true, scan: false },
+  { key: "merge.tool", value: "", harden: true, scan: false },
+  { key: "core.gitProxy", value: "", harden: true, scan: true, scanKind: "exec" },
+  { key: "core.askPass", value: "", harden: true, scan: true, scanKind: "exec" },
+  { key: "sequence.editor", value: "", harden: true, scan: true, scanKind: "exec" },
   // The transport family (P0-1): ext:: runs an external command as the
   // remote URL transport; protocol.file re-enables file:// URLs.
-  { key: "protocol.ext.allow", value: "never", env: true, args: true, scan: true, scanKind: "transport",
+  { key: "protocol.ext.allow", value: "never", harden: true, scan: true, scanKind: "transport",
     refuse: "it chooses git's transport policy (the ext:: transport runs an external command)" },
-  { key: "protocol.file.allow", value: "never", env: true, args: true, scan: true, scanKind: "transport",
+  { key: "protocol.file.allow", value: "never", harden: true, scan: true, scanKind: "transport",
     refuse: "it chooses git's transport policy (the ext:: transport runs an external command)" },
   // Scanner-only families. `id` is the stable handle the scanner derives its
   // named patterns from, so each regex is written here and nowhere else.
@@ -466,13 +466,17 @@ const HARDENING_SCAN_KINDS = new Set(["exec", "transport", "driver", "include", 
       throw new Error("GIT_HARDENING: " + (entry.key || entry.pattern) + " must spell scan:true/false");
     }
     if (hasKey) {
-      if (typeof entry.env !== "boolean" || typeof entry.args !== "boolean") {
-        throw new Error("GIT_HARDENING: " + entry.key + " must spell env:true/false and args:true/false");
+      // P2-3.3: one flag. `env` and `args` were always equal on every entry
+      // (the child env and the server -c list pin the same keys), so the pair
+      // could never legitimately disagree — it only invited a future edit to
+      // set one and not the other, which is the P0-1 drift itself.
+      if (typeof entry.harden !== "boolean") {
+        throw new Error("GIT_HARDENING: " + entry.key + " must spell harden:true/false");
       }
-      // The P0-1 invariant: whatever protects the server or the scanner must
-      // also protect the reviewer child - that is the list nobody predicts.
-      if ((entry.args || entry.scan) && !entry.env) {
-        throw new Error("GIT_HARDENING: " + entry.key + " must set env:true (the claude child is the layer that cannot be predicted)");
+      // The P0-1 invariant: whatever the scanner refuses must also be
+      // neutralised in the reviewer child - that is the list nobody predicts.
+      if (entry.scan && !entry.harden) {
+        throw new Error("GIT_HARDENING: " + entry.key + " is scanned but not hardened (the claude child is the layer that cannot be predicted)");
       }
       const lower = entry.key.toLowerCase();
       if (keysSeen.has(lower)) throw new Error("GIT_HARDENING: duplicate key " + entry.key);
@@ -487,7 +491,7 @@ const HARDENING_SCAN_KINDS = new Set(["exec", "transport", "driver", "include", 
       // A wildcard family has no literal key, so it can never be pinned in the
       // child env or in -c: accepting env/args would promise a protection it
       // cannot give (and re-create exactly the P0-1 blindness).
-      if (entry.env === true || entry.args === true) {
+      if (entry.harden === true) {
         throw new Error("GIT_HARDENING: " + entry.pattern + " is a pattern; only a fixed key can be pinned in env/-c");
       }
       if (!entry.scan) throw new Error("GIT_HARDENING: " + entry.pattern + " is a pattern and must be scanned");
@@ -527,7 +531,7 @@ export { GIT_HARDENING };
  * The `-c key=value` pairs this server passes to its own git spawns.
  * Derived from GIT_HARDENING so the two lists cannot drift.
  */
-export const GIT_HARDENING_ARGS = GIT_HARDENING.filter((e) => e.args).flatMap((e) => ["-c", e.key + "=" + e.value]);
+export const GIT_HARDENING_ARGS = GIT_HARDENING.filter((e) => e.harden).flatMap((e) => ["-c", e.key + "=" + e.value]);
 
 /**
  * Environment for the claude child process:
@@ -594,7 +598,7 @@ export function buildClaudeEnv() {
   // it) so the server never silently drops config the caller injected.
   // P2-1: derived from GIT_HARDENING (the single table) instead of a second
   // hand-written list. Anything in that table with env:true protects the child.
-  const gitOverrides = GIT_HARDENING.filter((e) => e.env).map((e) => [e.key, e.value]);
+  const gitOverrides = GIT_HARDENING.filter((e) => e.harden).map((e) => [e.key, e.value]);
   const hostCount = /^\d+$/.test(String(env.GIT_CONFIG_COUNT ?? "")) ? Number(env.GIT_CONFIG_COUNT) : 0;
   gitOverrides.forEach(([key, value], i) => {
     env["GIT_CONFIG_KEY_" + (hostCount + i)] = key;
@@ -1014,24 +1018,34 @@ const ACK_TAIL_LINE = [
   /^You can continue\b/i,
   /^Use the (?:TaskOutput|BashOutput|Agent) tool\b/i,
 ];
-export function looksLikeLaunchAck(text) {
+/**
+ * The ack SHAPE, shared by looksLikeLaunchAck() and launchAckBody() (audit
+ * P2-3.4: the two functions had the four shape tests written out twice, so a
+ * tightening in one could accept a shape the other deliberately excluded).
+ * Returns { s, nl, head } for an ack-shaped text, null otherwise.
+ */
+function ackShape(text) {
   const s = String(text ?? "");
   const nl = s.indexOf("\n");
   const firstLine = nl < 0 ? s : s.slice(0, nl);
   const head = ACK_HEAD.exec(firstLine);
-  if (!head) return false;
+  if (!head) return null;
   // The rest of the FIRST line must be ack-shaped too: nothing, or a
   // parenthetical ("(This tool result is internal metadata…)"). Trailing prose
   // ("…successfully? No — the real finding is: …") means the sentence is part of
   // a REPORT, and treating it as an ack would silently drop the report.
   const rest = firstLine.slice(head[0].length).trim();
-  if (rest && !/^\([^)]*\)?$/.test(rest)) return false;
-  if (!/agentId:\s*\S+/.test(s) && !/working in the background/i.test(s)) return false;
+  if (rest && !/^\([^)]*\)?$/.test(rest)) return null;
+  if (!/agentId:\s*\S+/.test(s) && !/working in the background/i.test(s)) return null;
+  return { s, nl, head };
+}
+
+export function looksLikeLaunchAck(text) {
   // P3-3: an ack whose body carries substantive prose is BOTH — the ack must
   // still be recognized (its transcript path is the 429 fallback), and the prose
-  // must be filed as the reviewer's report. This function only answers "is this
-  // an ack shape"; launchAckBody() extracts the report so nothing is dropped.
-  return true;
+  // must be filed as the reviewer's report. This only answers "is this an ack
+  // shape"; launchAckBody() extracts the report so nothing is dropped.
+  return ackShape(text) !== null;
 }
 
 /**
@@ -1045,15 +1059,9 @@ export function looksLikeLaunchAck(text) {
  * mistaken for an ack.
  */
 function launchAckBody(text) {
-  const s = String(text ?? "");
-  const nl = s.indexOf("\n");
-  if (nl < 0) return null;
-  const firstLine = s.slice(0, nl);
-  const head = ACK_HEAD.exec(firstLine);
-  if (!head) return null;
-  const rest = firstLine.slice(head[0].length).trim();
-  if (rest && !/^\([^)]*\)?$/.test(rest)) return null;
-  if (!/agentId:\s*\S+/.test(s) && !/working in the background/i.test(s)) return null;
+  const shape = ackShape(text);
+  if (!shape || shape.nl < 0) return null;
+  const { s, nl } = shape;
   const body = [];
   for (const line of s.slice(nl + 1).split(/\r?\n/)) {
     const l = line.trim();
@@ -1627,19 +1635,13 @@ export function writeGuardSettings(extra = {}) {
   if (!shellGuardStatus().enabled && !hasExtra) return null;
   try {
     const dir = path.join(os.tmpdir(), "cc-code-review");
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    // mode: only applies on CREATE. On Linux /tmp is shared, so a pre-created
-    // /tmp/cc-code-review (or a symlink to an attacker-owned directory) would
-    // receive guard-settings-*.json — which claude reads at spawn time, i.e. the
-    // attacker could substitute the hook that is supposed to police this run.
-    // Refuse links, require our own uid, and force 0700 on the existing dir.
-    const dirStat = fs.lstatSync(dir);
-    if (dirStat.isSymbolicLink()) throw new Error("refusing a symlinked guard directory");
-    if (!dirStat.isDirectory()) throw new Error("guard path is not a directory");
-    if (typeof process.getuid === "function" && dirStat.uid !== process.getuid()) {
-      throw new Error("guard directory owned by uid " + dirStat.uid + ", not " + process.getuid());
-    }
-    if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+    // P2-3.2: one ownership check, not a second copy. On Linux /tmp is shared,
+    // so a pre-created /tmp/cc-code-review (or a symlink to an attacker-owned
+    // directory) would receive guard-settings-*.json — which claude reads at
+    // spawn time, i.e. the attacker could substitute the hook that is supposed
+    // to police this run. The helper refuses links/non-dirs/foreign uid and
+    // forces 0700 (mode: only applies on CREATE).
+    ensureOwnedPrivateDir(dir, "guard");
     sweepTempArtifacts(dir);
     const file = path.join(dir, `guard-settings-${process.pid}-${Math.random().toString(36).slice(2, 8)}.json`);
     fs.writeFileSync(file, JSON.stringify({

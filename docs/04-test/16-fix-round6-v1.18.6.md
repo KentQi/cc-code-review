@@ -1,3 +1,10 @@
+---
+title: 修复报告（第六轮）
+version: v1.18.6
+created: 2026-10-30
+status: final
+---
+
 # 修复报告（第六轮）— v1.18.6
 
 **基线**：v1.18.5（第三轮审计的残余：P2-1 / P2-3 / P2-22 + FIXES-round5 的 P1-4、P1-13、fail-closed 缺口）

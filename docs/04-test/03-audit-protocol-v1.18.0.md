@@ -1,3 +1,10 @@
+---
+title: 首轮审计 · 协议视角
+version: v1.18.0
+created: 2026-10-29
+status: final
+---
+
 # 02 — MCP 协议与工具面审计（`src/index.js` 全量）
 
 > 审计员：protocol-auditor（task-2）。只读 `src/`、`scripts/`；**未运行任何付费 run**（paid-smoke / cross-cases / e2e 均未执行），没有 npm install、没有联网。

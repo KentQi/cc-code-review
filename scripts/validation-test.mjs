@@ -72,6 +72,16 @@ r = await call("claude_code_review", { repoPath: cleanRepo, scope: "branch", bas
 check("baseRef with '...' (a revision range) refused",
   r.result?.isError === true && /single ref, not a revision range/i.test(textOf(r)), textOf(r).slice(0, 220));
 
+// 3e. postToPR needs a FULLY-QUALIFIED pr. gh resolves a bare number ("123")
+//     against the reviewed repository's own remote, and that repository is
+//     untrusted content — so the comment target would be repository-controlled.
+//     owner/repo#N and a URL pin it to what the caller named. This refusal runs
+//     before the gh preflight, so it is free and host-independent.
+r = await call("claude_code_review", { repoPath: cleanRepo, scope: "auto", pr: "123", postToPR: true });
+check("postToPR with a bare PR number refused",
+  r.result?.isError === true && /fully-qualified/i.test(textOf(r)) && /owner\/repo#/i.test(textOf(r)),
+  textOf(r).slice(0, 240));
+
 // 3c. focus is caller DATA: control characters / absurd length refused before it reaches the prompt
 r = await call("claude_code_review", { repoPath: cleanRepo, focus: "look at this\u0000\u0001 carefully" });
 check("focus with control characters refused", r.result?.isError === true && /control characters/i.test(textOf(r)), textOf(r).slice(0, 200));

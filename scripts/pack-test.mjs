@@ -12,7 +12,7 @@
  * while every checkout test stays green.
  *
  * It also locks the inverse: the published tarball must NOT ship the test,
- * paid, or audit material (~190KB of scripts/ plus audit/).
+ * paid, or audit material (~190KB of scripts/ plus docs/04-test/).
  *
  * Three layers, so a green here means something:
  *   1. package.json#files is exactly the reviewed list (no silent widening).
@@ -30,7 +30,11 @@ import { fileURLToPath } from "node:url";
 import { connectServer } from "./lib/mcp-client.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Node >= 18.20 refuses to execFile a .cmd shim without a shell (EINVAL), so on
+// Windows every npm call goes through cmd.exe. This was the only reason pack-test
+// failed on the Windows CI jobs when the new workflow started running `npm test`.
 const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
+const NPM_SHELL = process.platform === "win32";
 
 let pass = 0;
 const failures = [];
@@ -87,7 +91,7 @@ const FORBIDDEN_IN_TARBALL = [
   "scripts/paid-smoke.mjs",
   "scripts/e2e-test.mjs",
   "scripts/lib/mcp-client.mjs",
-  "audit/TRIAGE.md",
+  "docs/04-test/18-triage-p2-p3-v1.18.4.md",
 ];
 
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
@@ -133,6 +137,7 @@ const packJson = (args, opts = {}) =>
     encoding: "utf8",
     timeout: 180_000,
     windowsHide: true,
+    shell: NPM_SHELL,
     ...opts,
   }));
 
@@ -141,6 +146,7 @@ try {
   dry = packJson(["--dry-run"]);
 } catch (e) {
   check("npm pack --dry-run --json succeeds", false, true);
+  console.error(String(e?.message || e));
   console.error(String(e?.stdout || "").slice(-2000));
   console.error(String(e?.stderr || "").slice(-2000));
   console.log(`\nPACK TEST FAILED (${failures.length} failed, ${pass} passed)`);
@@ -159,9 +165,10 @@ check("every tarball path is a regular packaged file", dryFiles.every((f) => !f.
 // files field even if the forbidden list above is not updated.
 truthy(`tarball is lean (${dryFiles.length} files)`, dryFiles.length <= 20, `${dryFiles.length} files`);
 const unpackedBytes = dry[0]?.unpackedSize ?? 0;
-// The docs (README/CHANGELOG) are ~160KB of the total; scripts/ used to add
-// another ~190KB. A re-widened files field crosses this ceiling immediately.
-truthy(`tarball unpacked size is runtime-sized (${Math.round(unpackedBytes / 1024)}KB)`, unpackedBytes < 700 * 1024);
+// The docs (README/CHANGELOG) are ~170KB of the total and grew with the
+// 1.18.5–1.18.7 security sections; scripts/ used to add another ~190KB. A
+// re-widened files field crosses this ceiling immediately.
+truthy(`tarball unpacked size is runtime-sized (${Math.round(unpackedBytes / 1024)}KB)`, unpackedBytes < 720 * 1024);
 
 /* ---- 3. pack for real, extract, and run the extracted copy ---- */
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cc-pack-"));
@@ -249,7 +256,7 @@ try {
       delete env.CLAUDE_CONFIG_DIR;
       for (const k of ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]) delete env[k];
       const run = spawnSync(NPM, ["run", "init"], {
-        cwd: appDir, env, encoding: "utf8", timeout: 180_000, windowsHide: true,
+        cwd: appDir, env, encoding: "utf8", timeout: 180_000, windowsHide: true, shell: NPM_SHELL,
       });
       const out = `${run.stdout || ""}${run.stderr || ""}`;
       check("npm run init in the extracted package has no MODULE_NOT_FOUND",
@@ -270,5 +277,24 @@ try {
   fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
+
+/* ---- R-3: the declared runtime floor must be the one CI tests ---- */
+// The audit found engines >=18.19, a CI matrix [20,22,24] and a README badge
+// that disagreed. All three are asserted here so a future bump cannot land in
+// one place only.
+{
+  const floor = String(pkg.engines?.node || "");
+  const floorMajor = (floor.match(/(\d+)/) || [])[1];
+  const ci = fs.readFileSync(path.join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
+  const matrixLine = (ci.match(/node:\s*\[([^\]]+)\]/) || [])[1] || "";
+  const matrix = matrixLine.split(",").map((s) => s.trim()).filter(Boolean).map(Number);
+  check("R-3: engines declares a minimum node", Boolean(floorMajor), true);
+  check("R-3: the CI matrix tests the declared minimum", matrix.includes(Number(floorMajor)), true);
+  for (const f of ["README.md", "README.en.md"]) {
+    const readme = fs.readFileSync(path.join(ROOT, f), "utf8");
+    const badge = /badge\/node-%E2%89%A5(\d+)/.exec(readme);
+    check("R-3: " + f + " badge matches engines", badge ? badge[1] : null, floorMajor);
+  }
+}
 console.log(`\n${failures.length === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

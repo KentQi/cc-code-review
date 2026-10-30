@@ -1,11 +1,18 @@
+---
+title: 原子级审计报告（第二轮）
+version: v1.18.2
+created: 2026-10-29
+status: final
+---
+
 # cc-code-review — 原子级多专家并行审计报告
 
-> **状态更新（2026-10-29 深夜）**：本报告的 10 P0 / 10 P1 之外，后续 1.18.3 又收掉了两轮审计的剩余功能项（并发锁、sync 取消、报告格式、大结果上限、信号退出、cancel-test 跨平台）与复核新发现（指纹缓存窗口）。当前 **PR #3 = 1.18.3**，CI 6/6 绿。修复明细见 [FIXES-round3.md](FIXES-round3.md)。
+> **状态更新（2026-10-29 深夜）**：本报告的 10 P0 / 10 P1 之外，后续 1.18.3 又收掉了两轮审计的剩余功能项（并发锁、sync 取消、报告格式、大结果上限、信号退出、cancel-test 跨平台）与复核新发现（指纹缓存窗口）。当前 **PR #3 = 1.18.3**，CI 6/6 绿。修复明细见 [FIXES-round3.md](13-fix-round3-v1.18.3.md)。
 >
-> **状态更新（2026-10-29 晚）**：本报告的 **10 条 P0 与 10 条 P1 已全部修复并发布为 v1.18.2**（PR [#2](https://github.com/KentQi/cc-code-review/pull/2)，stacked on [#1](https://github.com/KentQi/cc-code-review/pull/1)），npm test 6 套件全绿。修复明细见 [FIXES-round2.md](FIXES-round2.md)。另有 3 条审计结论已被更正（见该文件末节）。下文保留审计原始结论作为验收依据。
+> **状态更新（2026-10-29 晚）**：本报告的 **10 条 P0 与 10 条 P1 已全部修复并发布为 v1.18.2**（PR [#2](https://github.com/KentQi/cc-code-review/pull/2)，stacked on [#1](https://github.com/KentQi/cc-code-review/pull/1)），npm test 6 套件全绿。修复明细见 [FIXES-round2.md](12-fix-round2-v1.18.2.md)。另有 3 条审计结论已被更正（见该文件末节）。下文保留审计原始结论作为验收依据。
 
 **审计对象**：`/Users/kent/Desktop/projects/cc-code-review_MCP`（v1.18.1）
-**基线**：v1.18.1（`audit/AUDIT-REPORT.md` 记录的 1.18.0 审计结论与 `audit/FIXES.md` 的 9 P0 / 12 P1 修复状态）
+**基线**：v1.18.1（`docs/04-test/08-audit-atomic-v1.18.2.md` 记录的 1.18.0 审计结论与 `docs/04-test/08-audit-atomic-v1.18.2.md` 的 9 P0 / 12 P1 修复状态）
 **审计日期**：2026-10-29
 **审计方式**：10 路并行专家角度（逐行 / 不变量 / 跨文件 / 语言陷阱 / 包装器 / 复用 / 简化 / 效率 / 层次 / 规范）+ 独立验证者 + 缺口清扫者；关键结论均以**真实产品代码**（非 mock）实测复现
 **审计范围**：`src/`(5,628 行) + `scripts/`(3,873 行) + `assets/skills/code-review/SKILL.md`(171 行)
@@ -108,7 +115,7 @@ DENIED  <- Read {"file_path":"/etc/passwd"}         （对照：Read 边界，re
 
 **并且不会被发现**：`detectShellChaining` 把这条命令计入 `clean`（`shell-guard.js:722`），`shellChainingNote` 因此返回 null —— 报告里不会出现任何痕迹。密钥会落在工具结果、Claude Code 的 `~/.claude/projects/` JSONL 转录、以及运行日志里。
 
-**已知前科**：上轮审计 `01-security.md` **SEC-17 [P2]**（"reviewer 进程能读到全部 auth env"）已记录，未修（`audit/FIXES.md` §5）。
+**已知前科**：上轮审计 `01-security.md` **SEC-17 [P2]**（"reviewer 进程能读到全部 auth env"）已记录，未修（`docs/04-test/08-audit-atomic-v1.18.2.md` §5）。
 
 **修法**：(a) 把 `echo`/`tr` 移出 `pathArgs` 的豁免名单；(b) 在 `parseCommand` 里把**裸 `$VAR`** 也建模（展开或直接判 unsafe），与 `$(`/`${}` 同级；(c) 对 `echo` 的参数禁止通配符与 `~`；(d) 子进程环境改为**白名单**而非 `...process.env`。
 
@@ -245,7 +252,7 @@ native 命令   -> "/code-review max"        ← 没有 target，静默改审默
 两条路径都是错的，但错得不一样：fleet 把 `undefined` 交给模型（模型会照着 `gh pr view undefined` 去跑，烧 turn 后失败）；native 直接**不传 target**，于是评审的是"默认推断出来的目标"，**报告看起来完全正常，但审的不是用户要的 PR**。`validatePr(undefined)` 返回 `{ok:true}`（`index.js:221`），没有任何地方要求 `scope=pr` 必须带 `pr`。
 
 **修法**：`scope === "pr" && !pr` 时直接 `err("scope=pr requires a pr (number, owner/repo#123, or a PR URL)")`。
-**已知**：上轮（1.18.0 轮）记为 **P1-10**，`audit/FIXES.md` 明确"留待下轮"，至今未修。
+**已知**：上轮（1.18.0 轮）记为 **P1-10**，`docs/04-test/08-audit-atomic-v1.18.2.md` 明确"留待下轮"，至今未修。
 
 ---
 
@@ -671,7 +678,7 @@ if (pipeline === "native" && shadow) {
 
 ---
 
-## 5. 上轮遗留项的现状（据 `audit/FIXES.md`）
+## 5. 上轮遗留项的现状（据 `docs/04-test/08-audit-atomic-v1.18.2.md`）
 
 | 编号（**1.18.0 轮**） | 状态 | 现状 |
 |---|---|---|

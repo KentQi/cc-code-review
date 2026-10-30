@@ -15,7 +15,7 @@ import {
 } from "../src/prompt.js";
 import {
   versionAtLeast, PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN,
-  GIT_HARDENING_ARGS, repoRunsGitPrograms, guardHookCommand, hookScriptPath,
+  GIT_HARDENING_ARGS, GIT_HARDENING, repoRunsGitPrograms, guardHookCommand, hookScriptPath,
   guardState, gitWriteFlagReason, gitSpawnOpts, guardSelfTest,
   writeGuardSettings, removeGuardSettings,
   streamEventFacts, parseUnrecognizedModels, buildModelProvenance, resultFacts,
@@ -1077,6 +1077,19 @@ console.log("-- P2-1/P2-3/P1-13 single sources and fingerprint coverage");
   const claudeSrc = fs.readFileSync(path.join(SRC, "claude.js"), "utf8");
   check("P2-1: exactly one GIT_HARDENING table", (claudeSrc.match(/const GIT_HARDENING = \[/g) || []).length, 1);
   truthy("P2-1: no second hand-written gitOverride pair list", !/\["core\.sshCommand", ""\]/.test(claudeSrc));
+  // The exported table is the source of truth: prove the three views agree from
+  // the table itself, not by regexing the source (audit P3: the export was dead).
+  {
+    const hardened = GIT_HARDENING.filter((e) => e.harden);
+    check("P2-1: every hardened key is in GIT_HARDENING_ARGS",
+      hardened.every((e) => GIT_HARDENING_ARGS.includes(e.key + "=" + e.value)), true);
+    check("P2-1: every scanned key is hardened (P0-1 invariant)",
+      GIT_HARDENING.filter((e) => e.key && e.scan).every((e) => e.harden), true);
+    check("P2-1: no pattern entry claims env/-c protection",
+      GIT_HARDENING.filter((e) => e.pattern).every((e) => e.harden !== true), true);
+    check("P2-1: pattern ids are unique", new Set(GIT_HARDENING.filter((e) => e.pattern).map((e) => e.id)).size,
+      GIT_HARDENING.filter((e) => e.pattern).length);
+  }
   const env = buildClaudeEnv();
   const count = Number(env.GIT_CONFIG_COUNT);
   const envPairs = [];
@@ -1103,8 +1116,8 @@ console.log("-- P2-1/P2-3/P1-13 single sources and fingerprint coverage");
   // Edit INSIDE a hashed rule function (the tables stay identical): this is the
   // "upgrade changed a rule, not a table" case the old fingerprint missed.
   const edited = fs.readFileSync(path.join(SRC, "shell-guard.js"), "utf8")
-    .replace("function segmentProblem(words, repoRoot, unquoted = [], tilde = []) {",
-      "function segmentProblem(words, repoRoot, unquoted = [], tilde = []) {\n  const _ruleDrift = 1;");
+    .replace("function segmentProblem(words, repoRoot, unquoted = []) {",
+      "function segmentProblem(words, repoRoot, unquoted = []) {\n  const _ruleDrift = 1;");
   fs.writeFileSync(copy, edited);
   const probe = "import(" + JSON.stringify(pathToFileURL(copy).href) + ").then((m) => process.stdout.write(m.policyFingerprint()))";
   const res = spawnSync(process.execPath, ["--input-type=module", "-e", probe], { encoding: "utf8", timeout: 15000 });

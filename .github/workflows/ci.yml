@@ -1,34 +1,40 @@
 name: CI
 
+# The badges in README.md and README.en.md point at this exact path, so the
+# file name is part of the contract: .github/workflows/ci.yml.
 on:
+  # No branch filter: the badge is on the default branch, but a gate that only
+  # runs on "main" can be red in a branch and still look green upstream.
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # The project's whole promise is cross-platform correctness — test on all three.
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        node: [18, 22]
-    runs-on: ${{ matrix.os }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: npm install
-      # These two suites are hermetic: no claude CLI, no network, no spend.
-      # smoke-test / validation-test additionally need a Claude Code install,
-      # so they stay as local commands (see CONTRIBUTING.md).
-      - run: node scripts/shell-guard-test.mjs
-      - run: node scripts/audit-fixes-test.mjs
-      # The P0 regression suite from the 2026-10 audit: real hook process, no
-      # claude CLI, no network — same hermetic contract as the two above.
-      - run: node scripts/p0-regression-test.mjs
-      # The stub-driven end-to-end suite: async job lifecycle, reviewer-report
-      # and model-provenance extraction, the error path, ultracode/Workflow.
-      # Hermetic too (stub claude via CLAUDE_CODE_PATH; the paid C9 stays opt-in).
-      - run: node scripts/cross-cases.mjs
+          cache: npm
+      - run: npm ci
+      - run: npm test
+        env:
+          # Hosted runners do not ship the claude CLI, and the smoke suite is
+          # fail-closed when the CLI cannot be resolved. Point resolution at the
+          # stub the stub-based e2e suites already use: the stdio handshake,
+          # tool list and env verdict are still exercised, so the matrix stays
+          # green without installing Claude Code or spending credits. Real-CLI
+          # behaviour is covered by `npm test` on a developer machine, where
+          # CLAUDE_CODE_PATH is unset.
+          CLAUDE_CODE_PATH: ${{ github.workspace }}/scripts/stub-claude.mjs

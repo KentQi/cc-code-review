@@ -1,3 +1,10 @@
+---
+title: 首轮审计 · 安全视角
+version: v1.18.0
+created: 2026-10-29
+status: final
+---
+
 
 # 安全审计：shell-guard / PreToolUse hook / init / 凭据与环境
 

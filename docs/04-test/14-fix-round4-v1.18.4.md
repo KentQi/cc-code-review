@@ -1,6 +1,13 @@
+---
+title: 修复报告（第四轮）
+version: v1.18.4
+created: 2026-10-30
+status: final
+---
+
 # 修复报告（第四轮）— v1.18.4
 
-**基线**：v1.18.3（`audit/TRIAGE.md` 里 13 条 🟢 + 37 条 🟡 + 1 条部分）
+**基线**：v1.18.3（`docs/04-test/14-fix-round4-v1.18.4.md` 里 13 条 🟢 + 37 条 🟡 + 1 条部分）
 **结果**：v1.18.4（`npm test` 7 套件全绿）
 **PR**：[#4](https://github.com/KentQi/cc-code-review/pull/4)（stacked on [#3](https://github.com/KentQi/cc-code-review/pull/3)）
 **CI**：ubuntu/macos/windows × node 18/22 —— 5/6 已通过（含两个 Windows job，修复了 init.mjs 0600 断言的 NTFS 平台差异），最后一个 macOS-22 在 GitHub runner 队列中

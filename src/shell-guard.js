@@ -214,7 +214,7 @@ function startsExpansion(cmd, i) {
  * Quote-aware: `git log --format="%h; %s"` is ONE segment. Reports the first
  * construct that makes the command unsafe regardless of the policy.
  *
- * @returns {{segs: {words: string[], unquoted: string[], tilde: boolean[]}[], ops: string[], unsafe: null|"redirection"|"substitution"|"unbalanced"|"ansi-quoting"}}
+ * @returns {{segs: {words: string[], unquoted: string[]}[], ops: string[], unsafe: null|"redirection"|"substitution"|"unbalanced"|"ansi-quoting"}}
  */
 function parseCommand(cmd) {
   const segs = [];
@@ -224,26 +224,25 @@ function parseCommand(cmd) {
   // PER CHARACTER, not per word: in echo ~"/".ssh/* only the "/" is quoted,
   // and bash still expands the leading ~ and the trailing *. The old per-word
   // boolean marked the whole word literal and let that form through (audit
-  // P1-14). The tilde array records an unquoted ~ in the FIRST position, which
-  // is the only place bash performs tilde expansion.
+  // P1-14). A leading unquoted ~ is the only place bash performs tilde
+  // expansion, so it is read off the unquoted view (`startsWith("~")`) rather
+  // than a third parallel array that had to be kept in sync (audit P2).
   let unquoted = [];
-  let tilde = [];
   let word = "";
   let wordUnquoted = "";
-  let wordTilde = false;
   let inWord = false;
   let quote = null;
   let unsafe = null;
 
   const endWord = () => {
     if (inWord) {
-      words.push(word); unquoted.push(wordUnquoted); tilde.push(wordTilde);
-      word = ""; wordUnquoted = ""; wordTilde = false; inWord = false;
+      words.push(word); unquoted.push(wordUnquoted);
+      word = ""; wordUnquoted = ""; inWord = false;
     }
   };
   const endSeg = (op) => {
     endWord();
-    if (words.length) { segs.push({ words, unquoted, tilde }); words = []; unquoted = []; tilde = []; }
+    if (words.length) { segs.push({ words, unquoted }); words = []; unquoted = []; }
     if (op) ops.push(op);
   };
 
@@ -309,7 +308,6 @@ function parseCommand(cmd) {
     }
     if (c === ">" || c === "<") { unsafe = unsafe || "redirection"; continue; }
     if (startsExpansion(cmd, i)) unsafe = unsafe || "substitution";
-    if (c === "~" && !inWord) wordTilde = true;
     wordUnquoted += c;
     word += c;
     inWord = true;
@@ -438,7 +436,21 @@ function longOptionIs(name, option) {
 function denyReasonIn(table, word) {
   const name = flagName(word);
   for (const [option, why] of Object.entries(table)) {
-    if (option.startsWith("--") ? longOptionIs(name, option) : name === option) return why;
+    if (option.startsWith("--")) {
+      if (longOptionIs(name, option)) return why;
+      continue;
+    }
+    // GNU find's historical long options are single-dash (-files0-from) and its
+    // parser accepts the double-dash spelling too (getopt_long_only). The table
+    // entry therefore matches BOTH spellings, with the same unambiguous-prefix
+    // rule for the double-dash form: find --files0-from and find --files0 were
+    // allowed while the single-dash spelling was denied (audit P1).
+    if (option.length > 2 && /^-[A-Za-z]/.test(option)) {
+      if (name === option) return why;
+      if (longOptionIs(name, "--" + option.slice(1))) return why;
+      continue;
+    }
+    if (name === option) return why;
   }
   // Glued short option (-X/etc/passwd): the value never becomes a separate
   // token, so the table has to see the two-character form.
@@ -473,7 +485,12 @@ const OUTRIGHT_DENY = {
   // GNU find only, but the guard must not depend on which find the host has:
   // the flag follows a NUL-separated list of start paths from an arbitrary file.
   find: {
+    // GNU find documents the single-dash spelling and its parser is
+    // getopt_long_only style, so `--files0-from` is accepted too. Both spellings
+    // (and the abbreviation) are listed here AND denyReasonIn() treats a
+    // single-dash long name as matching the double-dash word (audit P1).
     "-files0-from": "`find -files0-from` follows a list of paths that may point outside the repository",
+    "--files0-from": "`find --files0-from` follows a list of paths that may point outside the repository",
   },
 };
 
@@ -523,12 +540,19 @@ export const PROTECTED_WRITE = [
   /(^|\/)\.gitmodules$/i,
   /(^|\/)\.gitattributes$/i,
   /(^|\/)\.gitconfig$/i,
-  // Self-review: the reviewed repository can be this very package. Writing its
-  // guard files would disarm the hook for every later run, so these two
-  // package-relative paths are protected even though they are ordinary source.
-  // Root-anchored on purpose — other src/* files stay editable.
+  // Self-review: the reviewed repository can be this very package. Anything in
+  // the guard/spawn pipeline can disarm every later run — not only the hook
+  // itself: src/index.js spawns the reviewer, src/claude.js builds the child
+  // git environment, src/prompt.js renders the permission rules, src/skill.js
+  // writes the installed skill. R-2: the old list protected two files and
+  // documented "other src/* files stay editable", which left the promise half
+  // true. The whole pipeline is protected now; fix mode on THIS package is a
+  // manual-edit job by design.
+  /^src\/[^/]+\.js$/i,
   /^scripts\/pre-tool-hook\.js$/i,
-  /^src\/shell-guard\.js$/i,
+  /^scripts\/init\.mjs$/i,
+  /^scripts\/lib\//i,
+  /^assets\/skills\//i,
 ];
 
 /**
@@ -706,7 +730,17 @@ function pathArgs(words) {
       if (t === "--") { endOfOptions = true; continue; }
       if (!endOfOptions) {
         if (FIND_GLOBAL_FLAGS.has(t)) continue;
-        if (t === "-D" || t === "-O") { i++; continue; } // their value
+        if (t === "-D" || t === "-O") {
+          // R-1: the old form skipped the NEXT token unconditionally as "their
+          // value". GNU find's -D takes debugopts (letters/commas) and -O a
+          // level (digits) — both may also be glued (-Dhelp / -O3). A token
+          // that is not that value is a START PATH and must be checked:
+          // `find -D /etc` and `find -O /etc` used to enumerate a host dir.
+          const next = rest[i + 1] || "";
+          const takesValue = t === "-D" ? /^[A-Za-z,]+$/.test(next) : /^\d+$/.test(next);
+          if (takesValue) i++;
+          continue;
+        }
         if (/^-O[0-9]+$/.test(t) || /^-D.+/.test(t)) continue; // glued value
         if (t === "-f") {
           const v = rest[i + 1];
@@ -990,7 +1024,7 @@ function outrightDeny(words) {
  * positional). Applied to both policy commands and pipe sinks.
  * @returns {string | null}
  */
-function segmentProblem(words, repoRoot, unquoted = [], tilde = []) {
+function segmentProblem(words, repoRoot, unquoted = []) {
   const prog = words[0];
 
   const outright = outrightDeny(words);
@@ -1096,7 +1130,7 @@ function segmentProblem(words, repoRoot, unquoted = [], tilde = []) {
     // character (`echo "/x/"*`) is still judged by its unquoted glob (audit
     // P1-14: the old per-word boolean let that form through).
     const expands = words.slice(1).find((w, i) =>
-      /[?*\[\]]/.test(unquoted[i + 1] || "") || Boolean(tilde[i + 1]));
+      /[?*\[\]]/.test(unquoted[i + 1] || "") || (unquoted[i + 1] || "").startsWith("~"));
     if (expands) {
       return `blocked: \`echo ${expands}\` is expanded by the shell before echo runs (a glob or ~ enumerates files the review must not list). Echo literal text without wildcards or ~; use the Read/Grep/Glob tools for file contents.`;
     }
@@ -1282,14 +1316,14 @@ export function analyseCommand(cmd, opts = {}) {
           };
         }
       }
-      const why = segmentProblem(words, opts.repoRoot, segs[i].unquoted, segs[i].tilde);
+      const why = segmentProblem(words, opts.repoRoot, segs[i].unquoted);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }
 
     // A pipe sink consumes stdin only; it is never a valid first command.
     if (i > 0 && ops[i - 1] === "|" && PIPE_SINKS.has(words[0])) {
-      const why = segmentProblem(words, opts.repoRoot, segs[i].unquoted, segs[i].tilde);
+      const why = segmentProblem(words, opts.repoRoot, segs[i].unquoted);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }

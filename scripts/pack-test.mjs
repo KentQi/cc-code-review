@@ -30,7 +30,11 @@ import { fileURLToPath } from "node:url";
 import { connectServer } from "./lib/mcp-client.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Node >= 18.20 refuses to execFile a .cmd shim without a shell (EINVAL), so on
+// Windows every npm call goes through cmd.exe. This was the only reason pack-test
+// failed on the Windows CI jobs when the new workflow started running `npm test`.
 const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
+const NPM_SHELL = process.platform === "win32";
 
 let pass = 0;
 const failures = [];
@@ -133,6 +137,7 @@ const packJson = (args, opts = {}) =>
     encoding: "utf8",
     timeout: 180_000,
     windowsHide: true,
+    shell: NPM_SHELL,
     ...opts,
   }));
 
@@ -141,6 +146,7 @@ try {
   dry = packJson(["--dry-run"]);
 } catch (e) {
   check("npm pack --dry-run --json succeeds", false, true);
+  console.error(String(e?.message || e));
   console.error(String(e?.stdout || "").slice(-2000));
   console.error(String(e?.stderr || "").slice(-2000));
   console.log(`\nPACK TEST FAILED (${failures.length} failed, ${pass} passed)`);
@@ -249,7 +255,7 @@ try {
       delete env.CLAUDE_CONFIG_DIR;
       for (const k of ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]) delete env[k];
       const run = spawnSync(NPM, ["run", "init"], {
-        cwd: appDir, env, encoding: "utf8", timeout: 180_000, windowsHide: true,
+        cwd: appDir, env, encoding: "utf8", timeout: 180_000, windowsHide: true, shell: NPM_SHELL,
       });
       const out = `${run.stdout || ""}${run.stderr || ""}`;
       check("npm run init in the extracted package has no MODULE_NOT_FOUND",

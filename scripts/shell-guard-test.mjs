@@ -460,7 +460,18 @@ check("hook: write to a not-yet-existing file inside the repo still allowed",
   hookVerdict({ tool_name: "Write", tool_input: { file_path: path.join(REPO, "brand", "new.js") } }, { CLAUDE_REVIEW_REPO_ROOT: REPO }).decision, null);
 try { fs.rmSync(LINK, { force: true, recursive: true }); } catch { /* best effort */ }
 try { fs.rmSync(OUTSIDE, { recursive: true, force: true }); } catch { /* best effort */ }
-check("hook: garbage stdin allowed through", hookVerdict("not json at all"), { status: 0, decision: null, reason: null });
+// N-1: an unparseable payload is a payload the hook cannot judge — it must DENY.
+// The old assertion locked the fail-open behaviour ("not our payload shape").
+const garbage = hookVerdict("not json at all");
+check("hook: garbage stdin is denied (fail closed)", garbage.decision, "deny");
+for (const raw of ["", "[]", "null", "{\"tool_name\":42}", "{}", "{\"tool_name\":\"Bash\"}"]) {
+  const v = hookVerdict(raw);
+  check("hook: malformed payload denied: " + JSON.stringify(raw), v.decision, "deny");
+}
+// A parsed payload naming a tool this hook does not police still passes: those
+// are governed by the server allowlist, and denying them would break every run.
+const other = hookVerdict(JSON.stringify({ tool_name: "TodoWrite", tool_input: {} }));
+check("hook: a non-policed tool passes", other.decision, null);
 // A Bash payload with no command string cannot be inspected by the guard, so
 // the hook fails closed (audit SEC-24); an empty command string is a no-op and
 // stays allowed.
@@ -536,6 +547,20 @@ for (const c of ['grep -rn "" .', "grep -R x .", "grep -r x", "grep -rE x .", "g
 }
 for (const c of ["grep -rn x src", "grep -n x file.ts"]) {
   check(`P1-4: still allows scoped grep ${c}`, analyseCommand(c, { repoRoot: REPO }).ok, true);
+}
+/* ---- R-1 / P1: find global options and the files0-from spellings ---- */
+// R-1: -D takes debugopts (letters/commas) and -O a level (digits); a token
+// that is not that value is a START PATH and must be checked.
+for (const c of ["find -D /etc", "find -O /etc", "find -D help /etc", "find -O 3 /etc", "find -Dhelp /etc", "find -O3 /etc"]) {
+  check(`R-1: refuses ${c}`, analyseCommand(c, { repoRoot: REPO }).ok, false);
+}
+for (const c of ["find -D help .", "find -O 3 .", "find . -name x", "find -O2 ."]) {
+  check(`R-1: still allows ${c}`, analyseCommand(c, { repoRoot: REPO }).ok, true);
+}
+// P1: GNU find accepts both -files0-from and --files0-from (getopt_long_only),
+// and the PR added abbreviation matching only for `--` table entries.
+for (const c of ["find -files0-from /etc/passwd", "find --files0-from /etc/passwd", "find --files0-from=/etc/passwd", "find --files0 /etc/passwd", "find -files0 /etc/passwd"]) {
+  check(`P1: refuses ${c}`, analyseCommand(c, { repoRoot: REPO }).ok, false);
 }
 /* ---- cleanup ---- */
 try { fs.rmSync(REPO, { recursive: true, force: true }); } catch { /* best effort */ }

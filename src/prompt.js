@@ -803,8 +803,11 @@ export function fixAllowedTools() {
  * .devcontainer/, .cargo/config.toml, .circleci/ and .npmrc were writable
  * through BOTH layers, yet each is execution configuration whose write fires on
  * the next push / commit / make / npm install (audit P1-3, P2-2). The list lives
- * here, exported, so the hook can import it instead of hand-porting a glob
- * dialect a second time.
+ * here for the permission engine; the hook derives the same classes from
+ * PROTECTED_WRITE in src/shell-guard.js (it must stay loadable even if this
+ * module breaks, so it cannot import it). The two layers are kept aligned by a
+ * cross-layer test in scripts/p0-regression-test.mjs — not by hand (audit P2-1:
+ * the old comment claimed a single table the hook imports; it never did).
  *
  * Deliberately NOT here:
  *  - package.json: fix mode legitimately edits it (deps, metadata), no glob can
@@ -842,6 +845,7 @@ export const FIX_PROTECTED_WRITE_GLOBS = Object.freeze([
   ".circleci/**", "**/.circleci/**",
   ".husky/**", "**/.husky/**",
   ".pre-commit-config.yaml", "**/.pre-commit-config.yaml",
+  ".pre-commit-config.yml", "**/.pre-commit-config.yml",
   ".devcontainer/**", "**/.devcontainer/**",
   ".cargo/config", ".cargo/config.toml", "**/.cargo/config", "**/.cargo/config.toml",
   "Makefile", "**/Makefile",
@@ -851,17 +855,26 @@ export const FIX_PROTECTED_WRITE_GLOBS = Object.freeze([
   ".npmrc", "**/.npmrc",
   // Secret material: a write is an exfiltration path (and .git-credentials,
   // .pypirc, .dockercfg and kdbx vaults were missing from both tables).
+  // Two-layer note (P3): the permission engine cannot express "but allow the
+  // template", so `.env.example` is denied here while the hook's SECRET_READ_ALLOW
+  // lets it through — the over-block is deliberate and is locked by
+  // scripts/p0-regression-test.mjs ("documented template exception").
   ".env", ".env.*", "**/.env", "**/.env.*",
   "**/secrets.*", "**/credentials", "**/credentials.*",
   "**/.git-credentials", "**/.pypirc", "**/.dockercfg", "**/*.kdbx",
   "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx", "**/*.keystore", "**/*.jks",
   "**/id_rsa*", "**/id_dsa*", "**/id_ecdsa*", "**/id_ed25519*",
   "**/.ssh/**", "**/.aws/**", "**/.gnupg/**", "**/.netrc", "**/.pgpass",
-  // Self-review (repo == this package): writing the guard files would disarm
-  // every later run — the hook enforces the same two root-relative paths
-  // (SEC-15); the globs are the permission-engine half of that rule.
+  // Self-review (repo == this package): anything in the guard/spawn pipeline
+  // can disarm every later run — index.js spawns the reviewer, claude.js builds
+  // the child git env, prompt.js renders the permission rules, skill.js writes
+  // the installed skill (R-2). The hook enforces the same classes from
+  // PROTECTED_WRITE; these globs are the permission-engine half.
   "scripts/pre-tool-hook.js", "**/scripts/pre-tool-hook.js",
-  "src/shell-guard.js", "**/src/shell-guard.js",
+  "scripts/init.mjs", "**/scripts/init.mjs",
+  "scripts/lib/**", "**/scripts/lib/**",
+  "src/*.js", "**/src/*.js",
+  "assets/skills/**", "**/assets/skills/**",
 ]);
 
 /** Render FIX_PROTECTED_WRITE_GLOBS as the fix-mode write deny rules. */

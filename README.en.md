@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/KentQi/cc-code-review/actions/workflows/ci.yml/badge.svg)](https://github.com/KentQi/cc-code-review/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Node](https://img.shields.io/badge/node-%E2%89%A518.19-brightgreen)
+![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)
 
 English | [简体中文](README.md)
 
@@ -19,7 +19,7 @@ ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --
 
 ## Prerequisites
 
-- Node ≥ **18.19**
+- Node ≥ **20** (CI matrix 20/22/24; Node 18 is EOL and no longer supported)
 - Claude Code installed. **No OAuth login required** — all three access modes work:
   - **CC Switch / claude-code-router style gateways**: the config lives in the `env` block of `~/.claude/settings.json`; claude reads it on every start (settings keys override process env vars of the same name), so switching providers takes effect on the very next review. This MCP runs a **TCP preflight against loopback gateways** (127.0.0.1 etc.) — a dead gateway fails fast with "gateway not reachable" instead of hanging until the timeout; loopback gateway traffic never goes through an HTTP proxy (`NO_PROXY` is patched automatically).
   - **Official account login (OAuth/Pro/Max)**: run `claude` interactively once in a terminal to log in; headless mode works afterwards. Note: if the MCP host runs as a service/scheduled task that cannot read your credential store (Windows Credential Manager / macOS Keychain), you will get "Not logged in".
@@ -164,7 +164,35 @@ It also closes the **write/execute forms that a prefix rule cannot express**: `f
 
 > ⚠️ **`--settings` replaces the entire `hooks` key**: the injected temp file contains only this MCP's hook — your own hooks from `~/.claude/settings.json` will **not** run inside this child process (other keys such as `env`, `model`, `permissions` are unaffected). This is CLI behavior, not an omission — if you rely on your own hooks during reviews, you currently need a different approach.
 
-**There is exactly one policy**: `src/shell-guard.js` exports `BASH_POLICY`, `prompt.js` renders the `Bash(...)` rules from it, and the hook judges segments against the same table — so "the hook allowed it" and "the engine allowed it" cannot drift. The contract is locked by `scripts/shell-guard-test.mjs` (238 checks: allowed chains must pass, bad chains must stop, `cd` outside the root must stop, writing sinks must stop, a real review's 17-command replay, and a hook-process denial for every dangerous form) and `scripts/p0-regression-test.mjs` (95 checks: every P0 form from the 2026-10 multi-expert audit — ANSI-C quoting / backslash escapes / glued short options, `.GIT` case variants, fix-mode persistence paths, repo-supplied git drivers, symlink freeze) — **run `npm test` before changing the policy**. Turn it off with `CLAUDE_REVIEW_SHELL_GUARD=0` (the whole thing then fails closed and refuses to run — see "Fail closed when a defense layer is missing").
+**There is exactly one policy**: `src/shell-guard.js` exports `BASH_POLICY`, `prompt.js` renders the `Bash(...)` rules from it, and the hook judges segments against the same table — so "the hook allowed it" and "the engine allowed it" cannot drift. The contract is locked by `scripts/shell-guard-test.mjs` (320 checks) and `scripts/p0-regression-test.mjs` (238 checks: every P0 form from the 2026-10 audits — ANSI-C quoting / backslash escapes / glued short options, `.GIT` case variants, fix-mode persistence paths, repo-supplied git drivers, symlink freeze, config.worktree, node_modules attributes, the hook's fail-closed payload shapes) — **run `npm test` before changing the policy**. Turn it off with `CLAUDE_REVIEW_SHELL_GUARD=0` (the whole thing then fails closed and refuses to run — see "Fail closed when a defense layer is missing").
+**v1.18.5 boundaries (7 P0 / 14 P1 from the third audit)**
+
+- **Git long-option abbreviations no longer bypass the deny tables**: `git`/`sort`/`wc`/`rg` accept unambiguous prefixes, so the tables match by prefix now (`--cont` = `--contents`, `--files0` = `--files0-from`) and the missing file-reading options are denied.
+- **`gh pr comment --body-file/-F`** is scoped to the repository (postToPR included): a host credential file can no longer be POSTed to GitHub.
+- **`echo` quoting is judged per character**: only an unquoted glob/`~` is refused (`echo "prefix"*`, `echo ~"/".ssh/*` DENY); literal forms (`echo '*'`, `echo 'price: $5'`) still work.
+- **Repository config is enumerated by git itself**: the main worktree's `.git/config.worktree`, every `.gitattributes` `git ls-files` reports (including inside `node_modules/`), out-of-tree `[include]` targets and repositories with more than 200 includes are refused; `protocol.ext/file.allow`, `url.*.insteadOf` and `remote.*.vcs` are rejected by the scanner and neutralised in the child env.
+- **The read boundary covers Grep/Glob and Bash**: the hook matcher is catch-all, `Grep`/`Glob` `path` is confined to the repo and checked against the secret list, and a Bash command that references `.env`/`id_rsa`/`.ssh/`/`credentials`/`.npmrc`/`.git-credentials` is refused (previously only the `Read` tool was protected).
+- **fix mode refuses the runner/CI/hook configuration files** (`.husky/**`, `.github/actions/**`, `.gitlab-ci.yml`, `Jenkinsfile`, `Makefile`, `justfile`/`Taskfile`, `.pre-commit-config.yaml`, `.devcontainer/**`, `.cargo/config(.toml)`, `.circleci/**`, `.npmrc`); `package.json` only when the written content adds an install hook.
+- **The policy fingerprint covers the hook's two tables** (`PROTECTED_WRITE`/`SECRET_READ` moved into `shell-guard.js` and hashed), so a hook-only policy change trips the stale-policy check.
+
+**v1.18.6 structure and residuals**
+
+- **One git-hardening table**: the child env, the server's own `-c` list and the scanner's keys are generated from `GIT_HARDENING`, and a load-time assertion refuses to start if a key protected for the server/scanner is not also pinned in the child env.
+- **One containment implementation**: `realpathNearest`/`repoRelative`/`isInsideRepo(..., {allowRoot})` live in `src/shell-guard.js` and are shared by the hook, the guard and the repository-metadata reader.
+- **Recursive-scan read boundary**: `rg --hidden/--no-ignore/-u/--unrestricted` and recursive `grep -r/-R` rooted at the repository are refused (they read ignored secrets); scoped searches (`rg -n x src`) stay allowed.
+- **Fail-closed scanner**: an unparseable `.git/config` or an attribute enumeration that cannot run (corrupt index) refuses the review instead of noting it.
+- **`package.json` Edit/MultiEdit** are checked for install hooks too (the result file is reconstructed, so a two-step rename cannot smuggle one in).
+- **The fingerprint covers the inline rule code**, so a rule-only upgrade also trips the stale-policy check.
+- **Lockfile**: the 94 tarball URLs move from `registry.npmmirror.com` to `registry.npmjs.org` (same paths and integrity hashes).
+
+**v1.18.7 boundaries (re-check + final audit)**
+
+- **`find` long options match both spellings**: GNU find's historical single-dash long options (`-files0-from`) and the double-dash form (`--files0-from`, `--files0`) are all denied, including abbreviations.
+- **`find -D` / `-O`**: only a debugopts value (letters/commas) or a level (digits) is consumed; any other following token is a start path and is checked (`find -D /etc` and `find -O /etc` used to enumerate a host directory).
+- **Self-review protects the whole guard/spawn pipeline**: `src/*.js`, `scripts/pre-tool-hook.js`, `scripts/init.mjs`, `scripts/lib/**` and `assets/skills/**` can no longer be written in fix mode — editing `src/index.js` or `src/claude.js` would disarm every later run just like editing the hook.
+- **The hook fails closed on a payload it cannot judge**: malformed JSON, an empty stdin, a non-object or a missing `tool_name` now denies (it used to exit 0); a parsed payload naming a tool the hook does not police still passes, because those are governed by the server allowlist.
+- **Node >= 20**: the declared runtime floor, the CI matrix (20/22/24) and the README badge agree; a pack-test assertion keeps them in step.
+
 
 Redirection (including `2>/dev/null`) stays fully refused: it is the read/write primitive that bypasses the allowlist, and allowing it would require proving every destination harmless. Let the command write to stdout instead.
 

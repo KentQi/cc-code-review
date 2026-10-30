@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.18.7 — 2026-10-30
+
+Closes the re-check of 1.18.6 (R-1/R-2/R-3/N-1) and the final audit of PR #5/#6 (1 P1 + 6 P2 + 5 P3). No new feature; behaviour changes at the end.
+
+- **[P1] `find --files0-from` bypass.** GNU find's historical long options are single-dash (`-files0-from`), and the new abbreviation matcher only applied to `--` table entries: `find -files0-from` was denied while `find --files0-from` / `find --files0` were allowed and dumped a host file's text into stderr (and the report). The deny table now lists both spellings and `denyReasonIn()` matches a single-dash long name against both the `-` and `--` word forms.
+- **[R-1] `find -D` / `-O`.** The guard skipped the token after them as "their value", but `-D` takes debugopts (letters/commas) and `-O` a level (digits); any other token is a START PATH. `find -D /etc` and `find -O /etc` therefore enumerated a host directory on GNU find. Only a value-shaped token is consumed now.
+- **[R-2] Self-review protects the whole guard/spawn pipeline.** `PROTECTED_WRITE` covered only the hook and shell-guard, while editing `src/index.js` (spawns the reviewer), `src/claude.js` (builds the child git env), `src/prompt.js` (renders the permission rules) or `src/skill.js` (writes the installed skill) disarms every later run just as effectively. `src/*.js`, `scripts/pre-tool-hook.js`, `scripts/init.mjs`, `scripts/lib/**` and `assets/skills/**` are protected in both layers; ordinary source and docs stay editable. Fixing this package in fix mode is a manual-edit job by design.
+- **[N-1] The hook fails closed on a payload it cannot judge.** Malformed JSON, empty stdin, a non-object or a missing `tool_name` used to `exit(0)` (allow), contradicting the hook's own contract; all of them deny now. A parsed payload naming a tool the hook does not police still passes — those are governed by the server allowlist and denying them would break every run.
+- **[R-3] Runtime floor, CI matrix and badge agree.** Node 18 is EOL: `engines` is `>=20`, the CI matrix is 20/22/24 (committed as `.github/workflows/ci.yml`), both READMEs say ≥20, and a pack-test assertion fails if the three drift apart.
+- **P2 refactors (from the PR #5/#6 audit):** the redundant `tilde` array is gone (derived from `unquoted`); `writeGuardSettings()` reuses `ensureOwnedPrivateDir()` instead of a second copy; `GIT_HARDENING`'s `env`/`args` booleans collapse to one `harden` flag (they could never legitimately differ — the drift that produced P0-1); `looksLikeLaunchAck`/`launchAckBody` share one `ackShape()`; the hook computes containment once instead of calling `repoRelative()` and then `isInsideRepo()` on the same path.
+- **P2/P3 single-source honesty:** the prompt.js comment no longer claims the hook imports the glob table (it never did) — the two layers are kept aligned by a cross-layer test that asserts, for 21 protected paths, hook DENY and permission-glob coverage; the `.pre-commit-config.yml` spelling was added to the globs; `GIT_HARDENING` and `reportContractSource()` are no longer dead exports (the table is asserted by the self-test, a degraded report contract surfaces as a run warning).
+- **Docs:** README test counts refreshed (shell-guard 320, p0 238, audit-fixes 318), the `baseRef` row no longer says illegal characters are ignored (they are rejected), the English README gains the 1.18.5/1.18.6/1.18.7 security sections it was missing, and the audit documents carry the required frontmatter.
+- Suites: shell-guard 320, audit-fixes 318, p0-regression 238, validation 30, pack 52, cross-cases 154/154, smoke PASS — `npm test` green (7 suites).
+- **Behaviour changes:** `find --files0-from` / `--files0` and `find -D|-O <path>` are refused; fix mode can no longer edit this package's own `src/*.js` / hook / init / lib / assets; malformed hook payloads deny; Node 20+ is required; restart the MCP host (policy fingerprint changed).
+
 ## 1.18.6 — 2026-10-30
 
 Closes the residuals left by 1.18.5 (audit P2-1, P2-3, P2-22 and the documented P1-4/P1-13 gaps). No new feature; the behaviour changes are listed at the end.

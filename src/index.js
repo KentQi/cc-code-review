@@ -36,7 +36,7 @@ import {
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt, buildNativeCommand, buildNativeAppendix,
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools, postPROnlyTools,
-  deriveReviewLevel, validateBaseRef, FLEET_NUMBERS,
+  deriveReviewLevel, validateBaseRef, FLEET_NUMBERS, reportContractSource,
 } from "./prompt.js";
 
 /**
@@ -2315,7 +2315,12 @@ registerTool(
     const budgetUnsupportedNote = typeof maxBudgetUsd === "number" && maxBudgetUsd > 0 && !budgetFlagSupported
       ? `⚠ maxBudgetUsd=${maxBudgetUsd} was requested but this claude CLI does not advertise --max-budget-usd, so NO spend cap is enforced for this run. Upgrade claude or rely on timeoutMinutes/maxTurns.`
       : "";
-    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote, provenanceNote, budgetUnsupportedNote, flagProbeNote, skillRefreshNote, pipelineNote].filter(Boolean).join("\n\n");
+    // P3: a report contract that fell back to the built-in copy is a silent
+    // format change for the caller — say so instead of keeping the accessor dead.
+    const reportContractNote = reportContractSource() === "skill"
+      ? ""
+      : "⚠ the bundled code-review SKILL.md could not be read, so the report contract fell back to the built-in copy; the report format may differ from this build's asset.";
+    const warnings = [guardSetupNote, repoWarning.trim(), gitProgramNotes.trim(), denialNote, guardNote, chainNote, fixNote, gwNote, provenanceNote, budgetUnsupportedNote, flagProbeNote, skillRefreshNote, pipelineNote, reportContractNote].filter(Boolean).join("\n\n");
 
     const meta = {
       status: status2,

@@ -1,3 +1,10 @@
+---
+title: cc-code-review PR #1–#4 审计报告（第三轮）
+version: v1.18.4
+created: 2026-10-30
+status: final
+---
+
 # cc-code-review — PR #1–#4（1.18.1 → 1.18.4）原子级多专家并行审计报告
 
 > **审计对象**：`https://github.com/KentQi/cc-code-review` 的 4 个 stacked PR
@@ -618,3 +625,43 @@ $ bash -c 'echo "/Users/kent/.ssh/"*'
 ## 3. 复核方法
 
 同一批探针脚本重跑：`/tmp/acr5/rev2.mjs`（P0-2..P0-6、P1-1、P1-2、P1-14）、`rev3.mjs`（P1-1 修正 fixture、P0-2/P0-3 带可执行目标、P1-3..P1-8）、`rev4.mjs` 及 `out/rev*.txt`（真实 hook / 真实 git / 真实 `buildClaudeEnv()` / 真实 `buildReviewPrompt`）。所有 P0 均以"真实产品代码 + 真实 git + 真实 spawned hook 进程"复测，不依赖阅读代码。
+
+
+# 复核记录 二 — 2026-10-30（第二轮修复后，v1.18.6）
+
+> 上次复核(10:18–10:22)之后源码又改过一轮(`src/shell-guard.js` 10:52、`src/claude.js` + `scripts/pre-tool-hook.js` 11:03、`scripts/{audit-fixes,p0-regression}-test.mjs` 11:04)。本轮用**同一批探针**复测 4 项残留 + 对 15 条已修项做回归。
+> 门禁:`npm test` → **7 passed / 0 failed / exit 0**(143.1 s,断言 155 条 PASS);PASS 行数 755 → 809 → **821**,无回归。
+
+## 1. 本轮修好的
+
+| 项 | 修复 |
+|---|---|
+| **R-4**（P2-21） | `src/claude.js:1859` 改为 `ensureOwnedPrivateDir(dir, "subagents")`;该函数实现完整:`mkdirSync(0700)` → `lstatSync` → 拒符号链接 → 拒非目录 → 拒非本 uid → `chmodSync(0700)`。注释直接引用 P2-21 |
+| **P2-3** | 5 份 containment 原语收敛为 1 份:`scripts/pre-tool-hook.js:53-61` 现在从 `src/shell-guard.js` import `PROTECTED_WRITE` / `isSecretPath` / `repoRelative` / `isInsideRepo`,`PROTECTED_WRITE` 与 `SECRET_READ` 两张表本身也搬进了 `shell-guard.js`。此前"guard 判仓库根为 inside、hook 判 outside"的分叉消失 |
+| 打包门禁 | `scripts/pack-test.mjs` 新增 `package-lock.json version matches package.json` 等断言 |
+
+## 2. 仍开放的 3 项(实测可复现)
+
+| # | 位置 | 实测 |
+|---|---|---|
+| **R-1** | `src/shell-guard.js:709` | `if (t === "-D" || t === "-O") { i++; continue; } // their value` —— 注释里的前提是**错的**:GNU find 的 `-D`(debug)与 `-O`(no-dereference)都是**不带参数**的全局选项,所以被 `i++` 跳过的那个 token 正是**搜索路径**。实测 `find -D /etc` → **ALLOW**、`find -O /etc` → **ALLOW**(而 `find /etc`、`find -- /etc`、`find -O3 /etc`、`find -DL /etc` 均 DENY)。**仅 Linux/GNU find 有效**(macOS BSD find 报 `illegal option -- D`),二进制层行为本机无法验证 |
+| **R-2** | `src/shell-guard.js:529-531` | `PROTECTED_WRITE` 末尾只保护 `scripts/pre-tool-hook.js` 与 `src/shell-guard.js` 两个,注释明写 "Root-anchored on purpose — **other src/\* files stay editable**"。实测自审场景:`src/claude.js`、`src/index.js`、`src/prompt.js`、`src/skill.js`、`src/version.js`、`scripts/init.mjs`、`scripts/lib/mcp-client.mjs` **全部 ALLOW**。host 执行的是 `node <pkg>/src/index.js`,改 `src/index.js` 或 `src/claude.js`(子进程 git 环境构建者)同样能让后续所有 run 卸防——SEC-15 的承诺目前只成立一半 |
+| **R-3** | `.github/workflows/ci.yml:23` | 该文件 **mtime 仍是 10-29 14:48(从未改动)**。矩阵 `node: [20, 22, 24]` vs `package.json:59` `"node": ">=18.19"` vs `README.md:5` 徽章 `node ≥18.19` 三者不一致;声明支持的最低运行时没有任何 CI 任务覆盖(Node 18 已于 2025-04-30 EOL) |
+
+## 3. 本轮新暴露的一项(上一轮**漏报**)
+
+| # | 位置 | 问题 |
+|---|---|---|
+| **N-1** | `scripts/pre-tool-hook.js:232` | hook 对**无法解析**或**不认识**的 payload 仍然 fail-open:`catch { process.exit(0); } // not our payload shape`。实测(真实 hook 进程):`not json at all` / 空 stdin / `[]` / `null` / 尾部多余垃圾 / `{"tool_name":"SomeNewTool"}` / 无 `tool_name` —— **7 种输入全部 exit=0、无决策 = ALLOW**。对照:`Bash` 缺 command / command 为 null / command 为数字 三种都 **DENY**(`SEC-24` 的修复是对的)。这违反 hook 自己的契约(文件头):"**Unexpected internal errors deny as well — a broken guard must fail closed**";也违反第 214 行那条显式 fail-closed 检查的意图(注释写"fail closed for every payload shape, **including one we would otherwise treat as not-ours and pass through**"——但 parse 失败发生在那条检查之后并直接 exit 0)。**放大因素**:服务端自测 `guardSelfTestProbe()` 用**硬编码**的 payload 形状,所以 CLI 若改变信封形状,自测仍会绿、服务器仍报"guard verified",而真实调用全部 fail-open。**诚实标注实际暴露面**:受服务器 `--allowedTools` 白名单约束,且信封改名反而会让已知工具分支 fail-closed。所以这是**契约违背 + 纵深防御缺口**,不是可直接利用的绕过。上一轮由对抗式红队角度提出(A13-F7,P2),但**在汇总 51 条时被丢了**——本轮补上。 |
+
+## 4. 15 条已修项的回归复测
+
+全部仍成立,无回归:P0-1(ext:: 被 transport 挡住、标记文件未创建)、P0-2 / P0-3(两个 textconv 布局均返回 refusal、驱动未执行)、P0-4 / P0-5 / P0-6 / P0-7(guard 侧全部 DENY)、P1-1(越界 include refusal)、P1-2(`find --` DENY)、P1-3(11 个持久化文件 DENY、`package.json` 带 install hook 被 DENY)、P1-4(Read 与 Bash 两侧都 DENY)、P1-5(matcher `.*`、越权 Grep/Glob DENY)、P1-6(`scope=auto` 现在 1 行)、P1-7(先 settle 后盖章)、P1-8(`files` 含 `scripts/init.mjs`)。
+
+## 5. 门禁的诚实记录
+
+`npm test` 全绿,但**本轮开放的 R-1 / R-2 / R-3 / N-1 没有一条被门禁覆盖**:
+- R-1:`find -D` / `-O` 的形态无断言(且 macOS runner 上 `find -D` 根本不存在,只有 Linux runner 能测)。
+- R-2:`src/claude.js` / `src/index.js` 可写**是设计选择**(注释写明),不是漏网——但它与 SECURITY.md 里"自审也不能卸防"的承诺不一致。
+- R-3:门禁不检查 `engines` 与矩阵的一致性。
+- N-1:hook 的 payload 形状无断言,自测用的是硬编码形状,天然无法发现信封漂移。

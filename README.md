@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/KentQi/cc-code-review/actions/workflows/ci.yml/badge.svg)](https://github.com/KentQi/cc-code-review/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Node](https://img.shields.io/badge/node-%E2%89%A518.19-brightgreen)
+![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)
 
 [English](README.en.md) | 简体中文
 
@@ -20,7 +20,7 @@ ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --
 
 ## 前置条件
 
-- Node ≥ **18.19**（本机用 `C:\Program Files\nodejs\node.exe` 启动）
+- Node ≥ **20**（CI 矩阵 20/22/24；Node 18 已 EOL，不再声明支持）
 - 已安装 Claude Code。**无需 OAuth 登录**，三种接入方式均可：
   - **CC Switch / claude-code-router 等网关**：配置写在 `~/.claude/settings.json` 的 `env` 块，claude 每次启动自行读取（同名键 settings 覆盖进程环境变量），所以切换供应商对下一次 review 立即生效。本 MCP 会对**本地回环网关**（127.0.0.1 等）做 TCP 预检，网关挂了会立刻报"gateway not reachable"而不是干等到超时；本地网关流量不会走 HTTP 代理（自动补 `NO_PROXY`）。
   - **官方账号登录（OAuth/Pro/Max）**：首次需在终端交互式跑一次 `claude` 完成登录，之后 headless 直接可用。注意：若 MCP 宿主以服务/计划任务方式运行且读不到当前用户凭证（Windows Credential Manager / macOS Keychain），会报 "Not logged in"。
@@ -85,7 +85,7 @@ npm run init
 | `repoPath` | 必填 | - | 被审查仓库的绝对路径（支持 `~/` 前缀） |
 | `scope` | `auto` | 5 选 1 | `auto` / `pr` / `branch` / `working-dir` / `last-commit`；auto 按 PR → 领先默认分支的提交 → 未提交改动 → 上一条提交 自动判断 |
 | `pr` | - | - | GitHub PR 编号或 URL |
-| `baseRef` | - | 纯 ref 字符 | `branch` 范围的基线（缺省自动探测默认分支；非法字符会被忽略） |
+| `baseRef` | - | 纯 ref 字符 | `branch` 范围的基线（缺省自动探测默认分支；**非法字符/修订范围会在评审前被拒绝**，见下文） |
 | `focus` | - | - | 额外关注点（仅作为评审提示，不会被当作指令执行；**必须单行**） |
 | `outputLanguage` | `中文` | - | 报告语言 |
 | `postToPR` | `false` | - | 额外用 `gh pr comment` 把摘要贴回 PR（默认只返回报告，不外发）。**必须同时给 `pr`**：没有具名 PR 时预检直接拒绝（否则会带着一个无处可写的 GitHub 写权限，且提示词会要求模型猜一个 PR 号） |
@@ -162,7 +162,7 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 > ⚠️ **`--settings` 替换的是整个 `hooks` 键**：注入的临时文件里只有本 MCP 的 hook，用户 `~/.claude/settings.json` 里自己配置的 hooks 在**本次子进程内不会生效**（其它键如 `env`、`model`、`permissions` 不受影响）。这是 CLI 的行为，不是遗漏——如果你依赖自己的 hook 在 review 期间运行，目前需要另想办法。
 
-**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs`（238 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）与 `scripts/p0-regression-test.mjs`（95 条：2026-10 多专家审计的全部 P0 形态——ANSI-C 引用/反斜杠转义/紧贴短选项、`.GIT` 大小写变体、fix 模式持久化路径、仓库自带 git driver 的 RCE 形态、符号链接冻结）锁定——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
+**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs`（320 条）、`scripts/p0-regression-test.mjs`（238 条：2026-10 各轮审计的全部 P0 形态——ANSI-C 引用/反斜杠转义/紧贴短选项、`.GIT` 大小写变体、fix 模式持久化路径、仓库自带 git driver 的 RCE 形态、符号链接冻结、`config.worktree`、`node_modules` attributes、hook 的 fail-closed payload 形状）与 `scripts/audit-fixes-test.mjs`（318 条）锁定——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
 
 重定向（含 `2>/dev/null`）仍然整体拒绝：它是绕过 allowlist 的读写原语，改成"允许读重定向"需要先证明每个目标路径都无害，代价大于收益。需要看输出就直接让命令写到 stdout。
 
@@ -184,6 +184,13 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 - **`package.json` 的 Edit/MultiEdit** 同样检查 install 钩子（此前只查 Write）。
 - **策略指纹**现在覆盖内联规则函数的源码：只改规则、不改表的升级也会触发 stale-policy 拒绝。
 - **lockfile** 的 94 个 tarball URL 从 `registry.npmmirror.com` 改为 `registry.npmjs.org`（路径与 integrity 不变）。
+**v1.18.7 边界（复核 + 最终审计）**
+
+- **`find` 的长选项两种拼写都拒**：GNU find 历史单横线长选项（`-files0-from`）与双横线形式（`--files0-from`、`--files0`）全部拒绝，含无歧义缩写。
+- **`find -D` / `-O`**：只吞 debugopts（字母/逗号）或 level（数字）值，其它后续 token 都是搜索路径并参与校验（`find -D /etc`、`find -O /etc` 此前可枚举宿主目录）。
+- **自审保护整条 guard/spawn 管线**：`src/*.js`、`scripts/pre-tool-hook.js`、`scripts/init.mjs`、`scripts/lib/**`、`assets/skills/**` 在 fix 模式下不可写——改 `src/index.js` 或 `src/claude.js` 与改 hook 一样能让后续所有 run 卸防。
+- **hook 对无法判定的 payload fail-closed**：非法 JSON、空 stdin、非对象、缺 `tool_name` 一律拒绝（此前 exit 0）；解析成功但属于 hook 不负责的工具仍放行（那些由服务端 allowlist 管）。
+- **Node ≥ 20**：声明的最低运行时、CI 矩阵（20/22/24）与 README 徽章一致，并由 pack-test 断言锁住。
 
 hook 还有第二条确定性规则：**git 的 `--output=` / `--output-directory=` 会让"只读"命令写文件**（`git diff/show/log --output=<file>`、`git format-patch --output-directory=` 实测都会落盘；`--output-to=` 不是真实旗标）。deny glob 对这条无能为力——Bash 规则是整条命令前缀匹配，`Bash(git diff --output=*)` 拦不住 `git diff HEAD --output=x`，而中间带 `*` 的规则语义无法从 CLI 外验证——所以这一条由 hook 直接判掉。注意 `grep --output`、`find -print` 等非 git 的 `--output` 不受影响。
 

@@ -270,5 +270,24 @@ try {
   fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
+
+/* ---- R-3: the declared runtime floor must be the one CI tests ---- */
+// The audit found engines >=18.19, a CI matrix [20,22,24] and a README badge
+// that disagreed. All three are asserted here so a future bump cannot land in
+// one place only.
+{
+  const floor = String(pkg.engines?.node || "");
+  const floorMajor = (floor.match(/(\d+)/) || [])[1];
+  const ci = fs.readFileSync(path.join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
+  const matrixLine = (ci.match(/node:\s*\[([^\]]+)\]/) || [])[1] || "";
+  const matrix = matrixLine.split(",").map((s) => s.trim()).filter(Boolean).map(Number);
+  check("R-3: engines declares a minimum node", Boolean(floorMajor), true);
+  check("R-3: the CI matrix tests the declared minimum", matrix.includes(Number(floorMajor)), true);
+  for (const f of ["README.md", "README.en.md"]) {
+    const readme = fs.readFileSync(path.join(ROOT, f), "utf8");
+    const badge = /badge\/node-%E2%89%A5(\d+)/.exec(readme);
+    check("R-3: " + f + " badge matches engines", badge ? badge[1] : null, floorMajor);
+  }
+}
 console.log(`\n${failures.length === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

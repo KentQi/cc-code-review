@@ -1,3 +1,10 @@
+---
+title: 修复报告（第四轮）
+version: v1.18.4
+created: 2026-10-30
+status: final
+---
+
 # 修复报告（第四轮）— v1.18.4
 
 **基线**：v1.18.3（`audit/TRIAGE.md` 里 13 条 🟢 + 37 条 🟡 + 1 条部分）

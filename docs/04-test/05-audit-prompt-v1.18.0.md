@@ -1,3 +1,10 @@
+---
+title: 首轮审计 · 提示词视角
+version: v1.18.0
+created: 2026-10-29
+status: final
+---
+
 # 04 — 提示词与流水线行为审计（prompt.js / skill.js / version.js）
 
 - **审计对象**：cc-code-review MCP server v1.18.0，`/Users/kent/Desktop/projects/cc-code-review_MCP`

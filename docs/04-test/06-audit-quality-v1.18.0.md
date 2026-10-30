@@ -1,3 +1,10 @@
+---
+title: 首轮审计 · 质量视角
+version: v1.18.0
+created: 2026-10-29
+status: final
+---
+
 # 05 — 测试与工程质量审计（scripts/ + 发布配置）
 
 审计对象：cc-code-review v1.18.0（`package.json:3`）。范围：`scripts/` 全部 12 个脚本、`package.json`、`CONTRIBUTING.md`、`SECURITY.md`、`CHANGELOG.md`（测试/发布相关）。全程只读 `src/`/`scripts/`，未联网、未运行任何付费脚本。

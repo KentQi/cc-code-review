@@ -1,6 +1,13 @@
+---
+title: cc-code-review 首轮审计报告（五专家）
+version: v1.18.0
+created: 2026-10-29
+status: final
+---
+
 # cc-code-review MCP v1.18.0 — 多专家审计总报告
 
-> **状态更新（2026-10-29 晚）**：本报告的 **9 条 P0 与 12 条 P1 已修复并发布为 v1.18.1**，`npm test` 从红（230/3）转为绿（6 套件全过）。修复明细、回归证据与未修项见 [FIXES.md](FIXES.md)。 PR：[#1](https://github.com/KentQi/cc-code-review/pull/1)（未合并）。下文保留审计当时的原始结论，作为问题记录与验收依据。
+> **状态更新（2026-10-29 晚）**：本报告的 **9 条 P0 与 12 条 P1 已修复并发布为 v1.18.1**，`npm test` 从红（230/3）转为绿（6 套件全过）。修复明细、回归证据与未修项见 [FIXES.md](11-fix-round1-v1.18.1.md)。 PR：[#1](https://github.com/KentQi/cc-code-review/pull/1)（未合并）。下文保留审计当时的原始结论，作为问题记录与验收依据。
 >
 > **更正一条**：本报告 L2/L11/Q3 的"仓库没有任何 CI"是**本地工作副本缺 `.github/` 等点文件**造成的假象——上游仓库本来就有 `.github/workflows/ci.yml`。该结论作废。但实际情况并不更好：1.18.0 的 main 上 **CI 六个 job 全红**（macOS 3 红、Ubuntu 2 红、Windows 1 红，正是本报告 L1 的 realpath bug 与两条平台不可移植用例），红色 badge 被忽略了。本次已修掉这些失败，并把 `p0-regression` 加进 CI。
 
@@ -39,8 +46,8 @@
 **验证状态**：所有 P0 与多数 P1 由 Lead 独立复现（不是采信专家结论）。每条标注 `[已实测]` / `[代码路径确认]` / `[仅静态]`。
 
 明细文件：
-- [00-lead-empirical.md](00-lead-empirical.md) — Lead 的 16 条实证（L1–L16）
-- [01-security.md](01-security.md) · [02-protocol.md](02-protocol.md) · [03-runtime.md](03-runtime.md) · [04-prompt.md](04-prompt.md) · [05-quality.md](05-quality.md)
+- [00-lead-empirical.md](07-audit-lead-empirical-v1.18.0.md) — Lead 的 16 条实证（L1–L16）
+- [01-security.md](02-audit-security-v1.18.0.md) · [02-protocol.md](03-audit-protocol-v1.18.0.md) · [03-runtime.md](04-audit-runtime-v1.18.0.md) · [04-prompt.md](05-audit-prompt-v1.18.0.md) · [05-quality.md](06-audit-quality-v1.18.0.md)
 
 ---
 

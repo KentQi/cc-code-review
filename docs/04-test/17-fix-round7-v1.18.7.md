@@ -37,7 +37,7 @@ status: final
 | P3-6.3 | P3 | README 测试计数过期（238/95） | 更新为 320 / 238 / 318 |
 | P3-6.4 | P3 | README.en.md 缺 1.18.5/1.18.6 安全边界 | 补英文 1.18.5 / 1.18.6 / 1.18.7 三节 |
 | P3-6.5 | P3 | README 说 baseRef 非法字符「会被忽略」，代码是硬拒 | 文案改为「评审前拒绝」 |
-| P3-6.6 | P3 | 5 份新审计文档缺 frontmatter | 补齐 YAML frontmatter（title/version/created/status） |
+| P3-6.6 | P3 | 审计文档违反 `CLAUDE-PROJECT-RULES` §四（无 frontmatter、不在 `/docs/`、命名不合规） | **完整合规**：19 份文档 `git mv` 到 `docs/04-test/NN-类型-主题-vX.Y.md`，补 YAML frontmatter，重写跨文档引用，新增 `docs/README.md` 索引与旧路径映射；`audit/` 只留指针（规则 §四.1/2/3/7） |
 | P3-6.7 | P3 | `.env.example` 在权限层与 hook 层不一致且未文档化 | 代码注释说明这是有意的 over-block，并由 p0 断言锁定 |
 
 ## 验证

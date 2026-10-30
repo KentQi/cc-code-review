@@ -12,7 +12,7 @@
  * while every checkout test stays green.
  *
  * It also locks the inverse: the published tarball must NOT ship the test,
- * paid, or audit material (~190KB of scripts/ plus audit/).
+ * paid, or audit material (~190KB of scripts/ plus docs/04-test/).
  *
  * Three layers, so a green here means something:
  *   1. package.json#files is exactly the reviewed list (no silent widening).
@@ -91,7 +91,7 @@ const FORBIDDEN_IN_TARBALL = [
   "scripts/paid-smoke.mjs",
   "scripts/e2e-test.mjs",
   "scripts/lib/mcp-client.mjs",
-  "audit/TRIAGE.md",
+  "docs/04-test/18-triage-p2-p3-v1.18.4.md",
 ];
 
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));

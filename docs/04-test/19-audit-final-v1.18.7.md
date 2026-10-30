@@ -83,7 +83,7 @@ status: final
 
 ## 7. 证据文件
 
-- 第三轮审计报告：audit/2026-10-30-pr1-4-audit.md（577 行，51 条）
-- 各轮修复记录：audit/FIXES.md、FIXES-round2.md、FIXES-round3.md、FIXES-round4.md、FIXES-round5.md、FIXES-round6.md
-- 存量 triage：audit/TRIAGE.md
-- 第一/二轮审计：audit/AUDIT-REPORT.md、audit/2026-10-29-atomic-audit.md 与 01–05 专家报告
+- 第三轮审计报告：`docs/04-test/09-audit-pr1-4-v1.18.4.md`（577 行，51 条）
+- 各轮修复记录：`docs/04-test/11-fix-round1-v1.18.1.md` … `17-fix-round7-v1.18.7.md`
+- 存量 triage：`docs/04-test/18-triage-p2-p3-v1.18.4.md`
+- 第一/二轮审计：`docs/04-test/01-audit-cc-code-review-v1.18.0.md`、`08-audit-atomic-v1.18.2.md` 与 02–06 专家报告

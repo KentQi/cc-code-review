@@ -1,3 +1,10 @@
+---
+title: 首轮审计 · 运行时视角
+version: v1.18.0
+created: 2026-10-29
+status: final
+---
+
 # 运行时与进程管理审计 — `src/claude.js`（v1.18.0）
 
 - 审计对象：`src/claude.js`（1984 行，全部通读）+ 必要时对照 `src/index.js` 的调用点（仅用于判定影响，未审计 index.js 本身）

@@ -1,3 +1,10 @@
+---
+title: PR #5/#6 最终审计报告
+version: v1.18.6
+created: 2026-10-30
+status: final
+---
+
 # 最终审计报告 — PR #5 / PR #6（v1.18.5 + v1.18.6）
 
 - **审计对象**：`KentQi/cc-code-review`
@@ -217,9 +224,9 @@ PR #6 把整段 1.18.5/1.18.6 安全叙事（`GIT_HARDENING` 单表、`rg --hidd
 
 参数表写 `baseRef`「非法字符会被忽略」，而 `src/index.js:1895-1896` 是硬拒：`if (!baseRefCheck.ok) return err(baseRefCheck.error);`。同一份 README 在 132 行后又自相矛盾（「因此直接拒绝而不是"忽略"」），英文孪生 `README.en.md:90` 正确地写 "illegal characters rejected"。按中文 README 行事的调用方传 `baseRef="release 1.2"` 会得到评审前拒绝，而非文档承诺的静默回退。
 
-### 6.6 新增的 5 份 audit 文档违反 `CLAUDE-PROJECT-RULES.md` §四（R3） — `audit/FIXES-round6.md:1`
+### 6.6 新增的 5 份 audit 文档违反 `CLAUDE-PROJECT-RULES.md` §四（R3） — 现 `docs/04-test/16-fix-round6-v1.18.6.md:1`
 
-`/Users/kent/.claude/CLAUDE-PROJECT-RULES.md` §四.2 规定命名 `NN-类型-主题-vX.Y.md`，§四.3 规定「头部必带 YAML frontmatter(title / version / created / status)」，§四.1 规定文档统一在 `/docs/`；R3 机检这条。PR #5/#6 新增 `audit/2026-10-30-pr1-4-audit.md`、`audit/FINAL-AUDIT-REPORT.md`、`audit/FIXES-round4.md`、`audit/FIXES-round5.md`、`audit/FIXES-round6.md`——均无 frontmatter、均不匹配命名式、仓库无 `/docs/` 树。代价：本 PR 赖以论证「closes P0-1 / P1-4 / …」的审计轨迹对机检的文档契约不可见。
+`/Users/kent/.claude/CLAUDE-PROJECT-RULES.md` §四.2 规定命名 `NN-类型-主题-vX.Y.md`，§四.3 规定「头部必带 YAML frontmatter(title / version / created / status)」，§四.1 规定文档统一在 `/docs/`；R3 机检这条。PR #5/#6 新增 `docs/04-test/10-audit-pr5-6-v1.18.6.md`、`docs/04-test/10-audit-pr5-6-v1.18.6.md`、`docs/04-test/10-audit-pr5-6-v1.18.6.md`、`docs/04-test/10-audit-pr5-6-v1.18.6.md`、`docs/04-test/10-audit-pr5-6-v1.18.6.md`——均无 frontmatter、均不匹配命名式、仓库无 `/docs/` 树。代价：本 PR 赖以论证「closes P0-1 / P1-4 / …」的审计轨迹对机检的文档契约不可见。
 
 ### 6.7 `.env.example` 在两层不一致（有意但未文档化到代码层） — `src/prompt.js:531` vs `src/shell-guard.js:562`
 

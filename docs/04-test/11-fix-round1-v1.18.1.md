@@ -1,3 +1,10 @@
+---
+title: 修复报告（第一轮）
+version: v1.18.1
+created: 2026-10-29
+status: final
+---
+
 # 修复报告 — cc-code-review v1.18.1
 
 **基线**：v1.18.0（`npm test` 红：shell-guard 230/3，无 CI）
@@ -86,7 +93,7 @@
 **已在 1.18.2 修复**：P1-10（scope=pr 缺 pr，预检拒绝）。
 
 **P2/P3 未动**：审计报告的 ~45 条 P2 与 ~45 条 P3 基本保持原状，其中建议优先处理：
-1. `repoRunsGitPrograms` 仍以"驱动被 attributes 引用才拒绝"为策略——虽然扫描截断已 fail-closed，但更稳的做法是 `[diff|filter]` 段的命令行一律拒绝，或改用 `git config --list -z` / `git check-attr`（见 audit/03-runtime.md R-2/R-3 建议）。
+1. `repoRunsGitPrograms` 仍以"驱动被 attributes 引用才拒绝"为策略——虽然扫描截断已 fail-closed，但更稳的做法是 `[diff|filter]` 段的命令行一律拒绝，或改用 `git config --list -z` / `git check-attr`（见 docs/04-test/04-audit-runtime-v1.18.0.md R-2/R-3 建议）。
 2. Windows 上"父进程已退出 + 后代持 pipe"目前会等 deadline 才 settle（报告不丢，只是延迟）；建议补 post-exit grace 或 Job Object。
 3. `scripts/init.mjs` 的 gateway 探测仍会在不可达时打印原因（已脱敏 URL，但错误文本可能含主机信息，属可接受）。
 4. 递归 `.gitattributes` 扫描是同步的（普通仓 20–130ms，超大 monorepo 可能到秒级），长期应改异步/缓存。

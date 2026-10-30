@@ -53,7 +53,7 @@ Third audit of the stacked PRs (#1–#4): 7 P0 / 14 P1 / 22 P2 / 8 P3, every P0 
 
 ## 1.18.4 — 2026-10-29
 
-Clears the remaining P2/P3 backlog (the triage in `audit/TRIAGE.md`): the guard-policy holes, the runtime/protocol rough edges, prompt/playbook consistency, and the test/packaging debt. No behaviour change in the happy path; the changes below are the ones a caller can observe.
+Clears the remaining P2/P3 backlog (the triage in `docs/04-test/18-triage-p2-p3-v1.18.4.md`): the guard-policy holes, the runtime/protocol rough edges, prompt/playbook consistency, and the test/packaging debt. No behaviour change in the happy path; the changes below are the ones a caller can observe.
 
 - **Guard policy (security-adjacent).** `git branch -u<ref>` (and `-u <ref>`, `--set-upstream`) is refused — it writes `.git/config` from a read-only review (P2-11). In fix mode the two guard files (`scripts/pre-tool-hook.js`, `src/shell-guard.js`) can no longer be written, so reviewing this package can't disarm every later run (SEC-15). Review mode now refuses to `Read` secret material inside the repo (`.env*`, `id_rsa*`, `*.pem/*.key`, `credentials`, `.ssh/.aws/.gnupg`, `.netrc`, `.pgpass`; `.env.example`-style templates stay readable) (SEC-23). A Bash payload whose `command` is not a string is denied instead of allowed (SEC-24), and `NotebookEdit` now reads `notebook_path` so fix mode can actually edit notebooks (SEC-25).
 - **Loopback detection** normalises the forms `URL.hostname` actually produces: `[::1]`, `localhost.`, zone ids and IPv4-mapped IPv6 — the local-gateway Bearer token can no longer be routed through an HTTP proxy by spelling the host differently (SEC-09).

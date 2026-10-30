@@ -28,9 +28,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 
-const guardUrl = pathToFileURL(
-  path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "shell-guard.js"),
-).href;
+// This package's root: the hook and the server always load from HERE, never from
+// the reviewed repository. Only a self-review (reviewed repo == this tree) makes
+// editing the pipeline files meaningful (audit round 8).
+const PACKAGE_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+const guardUrl = pathToFileURL(path.join(PACKAGE_ROOT, "src", "shell-guard.js")).href;
 
 const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 const READ_TOOLS = new Set(["Read"]);
@@ -58,6 +60,8 @@ const isSecretPath = guardPolicy?.isSecretPath;
 // both the relative spelling the secret checks print and the boundary decision
 // (one realpath pass; the old code recomputed the same rel via isInsideRepo).
 const repoRelative = guardPolicy?.repoRelative;
+const SELF_REVIEW_PIPELINE = guardPolicy?.SELF_REVIEW_PIPELINE;
+const isSelfReview = guardPolicy?.isSelfReview;
 
 /**
  * Info mode (CC_REVIEW_GUARD_INFO=1): print the policy fingerprint and exit.
@@ -273,7 +277,15 @@ process.stdin.on("end", async () => {
     if (/(^|\/)\.git(\/|$)/i.test(relSlash)) {
       deny(`${tool} blocked: refusing to touch .git/ — a hook written there would outlive this run`);
     }
-    const execCfg = PROTECTED_WRITE.find((re) => re.test(relSlash));
+    // Pipeline files are protected only in a self-review: in a foreign repo the
+    // running guard loads from the package install dir, so editing the repo's
+    // copy has no effect — a path-shape rule here denied fix mode its purpose
+    // (audit round 8). Fail closed if the table is missing on a self-review.
+    const selfReview = typeof isSelfReview === "function" && isSelfReview(root);
+    if (selfReview && !Array.isArray(SELF_REVIEW_PIPELINE)) {
+      deny(`${tool} blocked: this is a self-review but the guard has no pipeline policy table; refusing the tool call (fail closed)`);
+    }
+    const execCfg = [...PROTECTED_WRITE, ...(selfReview ? SELF_REVIEW_PIPELINE : [])].find((re) => re.test(relSlash));
     if (execCfg) {
       deny(`${tool} blocked: ${relSlash} is execution configuration — it runs code (or decides what runs) when the project is opened, its diff is taken, or CI starts. fix mode may edit source files, not plant persistence. Edit the source file the finding points at instead.`);
     }

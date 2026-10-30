@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyseCommand, bashAllowRules, isInsideRepo, policyFingerprint } from "../src/shell-guard.js";
-import { postPROnlyTools, FIX_PROTECTED_WRITE_GLOBS } from "../src/prompt.js";
+import { postPROnlyTools, FIX_PROTECTED_WRITE_GLOBS, FIX_SELF_REVIEW_GLOBS } from "../src/prompt.js";
 import { buildClaudeEnv, repoRunsGitPrograms, writeGuardSettings } from "../src/claude.js";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -185,12 +185,13 @@ for (const rel of [
 ]) {
   check("Write DENY: " + rel, write(rel), "DENY");
 }
-// R-2: src/*.js is the guard/spawn pipeline now, so it is DENY; ordinary
-// manifests/docs stay writable.
-for (const rel of ["package.json", "README.md", "src/.gitignore", "docs/notes.md"]) {
+// R-2 follow-up (audit round 8): in a FOREIGN repo the pipeline names are
+// ordinary source — the running guard loads from the package install dir, so
+// protecting them by path shape denied fix mode its purpose. They are DENY only
+// in a self-review (asserted further down, with ROOT as the reviewed tree).
+for (const rel of ["package.json", "README.md", "src/.gitignore", "docs/notes.md", "src/index.js", "src/app.js"]) {
   check("Write ALLOW: " + rel, write(rel), "ALLOW");
 }
-check("Write DENY (pipeline): src/index.js", write("src/index.js"), "DENY");
 
 /* ------------------------------------------------------------------ */
 /* analyseCommand unit level (fast, no spawn): the same guarantees must */
@@ -389,12 +390,13 @@ console.log("-- round-4: upstream writes, guard-file writes, secret reads, noteb
   fs.mkdirSync(path.join(REPO, "notebooks"), { recursive: true });
   fs.writeFileSync(path.join(REPO, "notebooks", "x.ipynb"), "{}\n");
 
-  /** Live hook decision + reason + exit code. */
-  const hookDetail = (toolName, toolInput) => {
+  /** Live hook decision + reason + exit code. `repoRoot` defaults to REPO so a
+   *  self-review can point the same probe at this package (audit round 8). */
+  const hookDetail = (toolName, toolInput, repoRoot = REPO) => {
     const payload = JSON.stringify({ tool_name: toolName, tool_input: toolInput, cwd: REPO });
     const r = spawnSync(process.execPath, [HOOK], {
       input: payload,
-      env: { ...process.env, CLAUDE_REVIEW_REPO_ROOT: REPO },
+      env: { ...process.env, CLAUDE_REVIEW_REPO_ROOT: repoRoot },
       encoding: "utf8",
       timeout: 20000,
       stdio: ["pipe", "pipe", "pipe"],
@@ -431,21 +433,31 @@ console.log("-- round-4: upstream writes, guard-file writes, secret reads, noteb
   check("bash ALLOW git branch -a after the upstream rule", bash("git branch -a"), "ALLOW");
   check("bash ALLOW git branch -vv after the upstream rule", bash("git branch -vv"), "ALLOW");
 
-  // SEC-15: the reviewed repository can be this very package. Writing either
-  // guard file would disarm the hook for every later run.
+  // SEC-15 + R-2 follow-up (audit round 8): guard-file protection is
+  // identity-scoped. In a foreign repo these names are ordinary source — the
+  // running hook loads from the package install dir, so a path-shape rule only
+  // broke fix mode. In a self-review writing either file disarms later runs.
   for (const rel of ["scripts/pre-tool-hook.js", "src/shell-guard.js"]) {
-    const v = writeDetail(rel);
-    check("write DENY guard file: " + rel, v.decision, "DENY");
+    check("foreign repo: write ALLOW guard-file name: " + rel, write(rel), "ALLOW");
+    const v = hookDetail("Write", { file_path: path.join(ROOT, rel) }, ROOT);
+    check("self-review: write DENY guard file: " + rel, v.decision, "DENY");
     check("  ...and explains it is execution configuration: " + rel, /execution configuration/.test(v.reason), true);
   }
   // Ordinary source stays editable in fix mode -- the deny must be exact.
-  // R-2: the whole guard/spawn pipeline is protected in a self-review — index.js
-  // spawns the reviewer, claude.js builds the child git env, prompt.js renders
-  // the permission rules, skill.js writes the installed skill. Ordinary source
-  // and docs stay editable.
-  for (const rel of ["src/index.js", "src/claude.js", "src/prompt.js", "src/skill.js", "src/version.js", "scripts/init.mjs", "scripts/lib/mcp-client.mjs", "assets/skills/code-review/SKILL.md"]) {
-    check("write DENY pipeline file: " + rel, write(rel), "DENY");
+  // R-2: the guard/spawn pipeline is protected only in a SELF-REVIEW (the
+  // reviewed tree IS this package). In a foreign repo those names are ordinary
+  // source: the running guard never loads from the reviewed repo, so blocking
+  // them bought no security and broke fix mode (audit round 8).
+  const pipelineRels = ["src/index.js", "src/claude.js", "src/prompt.js", "src/skill.js", "src/version.js", "scripts/init.mjs", "scripts/lib/mcp-client.mjs", "assets/skills/code-review/SKILL.md"];
+  for (const rel of pipelineRels) {
+    check("write ALLOW pipeline name in a foreign repo: " + rel, write(rel), "ALLOW");
   }
+  for (const rel of pipelineRels) {
+    check("write DENY pipeline file in a self-review: " + rel,
+      hook("Write", { file_path: path.join(ROOT, rel) }, ROOT), "DENY");
+  }
+  check("write ALLOW non-pipeline src file even in a self-review",
+    hook("Write", { file_path: path.join(ROOT, "src/features/new-module.js") }, ROOT), "ALLOW");
   for (const rel of ["src/features/new-module.js", "docs/notes.md", "tests/example.test.js"]) {
     check("write ALLOW ordinary source: " + rel, write(rel), "ALLOW");
   }
@@ -531,7 +543,7 @@ console.log("-- P1-3 fix mode cannot write a git hook");
 for (const rel of [".husky/pre-commit", ".husky/_/husky.sh"]) {
   check("Write DENY: " + rel, write(rel), "DENY");
 }
-check("Write DENY after the hook rule: src/index.js", write("src/index.js"), "DENY");
+check("Write ALLOW after the hook rule (foreign repo): src/index.js", write("src/index.js"), "ALLOW");
 check("Write ALLOW after the hook rule: docs/notes.md", write("docs/notes.md"), "ALLOW");
 
 /* P0-2 / P0-3 / P1-1 / P1-12: what git READS must be what the scanner reads.
@@ -815,20 +827,29 @@ console.log("-- P2-1: hook and permission globs cover the same protected classes
   // also be refused by the permission engine, and vice versa (templates aside).
   const globToRe = (g) => new RegExp("^" + g.split("**").map((part) =>
     part.split("*").map((t) => t.replace(/[.+^${}()|[\]\\?]/g, "\\$&")).join("[^/]*")).join(".*") + "$");
-  const globs = FIX_PROTECTED_WRITE_GLOBS.map(globToRe);
-  const globCovers = (rel) => globs.some((re) => re.test(rel));
-  const pipeline = [
+  const staticGlobs = FIX_PROTECTED_WRITE_GLOBS.map(globToRe);
+  const selfGlobs = FIX_SELF_REVIEW_GLOBS.map(globToRe);
+  const covers = (globs, rel) => globs.some((re) => re.test(rel));
+  // Repo-agnostic classes: execution configuration + secrets, denied in every repo.
+  const staticPaths = [
     ".husky/pre-commit", ".github/workflows/ci.yml", ".github/actions/x/action.yml",
     ".gitlab-ci.yml", "Jenkinsfile", "Makefile", ".pre-commit-config.yaml",
     ".pre-commit-config.yml", ".devcontainer/devcontainer.json", ".cargo/config.toml",
     ".circleci/config.yml", ".npmrc", ".env", ".env.local", ".ssh/id_rsa",
-    "scripts/pre-tool-hook.js", "src/index.js", "src/claude.js", "scripts/init.mjs",
-    "scripts/lib/mcp-client.mjs", "assets/skills/code-review/SKILL.md",
   ];
-  for (const rel of pipeline) {
+  for (const rel of staticPaths) {
     // check() compares with ===, so the pair is joined into one string.
     check("hook DENY and permission glob both cover " + rel,
-      [hook("Write", { file_path: path.join(REPO, rel) }), globCovers(rel)].join("|"), "DENY|true");
+      [hook("Write", { file_path: path.join(REPO, rel) }), covers(staticGlobs, rel)].join("|"), "DENY|true");
+  }
+  // Pipeline classes: identity-scoped. Foreign repo -> both layers allow (fix
+  // mode must be able to edit ordinary source); self-review -> both deny.
+  const pipelinePaths = ["scripts/pre-tool-hook.js", "src/index.js", "src/claude.js", "scripts/init.mjs", "scripts/lib/mcp-client.mjs", "assets/skills/code-review/SKILL.md"];
+  for (const rel of pipelinePaths) {
+    check("foreign repo: hook allows and permission globs do not cover " + rel,
+      [hook("Write", { file_path: path.join(REPO, rel) }), covers(staticGlobs, rel)].join("|"), "ALLOW|false");
+    check("self-review: hook denies and self-review globs cover " + rel,
+      [hook("Write", { file_path: path.join(ROOT, rel) }, ROOT), covers(selfGlobs, rel)].join("|"), "DENY|true");
   }
   // The documented template exception: the hook allows it, the permission glob
   // is broader by design (over-block, not a hole) — locked so a future change

@@ -2,6 +2,8 @@
 
 **基线**：v1.18.5（第三轮审计的残余：P2-1 / P2-3 / P2-22 + FIXES-round5 的 P1-4、P1-13、fail-closed 缺口）
 **结果**：v1.18.6（`npm test` 7 套件全绿：shell-guard 292 / audit-fixes 313 / p0-regression 181 / validation 30 / pack 43 / cross-cases 154 / smoke）
+**PR**：[#6](https://github.com/KentQi/cc-code-review/pull/6)（stacked on [#5](https://github.com/KentQi/cc-code-review/pull/5)）
+**CI**：ubuntu/macos/windows × node 18/22 **6/6 全绿**（run [40992030320](https://github.com/KentQi/cc-code-review/actions/runs/40992030320)）
 **方式**：subagent 运行时本轮不可用（3 个全部异常终止且未改任何文件），由 Lead 直接逐项修复并补回归。
 
 ## 逐条
@@ -27,3 +29,9 @@
 - Lead 独立探针 `/tmp/verify-round6.mjs`：**20/20**（P1-4 矩阵、package.json Edit、共享 containment、坏 config fail-closed、指纹内联规则）。
 - `npm test` 7/7、exit 0；新增回归：shell-guard 272→292、audit-fixes 305→313、p0 163→181。
 - 环境限制：subagent 工具本轮不可用，全部改动由 Lead 完成（无并行写冲突）。
+## CI 抓到的两个 fixture 问题（已修）
+
+- **Node 18 的 ESM 检测**：P1-13 的指纹副本以 `.js` 放在无 `package.json` 的临时目录，Node 18 按 CommonJS 解析 → 改为复制成 `.mjs`（Node 22+ 自动检测 ESM，所以只有 18.x job 红）。
+- **Windows 的 git config 转义**：hooksPath/fsmonitor fixture 把 `C:\...` 原样写进 `.git/config`，反斜杠是转义符 → `bad config line`，而扫描器现在 fail-closed 拒绝（此前 fallback line-scan 会通过）。fixture 改用 `cfgPath()` 正斜杠（git 全平台接受）。
+
+这两个都是测试 fixture 的平台问题，不是产品缺陷；修复后 CI 6/6。

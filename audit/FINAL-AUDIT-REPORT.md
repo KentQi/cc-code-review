@@ -66,7 +66,7 @@
 | #3 | 1.18.3 | OPEN / MERGEABLE / CI 6/6 |
 | #4 | 1.18.4 | OPEN / MERGEABLE / CI 5/6 + 1 queued |
 | #5 | 1.18.5 | OPEN / MERGEABLE / CI 6/6 |
-| #6 | 1.18.6 | OPEN / MERGEABLE / CI 运行中 |
+| #6 | 1.18.6 | OPEN / MERGEABLE / CI 6/6 |
 
 合并顺序 #1 → #5；main 未修改（仍为 659ff49），未打 tag、未发布 npm。
 

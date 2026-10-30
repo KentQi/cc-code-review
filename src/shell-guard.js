@@ -58,8 +58,19 @@ const PACKAGE_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..
  * one thing it exists for in ordinary projects (audit round 8).
  */
 export function isSelfReview(repoRoot) {
+  const raw = String(repoRoot || "").trim();
+  // A relative/empty root resolves against the process cwd; if the server was
+  // launched from the package root that would read as a self-review and block
+  // ordinary writes. The tool layer already rejects a relative repoPath, so this
+  // is belt-and-braces (audit round 8, independent check).
+  if (!raw || !path.isAbsolute(raw)) return false;
   try {
-    return fs.realpathSync(path.resolve(String(repoRoot || ""))) === fs.realpathSync(PACKAGE_ROOT);
+    const pkg = fs.statSync(PACKAGE_ROOT);
+    const repo = fs.statSync(raw);
+    // Compare the FILESYSTEM identity (dev+ino), not the path spelling: a bind
+    // mount or an alternate path to the same tree would pass a realpath string
+    // comparison, and writing through that path would still disarm later runs.
+    return pkg.dev === repo.dev && pkg.ino === repo.ino;
   } catch {
     return false;
   }

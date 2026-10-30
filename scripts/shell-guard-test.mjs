@@ -570,6 +570,18 @@ for (const c of ["find -files0-from /etc/passwd", "find --files0-from /etc/passw
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 check("isSelfReview: this package is a self-review", isSelfReview(PKG_ROOT), true);
 check("isSelfReview: a foreign temp repo is not", isSelfReview(os.tmpdir()), false);
+// Independent edge cases (audit round 8): a relative/empty root must never read
+// as a self-review (it would resolve against the process cwd), and a symlink to
+// the package must still count (filesystem identity, not path spelling).
+check("isSelfReview: empty root is not a self-review", isSelfReview(""), false);
+check("isSelfReview: relative root is not a self-review", isSelfReview("."), false);
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "self-review-link-"));
+  const link = path.join(dir, "pkg-link");
+  fs.symlinkSync(PKG_ROOT, link);
+  check("isSelfReview: a symlink to the package is a self-review", isSelfReview(link), true);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
 check("SELF_REVIEW_PIPELINE is a separate table", Array.isArray(SELF_REVIEW_PIPELINE) && SELF_REVIEW_PIPELINE.length > 0, true);
 check("pipeline patterns are NOT in the repo-agnostic table",
   PROTECTED_WRITE.some((re) => re.source.includes("src\\/[^/]+") || re.source.includes("scripts\\/pre-tool-hook")), false);

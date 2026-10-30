@@ -683,7 +683,10 @@ for (const cmd of ["rg -n x src", "rg -n x file.ts", "grep -rn x src", "grep -n 
 // A path that RESOLVES to the repository root is the same recursive search as
 // ".". The literal check used to miss every other spelling (.//, ././, src/..,
 // an absolute path to the root), so the fix is locked against the spellings too.
-for (const cmd of ["grep -rn x .//", "grep -rn x ././", "grep -rn x src/..", "grep -rn x " + REPO]) {
+for (const cmd of ["grep -rn x .//", "grep -rn x ././", "grep -rn x src/..",
+  // Forward slashes: bash (git-bash included) strips backslashes from a raw
+  // C:\... token before grep ever sees it, so that spelling is not the guard's.
+  "grep -rn x " + REPO.replace(/\\/g, "/")]) {
   check("bash DENY (root spelling): " + cmd, bash(cmd), "DENY");
 }
 
@@ -766,28 +769,31 @@ console.log("-- fail-closed: unparseable repository config / unreadable index / 
   // The same fail-closed rule when git cannot be spawned at all (PATH without
   // git), not only when git runs and reports a corrupt index. Real repository,
   // clean config: the only failing step is the attribute enumeration.
-  const real = gitRepo("p0-nogit");
-  // Simulate "git runs but fails" deterministically. Emptying PATH does not work:
-  // gitSpawnOpts() inherits buildClaudeEnv(), which appends /usr/local/bin and
-  // friends, so a CI runner with a brew git still found one (this test failed
-  // only on those machines). A fake git first on PATH is platform-independent.
-  const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "p0-fakegit-"));
-  const isWin = process.platform === "win32";
-  const fake = path.join(fakeBin, isWin ? "git.cmd" : "git");
-  fs.writeFileSync(fake, isWin ? "@exit /b 1\r\n" : "#!/bin/sh\nexit 1\n");
-  try { fs.chmodSync(fake, 0o755); } catch { /* best effort */ }
-  const oldPath = process.env.PATH;
-  try {
-    process.env.PATH = fakeBin + path.delimiter + (oldPath || "");
-    const res = repoRunsGitPrograms(real);
-    check("an attribute enumeration that fails is refused", res.refusals.length > 0, true);
-    check("the refusal names the attribute enumeration",
-      res.refusals.some((r) => /could not be enumerated/.test(r)), true);
-  } finally {
-    process.env.PATH = oldPath;
-    fs.rmSync(fakeBin, { recursive: true, force: true });
+  if (process.platform !== "win32") {
+    // Simulate "git runs but fails" deterministically. Emptying PATH does not
+    // work: gitSpawnOpts() inherits buildClaudeEnv(), which appends /usr/local/bin
+    // and friends, so a CI runner with a brew git still found one. A failing fake
+    // git FIRST on PATH always wins (git is resolved left to right).
+    // Windows: a .cmd shim is not spawned deterministically here; the corrupt
+    // index case above exercises the same refusal path there.
+    const real = gitRepo("p0-nogit");
+    const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "p0-fakegit-"));
+    const fake = path.join(fakeBin, "git");
+    fs.writeFileSync(fake, "#!/bin/sh\nexit 1\n");
+    try { fs.chmodSync(fake, 0o755); } catch { /* best effort */ }
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = fakeBin + path.delimiter + (oldPath || "");
+      const res = repoRunsGitPrograms(real);
+      check("an attribute enumeration that fails is refused", res.refusals.length > 0, true);
+      check("the refusal names the attribute enumeration",
+        res.refusals.some((r) => /could not be enumerated/.test(r)), true);
+    } finally {
+      process.env.PATH = oldPath;
+      fs.rmSync(fakeBin, { recursive: true, force: true });
+    }
+    fs.rmSync(real, { recursive: true, force: true });
   }
-  fs.rmSync(real, { recursive: true, force: true });
 }
 try { fs.rmSync(REPO, { recursive: true, force: true }); } catch { /* ignore */ }
 if (failures.length) {

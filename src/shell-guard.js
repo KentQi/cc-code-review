@@ -138,6 +138,14 @@ export function policyFingerprint() {
     secretRead: SECRET_READ.map((re) => re.source + "/" + re.flags),
     secretEnv: SECRET_ENV.source + "/" + SECRET_ENV.flags,
     secretEnvAllow: SECRET_READ_ALLOW.source + "/" + SECRET_READ_ALLOW.flags,
+    // P1-13 residual: hashing only the tables missed RULE-CODE drift. If an
+    // upgrade changes an inline rule (a new refusal inside segmentProblem, a
+    // different glob rule, a changed containment policy) while the old server
+    // is still in memory, the tables are identical and the stale-policy check
+    // passed anyway. The in-memory source of these functions is what actually
+    // decides a call, so it is part of the policy identity.
+    rules: [segmentProblem, dotGlobProblem, isInsideRepo, repoRelative, pathArgs, outrightDeny, ghProblem]
+      .map((fn) => fn.toString()),
   });
   return crypto.createHash("sha256").update(canon).digest("hex").slice(0, 16);
 }
@@ -796,7 +804,52 @@ function repoRealpath(root) {
  * and elsewhere on disk — so the deepest existing ancestor is realpathed, the
  * same rule the write/read scoping uses.
  */
-export function isInsideRepo(root, token) {
+/** realpath() of the nearest EXISTING ancestor, with the missing tail appended. */
+export function realpathNearest(p) {
+  let cur = path.resolve(p);
+  const missing = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync(cur);
+      return missing.length ? path.join(real, ...missing.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return path.resolve(p); // nothing on this path exists
+      missing.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+/**
+ * Where does `target` land relative to the (realpathed) repository root?
+ *
+ * The single implementation of the containment primitive (audit P2-3): the
+ * hook, the guard and the repository-metadata reader used to carry five copies
+ * and they had already diverged (one treated the root itself as inside, another
+ * as outside). Returns the path.relative() spelling — "" for the root itself,
+ * ".." prefixed for an escape — or null when the root cannot be resolved.
+ * Symlinks are resolved on both sides, and a not-yet-existing target is anchored
+ * on its nearest existing ancestor (the common Write case).
+ */
+export function repoRelative(root, target) {
+  const realRoot = repoRealpath(root);
+  if (!realRoot) return null;
+  const resolved = path.isAbsolute(String(target)) ? path.resolve(String(target)) : path.resolve(realRoot, String(target));
+  const realTarget = realpathNearest(resolved);
+  return path.relative(realRoot, realTarget);
+}
+
+/**
+ * Is `token` inside the reviewed repository? Lexical containment is not enough:
+ * a repo may contain `link -> C:\Users\victim\.ssh`, which is "inside" lexically
+ * and elsewhere on disk — so both sides are realpathed.
+ *
+ * `allowRoot` expresses the one legitimate policy difference between callers:
+ * a search root (Grep/Glob) may be the repository root itself, while Read has no
+ * use for "the directory as a file" and refuses it (audit P2-3).
+ */
+export function isInsideRepo(root, token, { allowRoot = true } = {}) {
   if (typeof token !== "string" || !token) return true;
   if (token.startsWith("~")) return false;           // shell expands to $HOME
   if (token.includes("$")) return false;             // cannot be resolved statically
@@ -808,33 +861,11 @@ export function isInsideRepo(root, token) {
   // An absolute token must be resolved against itself, not against the root: a
   // repo reached through a symlinked prefix (macOS /tmp and /var are symlinks)
   // has a real root of /private/var/..., while the model writes the path it was
-  // given. path.resolve(realRoot, "/var/...") keeps the absolute path, so the
-  // lexical check below saw "outside" and refused every legitimate read. The
-  // realpath pass at the end is the authority for both forms.
-  const absolute = path.isAbsolute(token);
-  const target = absolute ? path.resolve(token) : path.resolve(realRoot, token);
-  if (!absolute) {
-    const rel = path.relative(realRoot, target);
-    if (!rel) return true;
-    if (rel.startsWith("..") || path.isAbsolute(rel)) return false;
-  }
-  // Resolve links for the part that exists.
-  let probe = target;
-  for (;;) {
-    let real;
-    try {
-      real = fs.realpathSync(probe);
-    } catch {
-      const parent = path.dirname(probe);
-      if (parent === probe) return false;
-      probe = parent;
-      continue;
-    }
-    const tail = path.relative(probe, target);
-    const full = tail ? path.join(real, tail) : real;
-    const r = path.relative(realRoot, full);
-    return !r || (!r.startsWith("..") && !path.isAbsolute(r));
-  }
+  // given. realpathNearest resolves both spellings to the same place.
+  const target = path.isAbsolute(token) ? path.resolve(token) : path.resolve(realRoot, token);
+  const rel = path.relative(realRoot, realpathNearest(target));
+  if (!rel) return allowRoot;
+  return !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
 /** A segment may only read inside the reviewed repository. */
@@ -879,6 +910,43 @@ function segmentProblem(words, repoRoot, unquoted = [], tilde = []) {
     return longOptionIs(name, "--pre") || longOptionIs(name, "--pre-glob");
   })) {
     return "blocked: rg --pre / --pre-glob runs an arbitrary program for every file. Review mode is read-only — use a plain rg.";
+  }
+  if (prog === "rg") {
+    // P1-4 residual: rg honours .gitignore by default, which is exactly what
+    // keeps a recursive search away from ignored secret files (.env, keys).
+    // --hidden/--no-ignore/-u/--unrestricted switch that protection off, so the
+    // same search reads them and the content lands in the transcript.
+    const leak = words.find((w) => {
+      const name = flagName(w);
+      if (longOptionIs(name, "--hidden") || longOptionIs(name, "--unrestricted")) return true;
+      // --no-ignore plus its variants (--no-ignore-vcs, --no-ignore-parent,
+      // --no-ignore-global, --no-ignore-dot, ...): all of them disable a layer
+      // of the ignore rules that keeps secrets out of a recursive search.
+      if (name.startsWith("--no-ignore")) return true;
+      // -u / -uu / -uuu, including a clustered short flag that contains u.
+      return /^-[A-Za-z]*u[A-Za-z]*$/.test(w);
+    });
+    if (leak) {
+      return `blocked: \`rg ${leak}\` disables ripgrep's ignore/hidden-file rules, so a recursive search reads ignored secret files (.env, keys) inside the repository. Review mode may search tracked sources — use a plain rg, or scope it to a path.`;
+    }
+  }
+  if (prog === "grep") {
+    // P1-4 residual: grep has no .gitignore awareness at all, so a recursive
+    // grep rooted at the repository reads every ignored secret file. A search
+    // with an explicit subdirectory/file stays allowed.
+    const recursive = words.some((w) => /^-[A-Za-z]*[rR][A-Za-z]*$/.test(w) ||
+      longOptionIs(flagName(w), "--recursive") || longOptionIs(flagName(w), "--dereference-recursive"));
+    if (recursive) {
+      const positionals = [];
+      for (const w of words.slice(1)) {
+        if (w === "--" || (w.startsWith("-") && w !== "-")) continue;
+        positionals.push(w);
+      }
+      const files = positionals.slice(1); // grep's first positional is the PATTERN
+      if (files.length === 0 || files.some((f) => f === "." || f === "./")) {
+        return "blocked: recursive grep over the repository root reads ignored secret files (.env, keys), because grep does not honour .gitignore. Give it a specific subdirectory or file, or use the Grep tool / plain rg.";
+      }
+    }
   }
   if (prog === "gh") {
     const problem = ghProblem(words);

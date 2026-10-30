@@ -20,8 +20,9 @@ import {
   writeGuardSettings, removeGuardSettings,
   streamEventFacts, parseUnrecognizedModels, buildModelProvenance, resultFacts,
   parseAgentLaunchAck, looksLikeLaunchAck, recoverReportFromTranscript, analyseCommand,
+  buildClaudeEnv,
 } from "../src/claude.js";
-import { guardVerdict } from "../src/shell-guard.js";
+import { guardVerdict, policyFingerprint } from "../src/shell-guard.js";
 import { codeDrift } from "../src/version.js";
 import { skillStatus, skillSync, installBundledSkill, bundledSkillFile } from "../src/skill.js";
 import fs from "node:fs";
@@ -1064,5 +1065,44 @@ check("effort xhigh maps to review level max (same native playbook as max)", der
     /verdict is MISCONFIGURED/.test(out) && !/SMOKE TEST PASSED/.test(out), out.slice(-300));
 }
 
+
+/* ---------------- round-6: single hardening table + shared containment -- */
+console.log("-- P2-1/P2-3/P1-13 single sources and fingerprint coverage");
+{
+  const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+  const claudeSrc = fs.readFileSync(path.join(SRC, "claude.js"), "utf8");
+  check("P2-1: exactly one GIT_HARDENING table", (claudeSrc.match(/const GIT_HARDENING = \[/g) || []).length, 1);
+  truthy("P2-1: no second hand-written gitOverride pair list", !/\["core\.sshCommand", ""\]/.test(claudeSrc));
+  const env = buildClaudeEnv();
+  const count = Number(env.GIT_CONFIG_COUNT);
+  const envPairs = [];
+  for (let i = 0; i < count; i++) envPairs.push(env["GIT_CONFIG_KEY_" + i] + "=" + env["GIT_CONFIG_VALUE_" + i]);
+  const argPairs = [];
+  for (let i = 0; i < GIT_HARDENING_ARGS.length; i += 2) argPairs.push(GIT_HARDENING_ARGS[i + 1]);
+  check("P2-1: every -c key is also in the child env (the P0-1 invariant)", argPairs.filter((p) => !envPairs.includes(p)), []);
+  truthy("P2-1: the child env carries the transport pins",
+    envPairs.includes("protocol.ext.allow=never") && envPairs.includes("protocol.file.allow=never"));
+  truthy("P2-1: the child env neutralises the exec keys",
+    ["core.sshCommand=", "core.fsmonitor=", "core.hooksPath=", "diff.external=", "credential.helper="]
+      .every((p) => envPairs.includes(p)));
+  check("P2-3: the hook no longer carries a private containment copy",
+    fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "pre-tool-hook.js"), "utf8").includes("realContainment"), false);
+  check("P2-3: the metadata reader delegates containment", claudeSrc.includes("fs.realpathSync(root)"), false);
+  // P1-13 residual: an inline RULE change (tables unchanged) must still change
+  // the fingerprint, otherwise an upgraded hook and an old server would agree.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "af-fp-"));
+  fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+  const copy = path.join(dir, "src", "shell-guard.js");
+  // Edit INSIDE a hashed rule function (the tables stay identical): this is the
+  // "upgrade changed a rule, not a table" case the old fingerprint missed.
+  const edited = fs.readFileSync(path.join(SRC, "shell-guard.js"), "utf8")
+    .replace("function segmentProblem(words, repoRoot, unquoted = [], tilde = []) {",
+      "function segmentProblem(words, repoRoot, unquoted = [], tilde = []) {\n  const _ruleDrift = 1;");
+  fs.writeFileSync(copy, edited);
+  const probe = "import(" + JSON.stringify(pathToFileURL(copy).href) + ").then((m) => process.stdout.write(m.policyFingerprint()))";
+  const res = spawnSync(process.execPath, ["--input-type=module", "-e", probe], { encoding: "utf8", timeout: 15000 });
+  truthy("P1-13: an inline rule edit changes the fingerprint", res.stdout && res.stdout.trim() !== policyFingerprint());
+  fs.rmSync(dir, { recursive: true, force: true });
+}
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed${skipped ? `, ${skipped} skipped` : ""}`);
 process.exit(fail ? 1 : 0);

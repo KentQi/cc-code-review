@@ -5,7 +5,7 @@ import net from "node:net";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { policyFingerprint } from "./shell-guard.js";
+import { policyFingerprint, realpathNearest, repoRelative } from "./shell-guard.js";
 // One implementation of the config-dir rule (skill.js resolves relative
 // CLAUDE_CONFIG_DIR values; a second copy here drifted and could point the
 // skill path and the child-process env at different directories — P3-10).
@@ -372,6 +372,63 @@ function isLoopbackHost(h) {
 }
 
 /**
+ * Single source for git hardening (audit P2-1).
+ *
+ * Three consumers used to keep their own hand-written list and they drifted:
+ * a key added to the -c list alone never reached the claude child (the P0-1
+ * class), and a key added to the child env alone never reached this server's
+ * own git calls. Every fixed key now lives here once:
+ *
+ *   env  - GIT_CONFIG_KEY_n/VALUE_n for the claude child. This is the ONLY
+ *          list that protects the reviewer's own git, because the scanner
+ *          cannot predict every command the model will run.
+ *   args - `-c key=value` for this server's git spawns.
+ *   scan - the scanner refuses a repository that sets this key (the value is
+ *          executed, or decides what will be executed).
+ *
+ * The module-load assertion below makes env mandatory for anything in args or
+ * scan, so "added it in the wrong list" can never silently weaken the child.
+ */
+const GIT_HARDENING = [
+  // Values git executes (or that decide what executes).
+  { key: "core.sshCommand", value: "", env: true, args: true, scan: true },
+  { key: "core.fsmonitor", value: "", env: true, args: true, scan: true },
+  { key: "core.pager", value: "cat", env: true, args: true, scan: true },
+  { key: "core.hooksPath", value: "", env: true, args: true, scan: true },
+  { key: "diff.external", value: "", env: true, args: true, scan: true },
+  { key: "credential.helper", value: "", env: true, args: true, scan: false },
+  { key: "core.attributesFile", value: "", env: true, args: true, scan: false },
+  { key: "interactive.diffFilter", value: "", env: true, args: true, scan: false },
+  { key: "core.editor", value: "", env: true, args: true, scan: false },
+  { key: "gpg.program", value: "", env: true, args: true, scan: false },
+  { key: "merge.tool", value: "", env: true, args: true, scan: false },
+  { key: "core.gitProxy", value: "", env: true, args: true, scan: true },
+  { key: "core.askPass", value: "", env: true, args: true, scan: true },
+  { key: "sequence.editor", value: "", env: true, args: true, scan: true },
+  // The transport family (P0-1): ext:: runs an external command as the
+  // remote URL transport; protocol.file re-enables file:// URLs.
+  { key: "protocol.ext.allow", value: "never", env: true, args: true, scan: false },
+  { key: "protocol.file.allow", value: "never", env: true, args: true, scan: false },
+];
+
+// Load-time invariant: a fixed key that protects the server or the scanner but
+// not the reviewer child is exactly the drift that produced P0-1.
+for (const entry of GIT_HARDENING) {
+  if ((entry.args || entry.scan) && !entry.env) {
+    throw new Error("GIT_HARDENING: " + entry.key + " must set env:true (the claude child is the layer that cannot be predicted)");
+  }
+}
+if (new Set(GIT_HARDENING.map((e) => e.key.toLowerCase())).size !== GIT_HARDENING.length) {
+  throw new Error("GIT_HARDENING: duplicate key");
+}
+
+/**
+ * The `-c key=value` pairs this server passes to its own git spawns.
+ * Derived from GIT_HARDENING so the two lists cannot drift.
+ */
+export const GIT_HARDENING_ARGS = GIT_HARDENING.filter((e) => e.args).flatMap((e) => ["-c", e.key + "=" + e.value]);
+
+/**
  * Environment for the claude child process:
  *  - drop our own entrypoint marker so claude's telemetry sees a standard CLI session
  *  - macOS/Linux: APPEND (never prepend) common tool dirs missing from the host
@@ -434,23 +491,9 @@ export function buildClaudeEnv() {
   // transport (protocol.ext/protocol.file, P0-1).
   // A host-provided GIT_CONFIG_COUNT is preserved (entries are appended after
   // it) so the server never silently drops config the caller injected.
-  const gitOverrides = [
-    ["core.sshCommand", ""],
-    ["core.fsmonitor", ""],
-    ["core.pager", "cat"], // a pager is a program; "cat" is the inert one
-    ["core.hooksPath", ""],
-    ["diff.external", ""],
-    ["credential.helper", ""],
-    // P0-9: attributesFile is a THIRD attributes source that can activate a
-    // live textconv driver on a plain `git log -p`; an empty value removes it.
-    ["core.attributesFile", ""],
-    // P0-1: the transport family is an execution surface too. `ext::` runs an
-    // external command as the remote URL's transport, and protocol.file
-    // re-enables file:// URLs (and the local clone helpers) a repo can name.
-    // command-scope "never" beats any protocol.* block in the repo's config.
-    ["protocol.ext.allow", "never"],
-    ["protocol.file.allow", "never"],
-  ];
+  // P2-1: derived from GIT_HARDENING (the single table) instead of a second
+  // hand-written list. Anything in that table with env:true protects the child.
+  const gitOverrides = GIT_HARDENING.filter((e) => e.env).map((e) => [e.key, e.value]);
   const hostCount = /^\d+$/.test(String(env.GIT_CONFIG_COUNT ?? "")) ? Number(env.GIT_CONFIG_COUNT) : 0;
   gitOverrides.forEach(([key, value], i) => {
     env["GIT_CONFIG_KEY_" + (hostCount + i)] = key;
@@ -813,22 +856,7 @@ export function parseUnrecognizedModels(stderr) {
   return out;
 }
 
-/** realpath() of the nearest EXISTING ancestor, with the missing tail appended. */
-function realpathNearest(p) {
-  let cur = path.resolve(p);
-  const missing = [];
-  for (;;) {
-    try {
-      const real = fs.realpathSync(cur);
-      return missing.length ? path.join(real, ...missing.reverse()) : real;
-    } catch {
-      const parent = path.dirname(cur);
-      if (parent === cur) return path.resolve(p); // nothing on this path exists
-      missing.push(path.basename(cur));
-      cur = parent;
-    }
-  }
-}
+// realpathNearest() is imported from shell-guard.js (audit P2-3: one copy).
 
 /**
  * A path the CLI itself could have written an agent transcript to: under the
@@ -2098,21 +2126,7 @@ export function runClaude({
  * command line beats every config file, including the repo's own, and the env
  * vars cut off the system/global config and the pager and credential helpers.
  */
-export const GIT_HARDENING_ARGS = [
-  "-c", "core.fsmonitor=",
-  "-c", "diff.external=",
-  "-c", "interactive.diffFilter=",
-  "-c", "core.pager=cat",
-  "-c", "core.editor=",
-  "-c", "core.sshCommand=",
-  "-c", "credential.helper=",
-  "-c", "gpg.program=",
-  "-c", "merge.tool=",
-  "-c", "core.hooksPath=",
-  // P0-1: the same transport pair buildClaudeEnv() pins for the reviewer child.
-  "-c", "protocol.ext.allow=never",
-  "-c", "protocol.file.allow=never",
-];
+// GIT_HARDENING_ARGS is defined once, next to the GIT_HARDENING table (P2-1).
 
 /** git spawn options shared by every git call this server makes. */
 let gitEmptyHome;
@@ -2209,20 +2223,18 @@ const INCLUDE_PATH = /^\s*path\s*=\s*(.+?)\s*$/i;
  * compared case-insensitively below), so these are the spellings to match.
  */
 
-/** Keys whose VALUE git executes. */
-const CONFIG_EXEC_KEYS = new Set([
-  "core.sshcommand",
-  "core.fsmonitor",
-  "core.pager",
-  "core.gitproxy",
-  "diff.external",
-  // Round-2 scanner gap: a credential challenge runs core.askPass, and an interactive rebase
-  // runs sequence.editor. The read allowlist does not reach the operations that
-  // trigger them today, but "not reachable today" is not a boundary: both are
-  // repo-controlled programs and the review must not run them by accident.
-  "core.askpass",
-  "sequence.editor",
-]);
+/**
+ * Keys whose VALUE git executes — derived from GIT_HARDENING (P2-1) so a key
+ * that the child env neutralises and the scanner refuses is spelled once.
+ * core.hooksPath and core.attributesFile are excluded here because they have
+ * dedicated handlers below (a hook path is a directory policy, an attributes
+ * file is a path to scan), and credential.helper is covered by the
+ * credential(?:..+)?.helper pattern.
+ */
+const CONFIG_EXEC_KEYS = new Set(
+  GIT_HARDENING.filter((e) => e.scan && !["core.hookspath", "core.attributesfile", "credential.helper"].includes(e.key.toLowerCase()))
+    .map((e) => e.key.toLowerCase()),
+);
 /**
  * P0-1: the TRANSPORT family. These keys are not values git executes directly,
  * but they choose what will execute or where a fetch goes: `ext::` runs an
@@ -2281,8 +2293,14 @@ function normalizedConfigEntries(file, repoPath) {
   let res;
   try {
     res = spawnSync("git", [...GIT_HARDENING_ARGS, "config", "--file", file, "--no-includes", "--list", "-z"], gitSpawnOpts(repoPath));
-  } catch { return null; }
-  if (!res || res.error || res.status !== 0 || !Buffer.isBuffer(res.stdout)) return null;
+  } catch (e) { return { error: String(e?.message || e) }; }
+  if (!res || res.error || res.status !== 0 || !Buffer.isBuffer(res.stdout)) {
+    // Keep the stderr: "bad config" is a repository-controlled condition the
+    // scan must fail closed on (a config git itself cannot parse is not a config
+    // the review can trust), while a missing/old git keeps the line-scan
+    // fallback. The old code collapsed both into a silent null (P2 fail-closed).
+    return { error: String(res?.stderr || res?.error || "git config failed").trim() };
+  }
   const entries = [];
   for (const rec of res.stdout.toString("utf8").split("\0")) {
     if (!rec) continue;
@@ -2291,7 +2309,7 @@ function normalizedConfigEntries(file, repoPath) {
       ? { key: rec.toLowerCase(), value: null }
       : { key: rec.slice(0, nl).toLowerCase(), value: rec.slice(nl + 1) });
   }
-  return entries;
+  return { entries };
 }
 
 /**
@@ -2423,12 +2441,12 @@ function readRepoFile(file, roots, { followSymlink = false } = {}) {
   if (!st.isFile()) return null;
   let real;
   try { real = fs.realpathSync(target); } catch { return null; }
+  // Shared containment (audit P2-3). A file may not BE a root: rel "" means the
+  // path resolves to the directory itself, which is not a file we can read.
   const rootList = Array.isArray(roots) ? roots : [roots];
   const inside = rootList.some((root) => {
-    try {
-      const rel = path.relative(fs.realpathSync(root), real);
-      return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
-    } catch { return false; }
+    const rel = repoRelative(root, real);
+    return rel !== null && rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
   });
   if (!inside) return null;
   // Real git config/attributes files are a few KiB. A bigger one is not metadata
@@ -2447,10 +2465,8 @@ function realPathInside(file, roots) {
   let real;
   try { real = fs.realpathSync(file); } catch { return false; }
   return (Array.isArray(roots) ? roots : [roots]).some((root) => {
-    try {
-      const rel = path.relative(fs.realpathSync(root), real);
-      return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-    } catch { return false; }
+    const rel = repoRelative(root, real);
+    return rel !== null && !rel.startsWith("..") && !path.isAbsolute(rel);
   });
 }
 
@@ -2673,9 +2689,13 @@ function repoAttributeFiles(repoPath, attributeSources = []) {
         add(rel);
       }
     } else if (!/not a git repository/i.test(String(res?.stderr || ""))) {
-      notes.push("the repository's .gitattributes files could not be enumerated (" +
+      // Fail closed: the walk below prunes node_modules, so a git enumeration
+      // that fails leaves attribute files there unverified — and an attribute
+      // file the scan never read can still name a live driver that a plain
+      // `git diff` executes. A note would let the review start anyway.
+      refusals.push("the repository's .gitattributes files could not be enumerated (" +
         String(res?.stderr || res?.error || "git ls-files failed").trim().slice(0, 160) +
-        "); attribute files under pruned directories (node_modules/) are not covered");
+        "); attribute files under pruned directories (node_modules/) would be unverified — refusing to review a repository whose git index cannot be read");
     }
   } catch { /* the walk below still covers the reviewable tree */ }
   // P0-9: core.attributesFile is git's THIRD attributes source, and the only one
@@ -2951,9 +2971,19 @@ export function repoRunsGitPrograms(repoPath) {
     // dotted subsections and same-line section headers cannot hide a key. Scoped
     // to the file repoConfigFiles() already validated (the include graph is
     // walked and labeled there), so every finding keeps its own label.
-    const entries = normalizedConfigEntries(file, repoPath);
-    if (entries) {
-      for (const { key, value } of entries) scanKey(label, key, value);
+    const parsed = normalizedConfigEntries(file, repoPath);
+    if (parsed.entries) {
+      for (const { key, value } of parsed.entries) scanKey(label, key, value);
+      continue;
+    }
+    // A config git itself cannot parse is repository-controlled and makes every
+    // git command in this repository fail; it is also the one state where the
+    // scan cannot know which keys exist. Refuse instead of line-scanning a file
+    // whose meaning git disagrees about (fail-closed).
+    if (/bad config|invalid config|unterminated|missing value|invalid key/i.test(parsed.error || "")) {
+      refusals.push(label + ": the repository's git config cannot be parsed (" +
+        String(parsed.error).trim().slice(0, 160) +
+        "); git commands in this repository fail, and a config the scan cannot read is not a config the review can trust — fix or remove the malformed line");
       continue;
     }
     // Fallback: no usable git, or this file is not parseable. The line scan knows

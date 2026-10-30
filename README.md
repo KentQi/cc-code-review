@@ -100,7 +100,7 @@ npm run init
 | `pipeline` | `auto` | auto / native / fleet / skill | 评审引擎。**auto**：level 为 low..xhigh（含 fix——走命令自带 `--fix`）时直接用 claude 内置的 `/code-review`（无需任何文件）；仅 max 改用本 MCP 的舰队流水线（理由见下）。**native** 强制内置命令；**fleet** 强制内联舰队（指令写在 prompt 里）；**skill** 为兼容旧行为（唯一会往 `~/.claude` 写文件的模式） |
 | `installSkillIfMissing` | `false` | - | 仅在 `pipeline=skill` 时有意义：skill **缺失**时安装（默认不装——缺失时退化走内联舰队流水线；已存在且由本 MCP 管理的副本在实际使用前自动刷新；用户自建的副本永不触碰） |
 
-返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（Review Summary / Findings / Notes）+ 每个评审子代理各自的报告（`## Reviewer subagent reports`，数量随 diff 规模而定）+ 元数据（`session_id`、花费、轮数、日志路径、模型溯源）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
+返回（默认异步：先返回 jobId（<1 秒）与预检结论，报告用 claude_review_status(jobId) 取回；waitForResult: true 时为下列同步返回）：markdown 报告（`## Code Review Summary` / `## Findings (N)` / `## Notes`，与随包 SKILL.md 同一份格式合同）+ 每个评审子代理各自的报告（`## Reviewer subagent reports`，数量随 diff 规模而定）+ 元数据（`session_id`、花费、轮数、日志路径、模型溯源）。claude 的认证/网关类失败会以醒目的 `⚠️ REVIEW FAILED` 横幅返回并附处理建议，不会伪装成"报告"。
 
 ### 2. `claude_review_status` — 轮询/获取/取消后台 review 任务（免费）
 
@@ -182,7 +182,7 @@ git 会执行**仓库自己**的配置：`core.fsmonitor`、`diff.<driver>.comma
 
 **纵深失效即拒跑（fail closed）**
 
-hook 没装上、`guardSelfTest()` 自检失败（hook 真的能拦下一条链式命令、真的放行一条干净命令）或 guard 状态为 `failed` 时，两个工具都会**直接拒绝发起 review**，并说明缺了哪一层——因为 manual 模式的 allowlist 单靠自己挡不住前缀匹配绕权。确实要无防护运行（例如排查误报）才设 `CLAUDE_REVIEW_ALLOW_UNGUARDED=1` 显式解锁。
+hook 没装上、`guardSelfTest()` 自检失败（hook 真的能拦下一条链式命令、真的放行一条干净命令）或 guard 状态为 `failed` 时，两个工具都会**直接拒绝发起 review**，并说明缺了哪一层——因为 manual 模式的 allowlist 单靠自己挡不住前缀匹配绕权。`CLAUDE_REVIEW_ALLOW_UNGUARDED=1` **只**解锁"你显式关掉的 guard"（`CLAUDE_REVIEW_SHELL_GUARD=0`）；**安装失败/自检失败永远不可绕过**（那种情况下的运行会宣称有 hook 而实际没有任何命令被拦）。确实要完全无防护运行，显式设 `CLAUDE_REVIEW_SHELL_GUARD=0`。
 
 **版本地板（v1.5.0 新增）**
 
@@ -209,7 +209,7 @@ v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `sh
 v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagent reports` 小节 + structuredContent 的 `subagents[]`）——此前只有父代理的综合报告，子代理内容只存在于日志文件里，这正是"同样提示词在 Claude Code 里能看到多个专家干活、通过 MCP 只有一份综述"的原因。同时新增**模型溯源**：claude 2.1+ 会把子代理事件（含它实际使用的模型）转发到父流，MCP 据此比对"请求的模型 vs 实际运行的模型"，一旦发现被改写（CC Switch 等网关、或 `~/.claude/settings.json` env 里的 `CLAUDE_CODE_SUBAGENT_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL_NAME`——claude 会在 stderr 打 `[claude-code:unrecognized_model]`），就在结果里明确报 `⚠ MODEL SUBSTITUTION`：这份输出与直接在 Claude Code 里跑同一提示词**不可比**。运行前也会针对 settings.json env 里的同名改写与"进程环境的 `ANTHROPIC_BASE_URL` 被 settings 覆盖"提前预警。
 
 - 运行日志（含被审代码引用）写入 `%TEMP%/cc-code-review/`，目录 0700、文件 0600，只保留最近 20 份；增量子代理报告 `subagents-*.jsonl` 用同一目录、同样 0600，并纳入同一套保留与清扫。
-- CLI 自带一份内置安全命令白名单（`ls`、`cat`、`echo` 等只读工具），即使不在 `--allowedTools` 里也会放行。**正因如此，`echo` 的收紧必须落在 hook 上**：hook 只允许字面文本，`$VAR` 展开、通配符、`~` 与仓外路径一律拒绝（否则被注入的 reviewer 可用 `echo $ANTHROPIC_API_KEY` 把宿主凭据写进报告）。已实测 `node -e`、`python -c`、`rm`、`git push`、`git commit`、`curl`、Write 工具调用**全部被拒**，所以这不是提权口子，但"只放行白名单里的命令"要按"白名单 + 这批内置只读命令"来理解。
+- CLI 自带一份内置安全命令白名单（`ls`、`cat`、`echo` 等只读工具），即使不在 `--allowedTools` 里也会放行。**正因如此，`echo` 的收紧必须落在 hook 上**：hook 只允许字面文本——`$VAR` 展开与**未加引号**的通配符/`~`/仓外路径一律拒绝，加引号的字面量（`echo 'price: $5'`、`echo '*'`）仍然可用（否则被注入的 reviewer 可用 `echo $ANTHROPIC_API_KEY` 把宿主凭据写进报告）。已实测 `node -e`、`python -c`、`rm`、`git push`、`git commit`、`curl`、Write 工具调用**全部被拒**，所以这不是提权口子，但"只放行白名单里的命令"要按"白名单 + 这批内置只读命令"来理解。
 - 模型可以把被 hook 拦下的复合命令拆成多次允许的调用分别执行——hook 拦的是"一条命令里串多步"，不是"一个回合里做多件事"。真正的能力边界仍然是 manual 模式的 allowlist，hook 保证每一步都可被单独审计。
 - 已知残留风险：仓库内其他文件的 fix 改动、prompt 注入诱导的"看起来合理"的编辑——fix 模式改动留在工作区不 commit，请像审 PR 一样 `git diff` 检查后再采纳。
 - 已知残留风险（Windows）：日志目录/文件的 0700/0600 是尽力而为——NTFS 不存 POSIX 权限位，同一台机器上的其他本地用户理论上可读 `%TEMP%\cc-code-review\run-*.log`（内含被审代码引用）。需要更严的隔离请设 `CLAUDE_REVIEW_LOG_DIR` 指向受限目录，或接受该风险（多数单用户桌面场景等同无风险）。
@@ -226,7 +226,7 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 | `CLAUDE_CONFIG_DIR` | ~/.claude | skill 的安装/查找根（进程环境与 `~/.claude/settings.json` 的 env 块都会读，与 claude 子进程一致） |
 | `CLAUDE_REVIEW_SKILL_DIR` | - | 测试覆盖：直接指定 skill 目录，优先于上者 |
 | `CLAUDE_REVIEW_SHELL_GUARD` | `1` | `0` 关闭 PreToolUse 的 Bash 分段守卫（仅用于排查误报，不推荐；单独设它不会放行，还会连带拒跑） |
-| `CLAUDE_REVIEW_ALLOW_UNGUARDED` | - | 设 `1` 才允许"hook 未生效/自检失败"时仍然开跑。默认拒跑 |
+| `CLAUDE_REVIEW_ALLOW_UNGUARDED` | - | 设 `1` 才允许"guard 被显式关闭"时仍然开跑。**对安装失败/自检失败无效**（那两种情况永远拒跑）。默认拒跑 |
 | `CLAUDE_REVIEW_LOG_DIR` | `%TEMP%/cc-code-review` | 运行日志目录（日志含被审代码引用；Windows 上无 POSIX 权限位，可指向自有 ACL 的目录） |
 
 提示：若宿主环境残留 `ANTHROPIC_API_KEY` 等认证变量但 settings.json 未管理它们，可能与 CC Switch 冲突（`claude_review_env` 会告警）；网关用户可在 `~/.claude/settings.json` 加 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"` 减少非必要流量。
@@ -248,7 +248,7 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # 跑全部免费套件并统一汇总（shell-guard 238 + 审计修复 272 + P0 回归 95 + validation 16 + smoke + cross-cases 139），任一失败即非零退出
+npm test                                         # 跑全部免费套件并统一汇总（shell-guard 238 + 审计修复 272 + P0 回归 95 + validation 16 + smoke + cross-cases 149），任一失败即非零退出
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
 node scripts/cross-cases.mjs                    # 21 个 MECE 用例（136 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
@@ -266,7 +266,7 @@ node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立
 
 **改 `src/shell-guard.js` 的正则前必须跑 `npm test`**：那行正则的注释和模块 docstring 说明了它为什么必须包含 `|` 与 `&`（前缀匹配绕权），单看代码很容易误以为在降低误报率。
 
-**已实测通过的回归项**（Windows / npm 全局安装 / CC Switch 本地网关，无账号登录）：manual 模式下完整 review（中文报告、按 ≥80 规则把自标 BUG 评成 CRITICAL/MAJOR、低分项正确降级到 Notes）、`scope=branch` + `baseRef`（`git log main..HEAD` / `git diff main...HEAD`，`permission_denials=0`、guard 拦下 0 条）、fix 模式落盘且**未 commit**、`.git/` 未动、followup 用返回的 `session_id` 续上同一会话。更早一轮还验证过：带恶意 `.claude/settings.json` 的仓库不再执行仓库控制的 hook、取消后 2 秒内进程树清零。
+**已实测通过的回归项**（Windows / npm 全局安装 / CC Switch 本地网关，无账号登录）：manual 模式下完整 review（中文报告、按当时的 ≥80 规则把自标 BUG 评成 CRITICAL/MAJOR（现行为 ≥75）、低分项正确降级到 Notes）、`scope=branch` + `baseRef`（`git log main..HEAD` / `git diff main...HEAD`，`permission_denials=0`、guard 拦下 0 条）、fix 模式落盘且**未 commit**、`.git/` 未动、followup 用返回的 `session_id` 续上同一会话。更早一轮还验证过：带恶意 `.claude/settings.json` 的仓库不再执行仓库控制的 hook、取消后 2 秒内进程树清零。
 
 - 运行日志：`%TEMP%\cc-code-review\run-*.log`（保留 20 份；guard 临时文件与 git 沙箱 HOME 同目录，进程退出时清理，陈旧残留由下一次运行自动清扫）。
 - 从 v1.5.0 及更早版本升级（旧名 claude-review-mcp）：旧日志目录 `%TEMP%\claude-review-mcp` 不会被新版本触碰或删除，如含敏感引用请手动删除。

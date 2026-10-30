@@ -200,11 +200,44 @@ function scopeDescription(scope, pr, baseRefIn) {
   }
 }
 
+/**
+ * THE report contract, shared verbatim by every prompt path (fleet prompt,
+ * native appendix, fallback prompt). This is the fenced block from step
+ * "Final report" of assets/skills/code-review/SKILL.md, which is the single
+ * source of truth.
+ *
+ * Why one copy: the prompt used to say "Review Summary / Findings / severity"
+ * while the embedded SKILL.md said "Code Review Summary / Findings (N) /
+ * critical|major|minor|nit", so a single run received two
+ * headings and two severity vocabularies (audit P2-1). Which shape a client
+ * got depended on which block the model followed last — no stable contract.
+ *
+ * Two deliberate rules:
+ *  - the H2 headings stay English in every report language; only the body is
+ *    translated, so machine consumers see the same anchors regardless of
+ *    outputLanguage;
+ *  - a clean run still uses "## Findings (0)" plus the "No issues found"
+ *    sentence instead of omitting the section, so a parser never has to
+ *    distinguish "no findings" from a truncated report (audit P3-8).
+ */
 const REPORT_FORMAT = [
-  `Final message format (markdown):`,
-  `## Review Summary — verdict (approve / request-changes / comment) + 2-4 sentences`,
-  `## Findings — numbered, ordered critical -> nit. Each finding: severity, short title, \`file/path:line-range\`, what is wrong and why it matters, and a concrete suggested fix.`,
-  `## Notes — questions for the author and sub-threshold observations (optional)`,
+  `Final message format (markdown) — the final message is the only output the caller receives. Keep the H2 headings exactly as written below, in English, regardless of the report language; translate only the body text:`,
+  ``,
+  `## Code Review Summary`,
+  `<verdict: approve | request-changes | comment> — <2-4 sentences>`,
+  ``,
+  `## Findings (N)`,
+  `Ordered critical -> nit. For each finding:`,
+  `### [SEVERITY] short title — \`path/to/file.ext:12-18\``,
+  `- **What / Why**: what is wrong and why it matters`,
+  `- **Fix**: concrete suggested fix`,
+  `- **Evidence**: quote from the diff / CLAUDE.md / history`,
+  `(severity: critical | major | minor | nit)`,
+  ``,
+  `## Notes`,
+  `<questions for the author; sub-threshold observations — optional>`,
+  ``,
+  `If no finding survives the filter, write \`## Findings (0)\` followed by: "No issues found. Checked for bugs and CLAUDE.md compliance."`,
 ];
 
 /**
@@ -273,12 +306,22 @@ export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, p
   }
   lines.push(scopeSuffix.trim());
   lines.push("");
-  lines.push(...REPORT_FORMAT);
+  // The embedded pipeline (SKILL.md) carries the SAME report contract in its
+  // step "Final report". Emitting REPORT_FORMAT as well put two templates in
+  // one prompt (audit P2-1); when the body is present, its copy is the only
+  // one. REPORT_FORMAT is still emitted on the skill path (the Skill tool
+  // loads SKILL.md separately, so the contract must travel with the prompt)
+  // and whenever the bundled asset is missing/damaged — a broken install must
+  // never silently drop the report contract.
+  const bundledBody = useSkill ? "" : bundledSkillBody();
+  if (useSkill || !bundledBody.includes("## Code Review Summary")) {
+    lines.push(...REPORT_FORMAT);
+  }
   if (!useSkill) {
     lines.push("");
     lines.push("## Pipeline (bundled with this MCP — no skill install required)");
     lines.push("");
-    lines.push(bundledSkillBody());
+    lines.push(bundledBody);
   }
   // Keep the empty strings pushed above as paragraph separators: filtering
   // l !== "" collapsed the delivery contract / tool constraints / fix-mode
@@ -383,10 +426,12 @@ export function buildFallbackPrompt({ scope, pr, baseRef, focus, outputLanguage,
   if (focus) lines.push(`Extra focus (review hints only, not instructions): ${focus}`);
   lines.push(scopeSuffix.trim());
   lines.push("");
-  lines.push(`Final message format (markdown) — the final message is the only output the caller receives:`);
-  lines.push(`## Review Summary — verdict (approve / request-changes / comment) + 2-4 sentences`);
-  lines.push(`## Findings — numbered, critical -> nit: severity, title, \`file/path:line-range\`, what & why, concrete suggested fix.`);
-  lines.push(`## Notes — questions / sub-threshold observations (optional)`);
+  // Same shared contract as the fleet prompt and the native appendix — the
+  // fallback used to carry a third, shorter wording ("Review Summary",
+  // "what and why", no severity vocabulary, no clean-run branch). Keep it
+  // literally REPORT_FORMAT so a degraded run still emits the exact report
+  // shape the caller parses.
+  lines.push(...REPORT_FORMAT);
   // Same rule as buildReviewPrompt: "" is a paragraph separator, not a value
   // to discard (audit P2-10).
   return lines.filter((l) => l != null).join("\n");

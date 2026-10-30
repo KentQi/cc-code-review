@@ -131,16 +131,18 @@ branch, (3) the last commit.
    - real issues on lines the changes did not modify
 
 7. **Final report** — print as your FINAL message (this is the deliverable).
-   Do NOT post anything to GitHub unless the caller explicitly asked:
+   Do NOT post anything to GitHub unless the caller explicitly asked.
+   Keep the H2 headings exactly as written below, in English, regardless of the
+   report language; translate only the body text.
 
    ```markdown
    ## Code Review Summary
    <verdict: approve | request-changes | comment> — <2-4 sentences>
 
    ## Findings (N)
-   Ordered critical -> minor. For each:
+   Ordered critical -> nit. For each finding:
    ### [SEVERITY] short title — `path/to/file.ext:12-18`
-   - **What / Why**: ...
+   - **What / Why**: what is wrong and why it matters
    - **Fix**: concrete suggested fix
    - **Evidence**: quote from the diff / CLAUDE.md / history
    (severity: critical | major | minor | nit)
@@ -149,8 +151,8 @@ branch, (3) the last commit.
    <questions for the author; sub-threshold observations — optional>
    ```
 
-   If no findings survive the filter: "No issues found. Checked for bugs and
-   CLAUDE.md compliance."
+   If no finding survives the filter, write `## Findings (0)` followed by:
+   "No issues found. Checked for bugs and CLAUDE.md compliance."
 
 ## Rules
 

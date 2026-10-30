@@ -19,5 +19,5 @@ status: final
 **验证**：
 
 - 独立探针 14/14：普通仓库 `src/app.js`/`src/index.js`/`scripts/pre-tool-hook.js`/`assets/skills/x.md` 全部 ALLOW，`.env`/`.husky` 仍 DENY；自审时 `src/index.js`/`src/claude.js`/`scripts/pre-tool-hook.js`/`scripts/lib/**`/`assets/skills/**` 全部 DENY，`src/features/new.js` ALLOW；glob 层 generic 不含 `src/*.js`、self-review 含。
-- 套件：shell-guard 324（+4：isSelfReview / 表分离）、audit-fixes 318、p0-regression 256（+18：foreign ALLOW + self-review DENY + 跨层双 scope）、validation 31、pack 52、cross-cases 156/156、smoke PASS。
+- 套件：shell-guard 327（+4：isSelfReview / 表分离）、audit-fixes 318、p0-regression 256（+18：foreign ALLOW + self-review DENY + 跨层双 scope）、validation 31、pack 52、cross-cases 156/156、smoke PASS。
 - `npm test` 7/7（本机 + 克隆）。

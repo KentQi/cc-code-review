@@ -29,6 +29,8 @@ status: final
 - **1.18.3**：并发 fix 锁；sync 取消保留付费报告；指纹缓存窗口；逃生门收窄；信号退出；报告格式统一。
 - **1.18.4**：P2/P3 存量（guard 读写边界、transcript realpath、缓存 TTL、pack 回归、共享 MCP 客户端等）。
 - **1.18.5**：protocol.ext.allow 传输族 RCE；.git/config.worktree；node_modules/.gitattributes；长选项缩写（--cont / --files0 / --ignore-revs-file）；gh --body-file；find --；echo 部分引号；Grep/Glob 与 Bash 读边界；fix 模式 runner 配置扩表；include 越界/数量上限；postToPR 必须带 pr；scope=auto 的 baseRef；init.mjs 打包与 settings 凭据。
+- **1.18.6**：`GIT_HARDENING` 单一加固表 + 加载期断言；containment 单一实现；`rg --hidden/--no-ignore/-u` 与根级递归 grep 拒绝；坏 config/index fail-closed；package.json Edit 结果级检查；lockfile 迁回 registry.npmjs.org。
+- **1.18.7**：`find` 单/双横线长选项（`--files0-from`）与 `-D`/`-O` 值语义；自审保护整条 guard/spawn 管线（`src/*.js` 等）；hook 对无法判定的 payload fail-closed；Node ≥20 与 CI 矩阵/徽章一致。
 
 ## 3. 当前验证状态
 

@@ -253,10 +253,14 @@ const evilRepo = fs.mkdtempSync(path.join(os.tmpdir(), "evil-repo-"));
 fs.mkdirSync(path.join(evilRepo, ".git"), { recursive: true });
 const evilScript = path.join(evilRepo, "evil.sh");
 fs.writeFileSync(evilScript, "#!/bin/sh\n");
+// git config treats backslash as an escape character, so a Windows path written
+// raw turns the file into "bad config line N" — git then reads no key at all.
+// Git accepts forward slashes everywhere, so fixtures spell paths that way.
+const cfgPath = (p) => String(p).replace(/\\/g, "/");
 const setConfig = (text) => fs.writeFileSync(path.join(evilRepo, ".git", "config"), text);
 const gate = (p) => repoRunsGitPrograms(p);
 
-setConfig(`[core]\n\tfsmonitor = ${evilScript}\n`);
+setConfig(`[core]\n\tfsmonitor = ${cfgPath(evilScript)}\n`);
 check("repoRunsGitPrograms refuses a LIVE core.fsmonitor (file exists)", gate(evilRepo).refusals.length, 1);
 setConfig(`[core]\n\tfsmonitor = /Users/kent/Desktop/does-not-exist/fs.sh\n`);
 check("repoRunsGitPrograms downgrades a DEAD cross-OS fsmonitor to a note",
@@ -305,7 +309,7 @@ check("repoRunsGitPrograms notes a dead include target",
   fs.writeFileSync(path.join(deep, "inc1"), "[include]\n\tpath = inc2\n");
   fs.writeFileSync(path.join(deep, "inc2"), "[include]\n\tpath = inc3\n");
   fs.writeFileSync(path.join(deep, "inc3"), "[include]\n\tpath = inc4\n");
-  fs.writeFileSync(path.join(deep, "inc4"), `[core]\n\tfsmonitor = ${sh}\n`);
+  fs.writeFileSync(path.join(deep, "inc4"), `[core]\n\tfsmonitor = ${cfgPath(sh)}\n`);
   check("repoRunsGitPrograms follows a 4-level include chain to a live driver",
     gate(deep).refusals.length, 1);
   fs.rmSync(deep, { recursive: true, force: true });
@@ -323,11 +327,11 @@ setConfig("[core]\n\thooksPath = /Users/kent/Desktop/projects/ordering_system/.g
 check("repoRunsGitPrograms does NOT refuse a stale cross-OS hooksPath (the cloned-repo incident)",
   gate(evilRepo).refusals.length, 0);
 check("...and explains it in a note", gate(evilRepo).notes.length, 1);
-setConfig(`[core]\n\thooksPath = ${evilRepo}\n`);
+setConfig(`[core]\n\thooksPath = ${cfgPath(evilRepo)}\n`);
 check("repoRunsGitPrograms notes a LIVE hooksPath too (never refused — mutations are not allowlisted)",
   { refusals: gate(evilRepo).refusals.length, notes: gate(evilRepo).notes.length }, { refusals: 0, notes: 1 });
 // a LIVE absolute fsmonitor (file exists) still refuses — the real threat
-setConfig(`[core]\n\tfsmonitor = ${evilScript}\n`);
+setConfig(`[core]\n\tfsmonitor = ${cfgPath(evilScript)}\n`);
 check("repoRunsGitPrograms still refuses a live absolute fsmonitor path",
   gate(evilRepo).refusals.length, 1);
 // an ordinary remote/alias config must never be flagged
@@ -351,16 +355,16 @@ const G = () => repoRunsGitPrograms(g2);
 const spaceDir = path.join(g2, "dir with space");
 fs.mkdirSync(spaceDir, { recursive: true });
 fs.writeFileSync(path.join(spaceDir, "watch.exe"), "");
-cfg2(`[core]\n\tfsmonitor = "${path.join(spaceDir, "watch.exe")}" --daemon\n`);
+cfg2(`[core]\n\tfsmonitor = "${cfgPath(path.join(spaceDir, "watch.exe"))}" --daemon\n`);
 check("H1: live fsmonitor with a SPACE in its path is refused", G().refusals.length, 1);
 check("H1b: same fixture, dead twin with a space stays a note",
-  (cfg2(`[core]\n\tfsmonitor = "${path.join(g2, "no such space dir", "watch.exe")}"\n`), G()).notes.length, 1);
+  (cfg2(`[core]\n\tfsmonitor = "${cfgPath(path.join(g2, "no such space dir", "watch.exe"))}"\n`), G()).notes.length, 1);
 
 // H2: two driver references in one .gitattributes — dead first, live second.
 // The old loop broke after the first match, so the live one silently passed.
 fs.writeFileSync(path.join(g2, ".gitattributes"), "*.a diff=dead\n*.b diff=live\n");
 fs.writeFileSync(path.join(spaceDir, "live.sh"), "");
-cfg2(`[diff "dead"]\n\tcommand = /Users/kent/Desktop/nope/dead.sh\n[diff "live"]\n\tcommand = "${path.join(spaceDir, "live.sh")}"\n`);
+cfg2(`[diff "dead"]\n\tcommand = /Users/kent/Desktop/nope/dead.sh\n[diff "live"]\n\tcommand = "${cfgPath(path.join(spaceDir, "live.sh"))}"\n`);
 check("H2: the LIVE driver behind a dead one is still refused", G().refusals.length, 1);
 
 // H3: a .gitattributes one directory deep is scanned (the condition was
@@ -1092,7 +1096,9 @@ console.log("-- P2-1/P2-3/P1-13 single sources and fingerprint coverage");
   // the fingerprint, otherwise an upgraded hook and an old server would agree.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "af-fp-"));
   fs.mkdirSync(path.join(dir, "src"), { recursive: true });
-  const copy = path.join(dir, "src", "shell-guard.js");
+  // .mjs, not .js: the temp tree has no package.json, so Node 18 would treat a
+  // copied .js as CommonJS and fail the import (Node 22+ auto-detects ESM).
+  const copy = path.join(dir, "src", "shell-guard-copy.mjs");
   // Edit INSIDE a hashed rule function (the tables stay identical): this is the
   // "upgrade changed a rule, not a table" case the old fingerprint missed.
   const edited = fs.readFileSync(path.join(SRC, "shell-guard.js"), "utf8")

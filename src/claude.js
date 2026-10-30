@@ -5,6 +5,7 @@ import net from "node:net";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import { policyFingerprint } from "./shell-guard.js";
 
 const execFileAsync = promisify(execFile);
 const IS_WIN = process.platform === "win32";
@@ -385,6 +386,36 @@ export function buildClaudeEnv() {
       if (!covers(env[key])) env[key] = env[key] ? `${env[key]},${add}` : add;
     }
   }
+  // GIT_CONFIG_* is the ENV equivalent of "git -c key=value": it applies at
+  // command scope, which beats every config file the reviewer's git will read,
+  // and — unlike the server's own gitSpawnOpts()/GIT_HARDENING_ARGS — it follows
+  // git into the claude child and into every Bash tool call it makes. That is
+  // the layer the scanner below cannot be: .git/config can name a command the
+  // scan did not anticipate, and `git remote show origin` (allowlisted, and
+  // suggested by the prompt) runs core.sshCommand before any network I/O.
+  // The keys are exactly the ones a review needs to survive: a repository must
+  // not choose the ssh transport, the pager, the credential helper, the hook
+  // path, the fsmonitor, the external diff, or a third attributes file.
+  // A host-provided GIT_CONFIG_COUNT is preserved (entries are appended after
+  // it) so the server never silently drops config the caller injected.
+  const gitOverrides = [
+    ["core.sshCommand", ""],
+    ["core.fsmonitor", ""],
+    ["core.pager", "cat"], // a pager is a program; "cat" is the inert one
+    ["core.hooksPath", ""],
+    ["diff.external", ""],
+    ["credential.helper", ""],
+    // P0-9: attributesFile is a THIRD attributes source that can activate a
+    // live textconv driver on a plain `git log -p`; an empty value removes it.
+    ["core.attributesFile", ""],
+  ];
+  const hostCount = /^\d+$/.test(String(env.GIT_CONFIG_COUNT ?? "")) ? Number(env.GIT_CONFIG_COUNT) : 0;
+  gitOverrides.forEach(([key, value], i) => {
+    env["GIT_CONFIG_KEY_" + (hostCount + i)] = key;
+    env["GIT_CONFIG_VALUE_" + (hostCount + i)] = value;
+  });
+  env.GIT_CONFIG_COUNT = String(hostCount + gitOverrides.length);
+
   return env;
 }
 
@@ -776,18 +807,40 @@ export function recoverReportFromTranscript(filePath, maxBytes = 256 * 1024) {
 const normModel = (s) => String(s || "").toLowerCase().replace(/\[[^\]]*\]$/, "").trim();
 
 /**
+ * The family a model name belongs to (opus/sonnet/haiku) — null when the name
+ * carries no family token (a gateway model, or an old claude-2.x name).
+ *
+ * Needed because "claude-*" is NOT one family: a gateway that silently serves
+ * claude-haiku when claude-sonnet was requested is exactly the downgrade this
+ * provenance exists to report.
+ */
+const modelFamily = (m) => {
+  const hit = /(?:^|[-_.])(opus|sonnet|haiku)(?:[-_.\d]|$)/.exec(m);
+  return hit ? hit[1] : null;
+};
+
+/**
  * Is `effective` plausibly the model the caller asked for? A real Claude Code
  * session never reports a non-claude model name unless something rewrote it:
  * a gateway response tag (step-5-preview), a settings.json env mapping
  * (MiniMax-M3.1-Flash) or CLAUDE_CODE_SUBAGENT_MODEL. Aliases (opus) and dated
  * snapshots (claude-opus-5-20260101) still count as the same family.
+ *
+ * "Same family" is decided by the FAMILY token when both names carry one. The
+ * old early-return `true` for every claude-* name made the comparison below
+ * dead code, so the most common substitution of all — gateway downgrades
+ * sonnet→haiku inside the Claude family — was reported as native.
  */
 function sameModelFamily(effective, requested) {
   const e = normModel(effective);
   if (!e) return true; // unknown → never cry wolf
-  if (e.startsWith("claude-")) return true;
   const r = normModel(requested);
-  if (!r) return false; // nothing requested, and this is not a Claude model
+  // Nothing requested: a Claude session still reports a claude-* name, so any
+  // other name means the model was rewritten (unchanged behaviour).
+  if (!r) return e.startsWith("claude-");
+  const ef = modelFamily(e);
+  const rf = modelFamily(r);
+  if (ef && rf) return ef === rf;
   return e === r || e.startsWith(r) || r.startsWith(e) || e.includes(r) || r.includes(e);
 }
 
@@ -1011,7 +1064,11 @@ function sweepTempArtifacts(dir) {
       const st = fs.statSync(p);
       if (st.mtimeMs >= cutoff) continue;
       if (/^guard-settings-.*\.json$/.test(name) && st.isFile()) fs.rmSync(p, { force: true });
-      else if (/^subagents-.*\.jsonl$/.test(name) && st.isFile()) fs.rmSync(p, { force: true });
+      // A journal a live run still references must survive the sweep: deleting
+      // it would leave the result metadata (partial_reports_file) pointing at a
+      // path that no longer exists, which is the opposite of what retention
+      // promises. A settled run removes its own entry (see finish()).
+      else if (/^subagents-.*\.jsonl$/.test(name) && st.isFile() && !activeSubagentFiles.has(p)) fs.rmSync(p, { force: true });
       else if (/^cc-code-review-git-/.test(name) && st.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
     } catch { /* best effort */ }
   }
@@ -1162,7 +1219,39 @@ async function guardSelfTestProbe() {
         `check guardHookCommand() quoting for node at ${process.execPath} and the hook at ${HOOK_SCRIPT}`,
     };
   }
-  return { ok: true, reason: "verified: an unsafe command is denied (direct and via the shell-rendered command), a clean one allowed" };
+  // The hook is spawned from disk on every call while this process keeps the
+  // policy it loaded at startup. The probes above are structural, so they pass on
+  // BOTH versions — after an upgrade without a restart the server and the hook
+  // disagree while everything looks green. Compare the policy fingerprints and
+  // refuse on a mismatch (this is the "refuses to run" README/SECURITY promise).
+  const remote = await new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(process.execPath, [HOOK_SCRIPT], {
+        env: { ...buildClaudeEnv(), CC_REVIEW_GUARD_INFO: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch { resolve(null); return; }
+    const killer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } }, 15_000);
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.on("error", () => { clearTimeout(killer); resolve(null); });
+    child.on("close", () => {
+      clearTimeout(killer);
+      try { resolve(JSON.parse(out.trim().split(/\r?\n/).filter(Boolean).pop() || "{}")); } catch { resolve(null); }
+    });
+  });
+  const localFp = policyFingerprint();
+  if (!remote || remote.fingerprint !== localFp) {
+    return {
+      ok: false,
+      reason:
+        `the hook on disk enforces a different policy than this process (server ${localFp}, hook ${remote?.fingerprint ?? "unreadable"}) — ` +
+        "this process is still running the previous version while the hook file is the new one. Restart the MCP host (or ZCode) to apply the upgrade.",
+    };
+  }
+  return { ok: true, reason: "verified: an unsafe command is denied (direct and via the shell-rendered command), a clean one allowed, and the hook's policy matches this process" };
 }
 
 /**
@@ -1194,6 +1283,18 @@ export function writeGuardSettings(extra = {}) {
   try {
     const dir = path.join(os.tmpdir(), "cc-code-review");
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // mode: only applies on CREATE. On Linux /tmp is shared, so a pre-created
+    // /tmp/cc-code-review (or a symlink to an attacker-owned directory) would
+    // receive guard-settings-*.json — which claude reads at spawn time, i.e. the
+    // attacker could substitute the hook that is supposed to police this run.
+    // Refuse links, require our own uid, and force 0700 on the existing dir.
+    const dirStat = fs.lstatSync(dir);
+    if (dirStat.isSymbolicLink()) throw new Error("refusing a symlinked guard directory");
+    if (!dirStat.isDirectory()) throw new Error("guard path is not a directory");
+    if (typeof process.getuid === "function" && dirStat.uid !== process.getuid()) {
+      throw new Error("guard directory owned by uid " + dirStat.uid + ", not " + process.getuid());
+    }
+    if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
     sweepTempArtifacts(dir);
     const file = path.join(dir, `guard-settings-${process.pid}-${Math.random().toString(36).slice(2, 8)}.json`);
     fs.writeFileSync(file, JSON.stringify({
@@ -1628,6 +1729,10 @@ export function runClaude({
       // result — its answer arrives as a synthetic assistant message. Without
       // this the native pipeline would return a successful run with no report.
       if (json && !json.result && lastAssistantText) json.result = lastAssistantText;
+      // The journal belongs to THIS run: once the run settles, retention (the
+      // 20-file prune and the 2h sweep) may reclaim it again. Leaving the path
+      // in the set would pin it for the life of the server process.
+      if (subagentsFile) activeSubagentFiles.delete(subagentsFile);
       resolve({
         ok: !wasCancelled && !timedOut && code === 0 && !!json,
         json,
@@ -1764,6 +1869,17 @@ export function gitSpawnOpts(cwd, extraEnv = {}) {
  *
  * Only the repo's own files are read, so an ordinary LFS repo (filter defined in
  * the user's global config, not in `.git/config`) is not flagged.
+ *
+ * Since 1.18.2 the config keys are NOT decided by this table when git is
+ * available: repoRunsGitPrograms asks git itself for the normalized keys
+ * (git config --file <cfg> --list -z) and classifies them against
+ * CONFIG_EXEC_KEYS / CONFIG_DRIVER_KEY below. A line table cannot model
+ * case-insensitive names, quoting, comments, dotted subsections or same-line
+ * section headers — which is exactly how core.sshCommand slipped past
+ * command-equals (no word boundary before the capital C) and how
+ * core.attributesFile matched nothing at all, while git executed both (P0-8,
+ * P0-9). These patterns remain the DEGRADED fallback for a host without a
+ * usable git, so they carry the same keys.
  */
 const CONFIG_CMD_PATTERNS = [
   /\btextconv\s*=/i,
@@ -1774,6 +1890,15 @@ const CONFIG_CMD_PATTERNS = [
   /\bprocess\s*=/i,
   /\bfilter\s*\.[\w.-]+\s*\.\s*(clean|smudge|process)\s*=/i,
   /\b(clean|smudge)\s*=/i,
+  // P0-8: keys the old table could not see. core.sshCommand has no word
+  // boundary before "Command", so it needs a boundary-free form; the rest of
+  // the same family (pager / gitProxy / credential helper) executes a
+  // repo-chosen program too. The normalized path above is primary — this is
+  // only for hosts where git itself is unusable.
+  /(^|[.\s])sshcommand\s*=/i,
+  /(^|[.\s])gitproxy\s*=/i,
+  /(^|[.\s])pager\s*=/i,
+  /\bhelper\s*=/i,
 ];
 // `core.fsmonitor` is a command only when it is not a boolean (`true` uses git's
 // built-in monitor and is harmless — and is neutralised by -c anyway).
@@ -1781,6 +1906,70 @@ const FSMONITOR_CMD = /\bfsmonitor\s*=\s*(.+)/i;
 // `core.hooksPath` and `[include] path` are PATH-valued, not command-valued.
 const HOOKS_PATH = /\bhooksPath\s*=\s*(.+)/i;
 const INCLUDE_PATH = /^\s*path\s*=\s*(.+?)\s*$/i;
+/**
+ * Normalized-key tables. git config --list lowercases the section and the
+ * variable name (a subsection keeps its spelling, which is why driver names are
+ * compared case-insensitively below), so these are the spellings to match.
+ */
+
+/** Keys whose VALUE git executes. */
+const CONFIG_EXEC_KEYS = new Set([
+  "core.sshcommand",
+  "core.fsmonitor",
+  "core.pager",
+  "core.gitproxy",
+  "diff.external",
+]);
+/** credential.helper, plain and in the credential.<url>.helper form. */
+const CONFIG_CREDENTIAL_HELPER = /^credential(?:\..+)?\.helper$/;
+/**
+ * A NAMED driver's command (diff.<name>.textconv, filter.<name>.process, ...).
+ * Not refused on sight: git runs a named driver only when an attributes file
+ * references it — that cross-check is what keeps an unreferenced definition
+ * inert (and what keeps an ordinary global-config LFS filter from flagging
+ * every repo). diff.external has no name, so it is in CONFIG_EXEC_KEYS.
+ */
+const CONFIG_DRIVER_KEY = /^(diff|filter)\.(.+)\.(textconv|external|command|difffilter|clean|smudge|process)$/;
+/** The old line table refused merge drivers; keep that behaviour. */
+const CONFIG_MERGE_DRIVER = /^merge\..+\.driver$/;
+/** core.attributesFile: a PATH, not a command — collected and scanned (P0-9). */
+const CONFIG_ATTR_FILE_KEY = "core.attributesfile";
+const CONFIG_HOOKS_PATH_KEY = "core.hookspath";
+const CONFIG_INCLUDE_PATH_KEY = /^include(?:if\..+)?\.path$/;
+const CONFIG_BOOLEAN = /^(true|false|1|0|yes|no|on|off)$/i;
+
+/**
+ * One already-validated config file's entries as GIT normalizes them.
+ *
+ * "git config --file <cfg> --no-includes --list -z" emits one key/value record
+ * per entry (fields separated by a newline, records by NUL; a bare boolean key
+ * has no newline and therefore no value) and accepts everything git accepts —
+ * quoting, comments, case, dotted subsections, continuation lines and a section
+ * header sharing its line with the first key. That is the point: the scan must
+ * see keys the way git sees them, not the way a regex guesses. --no-includes
+ * keeps the result scoped to the file repoConfigFiles() already validated and
+ * labeled (it walked the include graph itself), so a finding can never be
+ * attributed to the wrong file.
+ *
+ * Returns null when git is missing, times out, or refuses the file; the caller
+ * then falls back to the line scan — degraded, never silent.
+ */
+function normalizedConfigEntries(file, repoPath) {
+  let res;
+  try {
+    res = spawnSync("git", [...GIT_HARDENING_ARGS, "config", "--file", file, "--no-includes", "--list", "-z"], gitSpawnOpts(repoPath));
+  } catch { return null; }
+  if (!res || res.error || res.status !== 0 || !Buffer.isBuffer(res.stdout)) return null;
+  const entries = [];
+  for (const rec of res.stdout.toString("utf8").split("\0")) {
+    if (!rec) continue;
+    const nl = rec.indexOf("\n");
+    entries.push(nl < 0
+      ? { key: rec.toLowerCase(), value: null }
+      : { key: rec.slice(0, nl).toLowerCase(), value: rec.slice(nl + 1) });
+  }
+  return entries;
+}
 
 /**
  * Can we PROVE this config value cannot execute on THIS machine?
@@ -1997,13 +2186,16 @@ function repoConfigFiles(repoPath) {
  * deep" scan never looked, so depth>=2 references were invisible (P0-4). The walk
  * is bounded (depth and file count) so an adversarial tree cannot turn this
  * pre-spawn scan into a denial of service of its own. Same
- * { files, refusals } shape as repoConfigFiles.
+ * { files, refusals } shape as repoConfigFiles, plus notes for sources that
+ * provably cannot run anything here (a dead core.attributesFile path).
  */
 const MAX_ATTR_DEPTH = 16;
 const MAX_ATTR_FILES = 4000;
-function repoAttributeFiles(repoPath) {
+function repoAttributeFiles(repoPath, attributeSources = []) {
   const files = [];
   const refusals = [];
+  // Dead paths and other provably-inert sources are notes, not refusals.
+  const notes = [];
   const seenRels = new Set();
   let seen = 0;
   // A truncated walk is a hole, not a performance detail: an attribute file the
@@ -2019,12 +2211,55 @@ function repoAttributeFiles(repoPath) {
     seenRels.add(rel);
     const read = readRepoFile(path.join(repoPath, rel), repoPath, { followSymlink });
     if (!read) return;
-    if (read.refusal) { refusals.push(`${rel}: ${read.refusal}`); return; }
+    if (read.refusal) { refusals.push(rel + ": " + read.refusal); return; }
     files.push({ file: path.join(repoPath, rel), label: rel, text: read.text });
   };
   // The worktree root plus git's own per-repo file (not cloned, but a zip can ship it).
   add(".gitattributes");
   add(path.join(".git", "info", "attributes"), true);
+  // P0-9: core.attributesFile is git's THIRD attributes source, and the only one
+  // a repository can point at a file it fully controls — yet the scan used to
+  // read just the two well-known files. Git applies that file on every diff/log,
+  // so a driver it names executes exactly like one named by .gitattributes.
+  // Only a PLAIN file inside the worktree is repository content that can be read
+  // and attributed safely; anything else is refused out loud, never skipped.
+  for (const { label, value } of attributeSources) {
+    const raw = String(value || "").trim().replace(/^["']|["']$/g, "");
+    if (!raw) continue; // empty value: git reads no extra attributes file
+    const resolved = raw.startsWith("~/") ? path.join(os.homedir(), raw.slice(2)) : raw;
+    const abs = path.isAbsolute(resolved) ? resolved : path.resolve(repoPath, resolved);
+    if (!fs.existsSync(abs)) {
+      // A path from another machine (or a stale relative one) is inert: git
+      // reads nothing, so this is a note, not a refusal.
+      notes.push(label + ": core.attributesFile = " + raw.slice(0, 120) +
+        " does not exist on this machine, so git reads no attributes file from it; proceeding");
+      continue;
+    }
+    let inside = false;
+    try {
+      const relToRoot = path.relative(fs.realpathSync(repoPath), fs.realpathSync(abs));
+      inside = relToRoot !== "" && !relToRoot.startsWith("..") && !path.isAbsolute(relToRoot);
+    } catch { inside = false; }
+    if (!inside) {
+      refusals.push(label + ": core.attributesFile = " + raw.slice(0, 120) +
+        " points outside the repository — git applies attributes from that file on every diff/log, so a driver " +
+        "it names cannot be verified. Point it at a file inside the tree, or remove the key from .git/config " +
+        "(git config --unset core.attributesFile)");
+      continue;
+    }
+    const rel = path.relative(repoPath, path.resolve(abs));
+    if (seenRels.has(rel)) continue;
+    const read = readRepoFile(abs, repoPath, { followSymlink: true });
+    if (!read) {
+      refusals.push(label + ": core.attributesFile = " + raw.slice(0, 120) +
+        " is not a regular file inside the repository (directory, FIFO/device, or a link out of the tree) — git " +
+        "would read it as attributes, so it cannot be verified; replace it with a plain file or remove the key");
+      continue;
+    }
+    if (read.refusal) { refusals.push(label + ": " + read.refusal); continue; }
+    seenRels.add(rel);
+    files.push({ file: abs, label: rel, text: read.text });
+  }
   const walk = (dirRel, depth) => {
     if (depth > MAX_ATTR_DEPTH || seen >= MAX_ATTR_FILES) { truncated = true; return; }
     let entries;
@@ -2039,8 +2274,10 @@ function repoAttributeFiles(repoPath) {
       if (e.isDirectory()) { walk(rel, depth + 1); continue; }
       if (e.name !== ".gitattributes") continue;
       // Hard cap, checked BEFORE the read: an adversarial tree cannot make this
-      // pre-spawn scan read an unbounded number of files.
-      if (seen >= MAX_ATTR_FILES) return;
+      // pre-spawn scan read an unbounded number of files. Hitting it HERE must
+      // fail closed too — this return used to leave truncated false, so the walk
+      // stopped "most" of the way through and the review still proceeded (P0-10).
+      if (seen >= MAX_ATTR_FILES) { truncated = true; return; }
       seen++;
       add(rel);
     }
@@ -2054,15 +2291,22 @@ function repoAttributeFiles(repoPath) {
       "shallower tree, or remove the excess attribute files.",
     );
   }
-  return { files, refusals };
+  return { files, refusals, notes };
 }
 
 /**
  * Does the repository's own git config / attributes try to run a program?
  *
- * `-c` overrides neutralise the keys we know about, but `.gitattributes` can name
+ * `-c` overrides neutralise the keys we know about, but .gitattributes can name
  * an arbitrary filter driver (`*.foo diff=evil`), and `diff.evil.command` then
  * executes. That surface cannot be closed with `-c`, so it is refused instead.
+ *
+ * The keys are read as GIT normalizes them (`git config --file <cfg> --list -z`
+ * per already-validated config file), not matched line by line: a line table
+ * cannot model case-insensitive names, quoting, comments, dotted subsections or
+ * same-line section headers, which is exactly how `core.sshCommand` (P0-8) and
+ * `core.attributesFile` (P0-9) stayed invisible while git executed them. The
+ * line scan survives only as the fallback for hosts without a usable git.
  *
  * Liveness-aware (v1.7.0): a config value whose path provably does not exist on
  * THIS machine — typically an absolute path that arrived from another OS via a
@@ -2091,7 +2335,8 @@ export function repoRunsGitPrograms(repoPath) {
   // one of its lines. The old header regex demanded a line of its own, so that
   // line was attributed to the PREVIOUS section (and, when that was a dead
   // driver, `continue`d as harmless): the driver was never registered and its
-  // command never scanned (P0-5).
+  // command never scanned (P0-5). Fallback path only — the normalized path below
+  // gets sections from git itself.
   const sectionsOf = (text) => {
     const out = [];
     let cur = { header: null, lines: [] };
@@ -2116,15 +2361,90 @@ export function repoRunsGitPrograms(repoPath) {
     return m ? m[1].trim().replace(/^["']|["']$/g, "") : null;
   };
 
-  const classify = (label, line, val) => {
-    const shown = `${label}: ${line.trim().slice(0, 120)}`;
-    if (deadPathOnThisMachine(val, repoPath)) notes.push(`${shown} — path does not exist on this machine (stale cross-machine config); cannot execute, proceeding`);
-    else refusals.push(shown);
-  };
-
   // driver name -> does its section (across ALL config files) carry a LIVE command?
   const driverLive = new Map();
-  for (const { label, text } of configs.files) {
+  // core.attributesFile values: git's third attributes source, scanned below (P0-9).
+  const attributeSources = [];
+
+  const shownKey = (label, key, value) => label + ": " + key + " = " + String(value ?? "").trim().slice(0, 120);
+
+  // A value git would EXECUTE. A dead absolute path (a config copied from another
+  // machine) cannot run anything, so it is a note: that is what keeps a clone
+  // carrying the previous owner's paths reviewable.
+  const refuseCommand = (label, key, value) => {
+    const line = shownKey(label, key, value);
+    if (deadPathOnThisMachine(value, repoPath)) {
+      notes.push(line + " — path does not exist on this machine (stale cross-machine config); cannot execute, proceeding");
+      return;
+    }
+    // Actionable for the model: name the exact key and the exact undo command.
+    // The label prefixes the line, so "that config file" is unambiguous even
+    // when the key came from an [include] target.
+    refusals.push(line + " — git executes this value; remove the key from that config file (git config --unset " + key +
+      " when it is .git/config) or review a copy of the repository without it");
+  };
+
+  const noteHooksPath = (label, value) => {
+    notes.push(shownKey(label, "core.hooksPath", value) + (deadPathOnThisMachine(value, repoPath)
+      ? " — hooksPath points at a path that does not exist on this machine (stale cross-machine config); ignored"
+      : " — noted, not refused: git hooks fire only on mutating operations, which the review allowlist never grants; this server's own git calls also neutralise core.hooksPath via -c"));
+  };
+
+  // One key/value pair as git normalized it (section and variable lowercased).
+  const scanKey = (label, key, value) => {
+    const val = value === null ? "" : String(value);
+    if (key === CONFIG_HOOKS_PATH_KEY) { noteHooksPath(label, val); return; }
+    if (CONFIG_INCLUDE_PATH_KEY.test(key)) {
+      const raw = val.trim();
+      if (!raw || raw.startsWith("~/")) return; // ~ is the user's own config, not repo-controlled
+      // The include itself is not execution; repoConfigFiles() already walked a
+      // readable target and its contents are evaluated like any other config.
+      // A dead target is a git no-op (git silently ignores unreadable includes).
+      if (deadPathOnThisMachine(raw, repoPath)) {
+        notes.push(shownKey(label, key, raw) + " — include target does not exist on this machine; git ignores it");
+      }
+      return;
+    }
+    // Not a command but a PATH git reads as attributes: collected here and
+    // resolved by repoAttributeFiles (P0-9).
+    if (key === CONFIG_ATTR_FILE_KEY) { attributeSources.push({ label, value: val }); return; }
+    const dm = CONFIG_DRIVER_KEY.exec(key);
+    if (dm) {
+      // A named driver only executes when an attributes file references it, so
+      // an unreferenced definition is inert (see the cross-check below). An
+      // EMPTY command is inert even when referenced — git has nothing to run.
+      if (!val.trim()) return;
+      const name = dm[2].toLowerCase();
+      if (deadPathOnThisMachine(val, repoPath)) {
+        if (!driverLive.has(name)) driverLive.set(name, false);
+      } else {
+        driverLive.set(name, true);
+      }
+      return;
+    }
+    if (!CONFIG_EXEC_KEYS.has(key) && !CONFIG_CREDENTIAL_HELPER.test(key) && !CONFIG_MERGE_DRIVER.test(key)) return;
+    const trimmed = val.trim();
+    if (!trimmed) return; // an empty value neutralises the key; it runs nothing
+    // core.fsmonitor accepts a boolean: true means git's built-in monitor.
+    if (key === "core.fsmonitor" && CONFIG_BOOLEAN.test(trimmed)) return;
+    // core.gitProxy's documented "none" form DISABLES the proxy; it runs nothing.
+    if (key === "core.gitproxy" && /^none(\s|$)/i.test(trimmed)) return;
+    refuseCommand(label, key, trimmed);
+  };
+
+  for (const { file, label, text } of configs.files) {
+    // Primary path: git itself normalizes this file, so case, quoting, comments,
+    // dotted subsections and same-line section headers cannot hide a key. Scoped
+    // to the file repoConfigFiles() already validated (the include graph is
+    // walked and labeled there), so every finding keeps its own label.
+    const entries = normalizedConfigEntries(file, repoPath);
+    if (entries) {
+      for (const { key, value } of entries) scanKey(label, key, value);
+      continue;
+    }
+    // Fallback: no usable git, or this file is not parseable. The line scan knows
+    // less (the camel-case keys are matched explicitly in CONFIG_CMD_PATTERNS),
+    // but it must never skip the file.
     for (const sec of sectionsOf(text)) {
       // Three legal spellings name a driver: [diff "evil"], [diff.evil] (dotted,
       // equivalent per git-config), and the filter twin. Only the quoted form used
@@ -2137,33 +2457,35 @@ export function repoRunsGitPrograms(repoPath) {
         if (!trimmed) continue;
         // git config comments: # or ; to end of line — never executable
         if (/^\s*[#;]/.test(line)) continue;
+        // The third attributes source is a PATH: collect it, do not judge it.
+        const af = /^\s*attributesfile\s*=\s*(.+?)\s*$/i.exec(line);
+        if (af) { attributeSources.push({ label, value: af[1].replace(/^["']|["']$/g, "") }); continue; }
         const hp = valueOf(line, HOOKS_PATH);
-        if (hp) {
-          const dead = deadPathOnThisMachine(hp, repoPath);
-          notes.push(`${label}: ${trimmed.slice(0, 120)}${dead
-            ? " — hooksPath points at a path that does not exist on this machine (stale cross-machine config); ignored"
-            : " — noted, not refused: git hooks fire only on mutating operations, which the review allowlist never grants; this server's own git calls also neutralise core.hooksPath via -c"}`);
-          continue;
-        }
+        if (hp) { noteHooksPath(label, hp); continue; }
         const inc = INCLUDE_PATH.exec(line);
         if (inc && /^include/i.test(sec.header || "")) {
           const raw = inc[1].trim().replace(/^["']|["']$/g, "");
           if (!raw || raw.startsWith("~/")) continue;
-          // The include itself is not execution; repoConfigFiles() already walked a
-          // readable target and its contents are evaluated like any other config.
-          // A dead target is a git no-op (git silently ignores unreadable includes).
-          if (deadPathOnThisMachine(raw, repoPath)) notes.push(`${label}: ${trimmed.slice(0, 120)} — include target does not exist on this machine; git ignores it`);
+          if (deadPathOnThisMachine(raw, repoPath)) notes.push(label + ": " + trimmed.slice(0, 120) + " — include target does not exist on this machine; git ignores it");
           continue;
         }
+        // core.gitProxy's "none" form disables the proxy; it runs nothing. The
+        // normalized path handles this explicitly; keep the fallback honest too.
+        if (/^\s*gitproxy\s*=\s*none(\s|$)/i.test(line)) continue;
         if (!isCmdLine(line)) continue;
         const val = rhs(line) ?? "";
         if (dmName) {
-          const dead = deadPathOnThisMachine(val, repoPath);
-          if (!dead) driverLive.set(dmName.toLowerCase(), true);
-          else if (!driverLive.has(dmName.toLowerCase())) driverLive.set(dmName.toLowerCase(), false);
+          const name = dmName.toLowerCase();
+          if (!deadPathOnThisMachine(val, repoPath)) driverLive.set(name, true);
+          else if (!driverLive.has(name)) driverLive.set(name, false);
           continue;
         }
-        classify(label, line, val);
+        if (!val.trim()) continue;
+        if (deadPathOnThisMachine(val, repoPath)) {
+          notes.push(label + ": " + trimmed.slice(0, 120) + " — path does not exist on this machine (stale cross-machine config); cannot execute, proceeding");
+        } else {
+          refusals.push(label + ": " + trimmed.slice(0, 120) + " — git executes this value; remove it from that config file or review a copy of the repository without it");
+        }
       }
     }
     // No trailing `$`: the header may share its line with the first key, and a
@@ -2175,19 +2497,20 @@ export function repoRunsGitPrograms(repoPath) {
     }
   }
 
-  const attrs = repoAttributeFiles(repoPath);
+  const attrs = repoAttributeFiles(repoPath, attributeSources);
   // An attribute file too large to read is a refusal: not reading it means not
   // knowing which driver it activates (see readRepoFile).
   refusals.push(...attrs.refusals);
+  notes.push(...attrs.notes);
   for (const { label: aLabel, text: aText } of attrs.files) {
     // EVERY driver reference on EVERY line matters (H2): stopping at the first
     // match let a live driver hide behind a dead one listed earlier.
     for (const line of aText.split(/\r?\n/)) {
       for (const m of line.matchAll(/\b(?:diff|filter)\s*=\s*([\w.-]+)/gi)) {
         const live = driverLive.get(m[1].toLowerCase()) === true;
-        const shown = `${aLabel}: ${line.trim().slice(0, 120)} (driver "${m[1]}" is defined in the repo's git config)`;
+        const shown = aLabel + ": " + line.trim().slice(0, 120) + " (driver \"" + m[1] + "\" is defined in the repo's git config)";
         if (live) refusals.push(shown);
-        else if (driverLive.has(m[1].toLowerCase())) notes.push(`${shown} — the driver's command points at a path that does not exist on this machine; cannot execute, proceeding`);
+        else if (driverLive.has(m[1].toLowerCase())) notes.push(shown + " — the driver's command points at a path that does not exist on this machine; cannot execute, proceeding");
       }
     }
   }

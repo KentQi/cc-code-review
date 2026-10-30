@@ -112,6 +112,17 @@ for (const [c, kind] of BAD) {
   check(`block (${kind}): ${JSON.stringify(c)}`, [v.ok, v.kind], [false, kind]);
 }
 
+/* ---- the segment cap is a real bound: 8 allowed, 9 refused ----
+   MAX_SEGMENTS = 8 had no coverage (the longest chain here was 3), so raising
+   or deleting the cap would have left every test green while a model could
+   chain an unbounded command list past the guard (audit P2-6). */
+const eightSegments = Array(8).fill("git status").join(" && ");
+const nineSegments = Array(9).fill("git status").join(" && ");
+check("segment cap: 8 commands allowed", analyseCommand(eightSegments, OPTS).ok, true);
+const nineVerdict = analyseCommand(nineSegments, OPTS);
+check("segment cap: 9 commands refused", [nineVerdict.ok, nineVerdict.kind], [false, "chained"]);
+check("segment cap: refusal names the limit", /limit 8/.test(nineVerdict.reason) && /9 commands/.test(nineVerdict.reason), true);
+
 /* ---- find/rg write+exec forms, git writers, sed/sort writers ---- */
 const DANGEROUS = [
   "find . -delete",

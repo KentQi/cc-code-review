@@ -24,9 +24,10 @@
  *     permission engine cannot drift), or be a pipe sink (head/tail/cat/grep/sort/…);
  *   - `cd` is allowed only as the first segment and only when it resolves to
  *     the reviewed repository root, where every Bash call already starts;
- *   - redirection, command substitution and unbalanced quotes stay refused;
- *   - find/rg write or execute flags, git's --output writers and sed -i stay
- *     refused on the segment that carries them.
+ *   - redirection, command substitution (including bare $VAR), and unbalanced
+ *     quotes stay refused;
+ *   - find/rg write or execute flags and git's --output writers stay refused
+ *     on the segment that carries them.
  *
  * Verified against claude 2.1.311's own code: a PreToolUse hook may return
  * "deny" or "ask", but an "allow" is stripped by the CLI's output sanitizer
@@ -40,12 +41,19 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
 /** Tools that only read their stdin: allowed after a pipe, never as command 1.
  *  No sed: its script language writes (w/W), executes (e) and reads (r) files in
  *  forms no parser caught in audit (a sed "execute" command ran on this machine).
- *  head/tail cover the line-range need; the rest goes through Read. */
-const PIPE_SINKS = new Set(["head", "tail", "cat", "wc", "uniq", "cut", "tr", "grep", "sort"]);
+ *  head/tail cover the line-range need; the rest goes through Read.
+ *
+ *  This set is the single source for the sink list: ALLOWED_HINT is rendered
+ *  from it and the set is exported so tests can assert the hook's surface.
+ *  Adding/removing a sink here is the only edit needed in this module — but
+ *  the human-facing copies (assets/skills/code-review/SKILL.md, README) are
+ *  separate documents and must be updated by whoever owns them. */
+export const PIPE_SINKS = new Set(["head", "tail", "cat", "wc", "uniq", "cut", "tr", "grep", "sort"]);
 
 /**
  * The Bash surface of a review. `exact` entries must match word-for-word (the
@@ -103,6 +111,28 @@ export const BASH_POLICY = [
   },
 ];
 
+/**
+ * A stable hash of every table that decides a verdict.
+ *
+ * An stdio server keeps the policy it loaded at startup while the hook is spawned
+ * fresh from disk on every Bash call. After an upgrade without a restart the two
+ * disagree — the server believes one policy, the hook enforces another — and the
+ * self-test used to pass anyway because its probes are structural. The hook
+ * exposes this fingerprint (CC_REVIEW_GUARD_INFO=1) so the self-test can compare
+ * the two and refuse to run on a mismatch, which is what README/SECURITY promise.
+ */
+export function policyFingerprint() {
+  const canon = JSON.stringify({
+    policy: BASH_POLICY,
+    pipes: [...PIPE_SINKS],
+    flags: FLAG_KINDS,
+    deny: OUTRIGHT_DENY,
+    findWrite: [...FIND_WRITE_FLAGS],
+    segments: MAX_SEGMENTS,
+  });
+  return crypto.createHash("sha256").update(canon).digest("hex").slice(0, 16);
+}
+
 /** The permission-engine rules for BASH_POLICY, e.g. "Bash(git status:*)". */
 export function bashAllowRules() {
   const rules = [];
@@ -123,32 +153,50 @@ const MAX_SEGMENTS = 8;
 const FIND_WRITE_FLAGS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"]);
 
 /**
+ * Does cmd[i] start an expansion bash performs BEFORE the command runs?
+ * Covers command substitution (`...`, $(...), ${...}) and a bare $NAME /
+ * positional / special parameter. A bare variable is the concrete credential
+ * leak this models: `echo $ANTHROPIC_API_KEY` reaches the guard as that text
+ * but runs as `echo <the key>`. Single quotes are literal (callers skip
+ * them); double quotes expand, so they are checked too.
+ */
+function startsExpansion(cmd, i) {
+  if (cmd[i] === "`") return true;
+  if (cmd[i] !== "$") return false;
+  const next = cmd[i + 1] || "";
+  return next === "(" || next === "{" || /[A-Za-z0-9_@*#?$!-]/.test(next);
+}
+
+/**
  * Split a shell command into simple-command segments without running anything.
  * Quote-aware: `git log --format="%h; %s"` is ONE segment. Reports the first
  * construct that makes the command unsafe regardless of the policy.
  *
- * @returns {{segs: {words: string[]}[], ops: string[], unsafe: null|"redirection"|"substitution"|"unbalanced"}}
+ * @returns {{segs: {words: string[]}[], ops: string[], unsafe: null|"redirection"|"substitution"|"unbalanced"|"ansi-quoting"}}
  */
 function parseCommand(cmd) {
   const segs = [];
   const ops = [];
   let words = [];
+  let quoted = [];        // parallel to words: was any part of this word quote-protected?
   let word = "";
+  let wordQuoted = false;
   let inWord = false;
   let quote = null;
   let unsafe = null;
 
   const endWord = () => {
-    if (inWord) { words.push(word); word = ""; inWord = false; }
+    if (inWord) { words.push(word); quoted.push(wordQuoted); word = ""; inWord = false; wordQuoted = false; }
   };
   const endSeg = (op) => {
     endWord();
-    if (words.length) { segs.push({ words }); words = []; }
+    if (words.length) { segs.push({ words, quoted }); words = []; quoted = []; }
     if (op) ops.push(op);
   };
 
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
+    if (quote !== null) wordQuoted = true; // any character that arrives inside quotes is literal
     if (quote === "'") {
       if (c === "'") quote = null; else word += c;
       continue;
@@ -166,11 +214,13 @@ function parseCommand(cmd) {
         continue;
       }
       if (c === '"') { quote = null; continue; }
-      if (c === "`" || (c === "$" && (cmd[i + 1] === "(" || cmd[i + 1] === "{"))) unsafe = unsafe || "substitution";
+      // Double quotes still expand $VAR / $(...) / `...`: quoting changes word
+      // splitting, not substitution, so the same check applies here.
+      if (startsExpansion(cmd, i)) unsafe = unsafe || "substitution";
       word += c;
       continue;
     }
-    if (c === "'" || c === '"') { quote = c; inWord = true; continue; }
+    if (c === "'" || c === '"') { quote = c; inWord = true; wordQuoted = true; continue; }
     if (c === "$" && (cmd[i + 1] === "'" || cmd[i + 1] === '"')) {
       // ANSI-C quoting ($'...') and locale quoting ($"...") are expanded by bash
       // BEFORE the command runs: $'-exec' is the argv word -exec. The parser only
@@ -192,7 +242,7 @@ function parseCommand(cmd) {
       // above, which is how the model writes them.
       const next = cmd[i + 1];
       if (next === "\n") { i++; continue; }          // line continuation: both gone
-      if (next !== undefined) { word += next; i++; inWord = true; }
+      if (next !== undefined) { word += next; i++; inWord = true; wordQuoted = true; }
       continue;
     }
     if (c === " " || c === "\t" || c === "\r") { endWord(); continue; }
@@ -206,7 +256,7 @@ function parseCommand(cmd) {
       continue;
     }
     if (c === ">" || c === "<") { unsafe = unsafe || "redirection"; continue; }
-    if (c === "`" || (c === "$" && (cmd[i + 1] === "(" || cmd[i + 1] === "{"))) unsafe = unsafe || "substitution";
+    if (startsExpansion(cmd, i)) unsafe = unsafe || "substitution";
     word += c;
     inWord = true;
   }
@@ -263,11 +313,24 @@ const FLAG_KINDS = {
     "--label": "skip", "--binary-files": "skip", "--color": "skip", "--colour": "skip",
     "--group-separator": "skip", "--initial-tab": "skip",
   },
-  sed: {
-    "-e": "pattern", "--expression": "pattern",
-    "-f": "path", "--file": "path",
-    "-l": "skip", "--line-length": "skip",
+  // find's expression starts at the first flag, so a file-reference
+  // predicate such as -newer never reached the leading-path loop. The
+  // expression pass in pathArgs checks these through this table (audit P2-2).
+  find: {
+    "-newer": "path", "-anewer": "path", "-cnewer": "path", "-samefile": "path",
   },
+  // tr is the only pipe sink whose operands were never path-checked (audit
+  // P0-2). Its -d/-s/-c families take a character SET, not a file, so that
+  // value is skipped; every other operand falls through to the positional
+  // path check below.
+  tr: {
+    "-d": "skip", "--delete": "skip",
+    "-s": "skip", "--squeeze-repeats": "skip",
+    "-c": "skip", "-C": "skip", "--complement": "skip",
+  },
+  // echo reads nothing, but bash expands globs and ~ before it runs (audit
+  // P0-1), so every positional is checked against the repository like a read.
+  echo: {},
   cat: {},
   ls: { "--block-size": "skip", "-I": "skip", "--ignore": "skip", "--time-style": "skip", "--format": "skip", "-w": "skip", "--width": "skip", "--color": "skip", "--quoting-style": "skip", "--sort": "skip" },
   head: { "-n": "skip", "--lines": "skip", "-c": "skip", "--bytes": "skip" },
@@ -308,10 +371,7 @@ const OUTRIGHT_DENY = {
     "--files0-from": "`sort --files0-from` follows a list of paths that may point outside the repository",
     "--random-source": "`sort --random-source` reads an arbitrary file outside the repository",
   },
-  sed: {
-    "-f": "`sed -f` runs a script file, which can write or execute (w/W/e) — use an inline line-range script",
-    "--file": "`sed -f` runs a script file, which can write or execute (w/W/e) — use an inline line-range script",
-  },
+
   rg: {
     "--pre": "`rg --pre` runs an arbitrary program",
     "--pre-glob": "`rg --pre-glob` runs an arbitrary program",
@@ -320,15 +380,19 @@ const OUTRIGHT_DENY = {
 
 /**
  * The tokens of one segment that name filesystem paths.
- * Program-specific because `rg FOO`'s first positional is a pattern, `sed -n
- * '1,5p'`'s is a script, and `find`'s paths come before its expression.
+ * Program-specific because `rg FOO`'s first positional is a pattern, and
+ * `find`'s leading paths are followed by an expression whose predicates may
+ * themselves name files (-newer, -samefile).
  */
 function pathArgs(words) {
   const prog = words[0];
   const rest = words.slice(1);
   if (prog === "find") {
-    // find [options] [paths...] [expression] — paths are the leading tokens
-    // that are not options and not the start of the expression.
+    // find [options] [paths...] [expression] — the leading tokens are the
+    // start paths; once the expression begins, only file-reference predicates
+    // name files (-newer FILE, -samefile FILE). Both forms must be checked:
+    // the old loop stopped at the first flag, so `find . -newer /etc/passwd`
+    // never reached the path check (audit P2-2).
     const out = [];
     let i = 0;
     for (; i < rest.length; i++) {
@@ -338,10 +402,21 @@ function pathArgs(words) {
       if (t.startsWith("-") || t === "(" || t === "!" || t === "\\(") break;
       out.push({ value: t });
     }
+    const kinds = FLAG_KINDS.find;
+    for (; i < rest.length; i++) {
+      const t = rest[i];
+      // -newerXY references a file unless Y is `t` (then the value is a date
+      // string, not a path).
+      if (kinds[t] !== "path" && !/^-newer[aBcm][aBcm]$/.test(t)) continue;
+      const v = rest[i + 1];
+      if (typeof v === "string") { out.push({ value: v }); i++; }
+    }
     return out;
   }
-  // Programs whose arguments are never filesystem paths.
-  if (prog === "tr" || prog === "git" || prog === "gh" || prog === "echo") return [];
+  // Programs whose arguments are never filesystem paths. git/gh report paths
+  // from the repository itself; every other program (echo and tr included)
+  // goes through FLAG_KINDS so its operands get the in-repo path check.
+  if (prog === "git" || prog === "gh" || prog === "echo") return [];
   const kinds = FLAG_KINDS[prog];
   if (!kinds) return [];
   const out = [];
@@ -388,8 +463,8 @@ function pathArgs(words) {
       continue; // self-contained flag
     }
     positional++;
-    // The first positional of rg/grep is a pattern; of sed, a script.
-    const takesPattern = (prog === "rg" || prog === "grep" || prog === "sed") && positional === 1 && !patternSeen && !noPattern;
+    // The first positional of rg/grep is a pattern, not a path.
+    const takesPattern = (prog === "rg" || prog === "grep") && positional === 1 && !patternSeen && !noPattern;
     if (takesPattern) continue;
     out.push({ value: t });
   }
@@ -486,7 +561,7 @@ function outrightDeny(words) {
  * positional). Applied to both policy commands and pipe sinks.
  * @returns {string | null}
  */
-function segmentProblem(words, repoRoot) {
+function segmentProblem(words, repoRoot, quoted = []) {
   const prog = words[0];
 
   const outright = outrightDeny(words);
@@ -504,6 +579,20 @@ function segmentProblem(words, repoRoot) {
       return `blocked: \`${write}\` makes git write a file, and a read-only review must not write anything (an allowlisted \`git diff\`/\`git show\`/\`git log\` call with --output= would otherwise be a file-write primitive for repo-controlled content). Drop the flag.`;
     }
   }
+  if (prog === "echo") {
+    // Bash performs tilde and pathname expansion BEFORE echo runs: `echo ~/*`
+    // prints the home listing and `echo ../*` the parent listing, so the
+    // operand the guard sees is not the one that executes. A review only
+    // needs literal text; refuse the expansion instead of checking a pattern
+    // that no longer describes the output (audit P0-1).
+    // Only UNQUOTED operands expand: `echo *` lists the cwd, but `echo "*"` prints
+    // a star and `echo 'price: $5'` prints text. The tokenizer records which words
+    // were quote-protected, so the legitimate literal form is not refused.
+    const expands = words.slice(1).find((w, i) => !quoted[i + 1] && (w.startsWith("~") || /[?*\[\]]/.test(w)));
+    if (expands) {
+      return `blocked: \`echo ${expands}\` is expanded by the shell before echo runs (a glob or ~ enumerates files the review must not list). Echo literal text without wildcards or ~; use the Read/Grep/Glob tools for file contents.`;
+    }
+  }
   if (prog === "sort") {
     // -oFILE / -TFILE (value glued to the short option) are the same write and
     // temp-dir escapes as their spaced forms; match the tight spelling too or the
@@ -513,17 +602,6 @@ function segmentProblem(words, repoRoot) {
       w.startsWith("--temporary-directory") || /^-[A-Za-z]*[oT]./.test(w));
     if (bad) {
       return "blocked: sort -o/--compress-program/--temporary-directory write files or run a program outside the reviewed repository. Review mode is read-only.";
-    }
-  }
-  if (prog === "sed") {
-    if (words.some((w) => w === "-i" || w.startsWith("-i.") || w.startsWith("--in-place"))) {
-      return "blocked: `sed -i` rewrites files in place. Review mode is read-only — drop -i.";
-    }
-    // sed scripts can write (w / W), execute (e) or read (r) files. Select by
-    // line range and print: that is the only form a review needs.
-    const script = words.slice(1).filter((w) => !w.startsWith("-")).join(" ");
-    if (/(^|[\s;{}0-9,])[wWe]\s/.test(script) || /\$[wWe]/.test(script)) {
-      return "blocked: this sed script uses a w/W/e command, which writes a file or runs a program. Read the range with the Read tool (offset/limit) or pipe the source through head/tail instead.";
     }
   }
   if (prog === "uniq" && pathArgs(words).length >= 2) {
@@ -582,7 +660,9 @@ const ALLOWED_HINT =
   "Allowed commands: git status|diff|show|log|blame|rev-parse|ls-files, git branch -a|--show-current|-vv, " +
   "git remote -v|get-url|show, git stash list|show, find, rg, ls, grep, echo, " +
   "gh pr view|diff|list|checks, gh repo view — " +
-  "and after a pipe: head, tail, cat, wc, uniq, cut, tr, grep, sort. " +
+  // Rendered from PIPE_SINKS, so the model-facing hint and the enforced sink
+  // set cannot drift apart (audit P2-8).
+  "and after a pipe: " + [...PIPE_SINKS].join(", ") + ". " +
   "For file contents use the Read/Grep/Glob tools instead of cat/head/tail; sed is not a permitted sink.";
 
 /**
@@ -615,8 +695,10 @@ export function analyseCommand(cmd, opts = {}) {
   if (parsed.unsafe === "substitution") {
     return {
       ok: false, kind: "substituted",
-      reason: "blocked: command substitution ($(), ``, ${} — including inside double quotes). The substitution runs " +
-        "before any permission check, so it would execute a command the allowlist never saw.",
+      reason: "blocked: variable or command substitution ($VAR, $(), ``, ${} — including inside double quotes). " +
+        "Bash expands it before any permission check, so it would read host values (credentials, paths) or run a " +
+        "nested command the allowlist never saw. Review mode is read-only and scoped to the repository — write a " +
+        "literal value, or use the Read/Grep tools.",
       chained: false, substituted: true,
     };
   }
@@ -676,14 +758,14 @@ export function analyseCommand(cmd, opts = {}) {
           chained, substituted: false, dangerous: true,
         };
       }
-      const why = segmentProblem(words, opts.repoRoot);
+      const why = segmentProblem(words, opts.repoRoot, segs[i].quoted);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }
 
     // A pipe sink consumes stdin only; it is never a valid first command.
     if (i > 0 && ops[i - 1] === "|" && PIPE_SINKS.has(words[0])) {
-      const why = segmentProblem(words, opts.repoRoot);
+      const why = segmentProblem(words, opts.repoRoot, segs[i].quoted);
       if (why) return { ok: false, kind: "dangerous", reason: why, chained, substituted: false, dangerous: true };
       continue;
     }

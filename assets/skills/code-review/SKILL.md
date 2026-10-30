@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Comprehensive code review pipeline with the same three-phase fleet claude's own /code-review uses — parallel finder subagents (8 at medium/high, 10 at max), one verifier per surviving candidate, a sweep finder — then 0-100 confidence scoring, keeps only findings >= 80, outputs a structured markdown report. Use when asked to review code changes, a pull request, a branch, or the working tree. Adapted from Anthropic's official code-review plugin.
+description: Comprehensive code review pipeline with the same three-phase fleet claude's own /code-review uses — parallel finder subagents (8 at medium/high, 10 at max), one verifier per surviving candidate, a sweep finder — then 0-100 confidence scoring, keeps only findings >= 75, outputs a structured markdown report. Use when asked to review code changes, a pull request, a branch, or the working tree. Adapted from Anthropic's official code-review plugin.
 ---
 
 # Code Review
@@ -70,12 +70,14 @@ branch, (3) the last commit.
    > list|show, find, rg, ls, grep, and gh pr view|diff|list|checks / gh repo view.
    > Commands may be combined with `&&`, `;` or `|` as long as EVERY part is one
    > of those read-only commands (after a pipe: head, tail, cat, wc, uniq, cut,
-   > tr, grep, sort; `echo` is allowed anywhere). No redirection (`>`,
-   > `>>`, `<`), no `$(...)` or backticks, no `&`, and no ANSI-C quoting
-   > (`$'...'`). Reads must stay inside the repository: `rg`/`find` with an
-   > outside path (`~`, `..`, an absolute path elsewhere) is refused, so search
-   > from `.`. For file contents and line ranges prefer the Read/Grep/Glob tools
-   > (sed is not a permitted sink).
+   > tr, grep, sort). `echo` prints **literal text only**: `$VAR` expansion,
+   > globs (`*`, `?`, `[...]`), `~` and paths outside the repository are all
+   > refused. No redirection (`>`,
+   > `>>`, `<`), no `$(...)`/backticks/`${...}`/bare `$VAR`, no `&`, and no
+   > ANSI-C quoting (`$'...'`). Reads must stay inside the repository: `rg`/`find`
+   > with an outside path (`~`, `..`, an absolute path elsewhere) is refused, so
+   > search from `.`. For file contents and line ranges prefer the Read/Grep/Glob
+   > tools (sed is not a permitted sink).
 
    Every subagent returns ONLY a JSON list of candidate issues — the same shape
    claude's own playbook uses:
@@ -116,7 +118,7 @@ branch, (3) the last commit.
    For convention findings, double-check the CLAUDE.md actually calls out that
    issue specifically.
 
-6. **Filter** — keep only findings with score >= 80. Apply the false-positive
+6. **Filter** — keep only findings with score >= 75. Apply the false-positive
    filter at steps 4 and 5; drop findings that are:
    - pre-existing issues not introduced by these changes
    - something that looks like a bug but is not

@@ -27,7 +27,7 @@ import {
   PERMISSION_MODE_MANUAL_MIN, PERMISSION_PROMPTS_MIN,
   supportsFlag, supportsStreamJson, supportsPermissionPrompts,
   writeGuardSettings, guardState, guardSelfTest, hookScriptPath, removeGuardSettings,
-  cleanupGuardSettings, settingsParseProblem, peekSettingsEnv, markGuardSettingsInFlight,
+  cleanupGuardSettings, activeSubagentFiles, settingsParseProblem, peekSettingsEnv, markGuardSettingsInFlight,
   analyseCommand, shellGuardNote, shellChainingNote,
   probeGateway, gatewayTarget, authEnvResidue, modelEnvOverrides, gitPreflight,
   buildClaudeEnv, repoRunsGitPrograms, gitSpawnOpts, GIT_HARDENING_ARGS,
@@ -36,7 +36,7 @@ import {
 import {
   buildReviewPrompt, buildFallbackPrompt, buildFollowupPrompt, buildNativeCommand, buildNativeAppendix,
   reviewAllowedTools, reviewDisallowedTools, fixAllowedTools, fixDisallowedTools, postPROnlyTools,
-  deriveReviewLevel,
+  deriveReviewLevel, validateBaseRef,
 } from "./prompt.js";
 
 /**
@@ -92,7 +92,14 @@ const JOB_KEEP = 10;
 function pruneReviewJobs() {
   // A finished job is either "done" (a successful result) or "failed" (the tool
   // result was an error); every other state is still in flight and addressable.
-  const finished = [...reviewJobs.values()].filter((j) => j.state === "done" || j.state === "failed");
+  const finished = [...reviewJobs.values()]
+    .filter((j) => j.state === "done" || j.state === "failed")
+    // Evict in COMPLETION order. The Map's insertion order is START order, so a
+    // long review that started first and finished last was the first entry
+    // deleted the moment it settled — a client polling it got "unknown jobId"
+    // right after it completed (audit P2-4). settledAt is stamped by
+    // settleReviewJob; finishedAt is the older field kept for compatibility.
+    .sort((a, b) => (a.settledAt ?? a.finishedAt ?? 0) - (b.settledAt ?? b.finishedAt ?? 0));
   for (const j of finished.slice(0, Math.max(0, finished.length - JOB_KEEP))) reviewJobs.delete(j.id);
 }
 /**
@@ -105,6 +112,9 @@ function settleReviewJob(job, result) {
   job.result = result;
   job.state = result?.isError === true ? "failed" : "done";
   job.finishedAt = Date.now();
+  // Completion time, used by pruneReviewJobs to evict the oldest FINISHED job
+  // instead of the oldest STARTED one.
+  job.settledAt = job.finishedAt;
 }
 /**
  * Add the polled jobId to a finished async result. It used to be dropped once
@@ -123,11 +133,34 @@ function logsDir() {
   // the logs at a directory their own ACLs protect (see README "已知残留风险（Windows）").
   const base = process.env.CLAUDE_REVIEW_LOG_DIR?.trim() || path.join(os.tmpdir(), "cc-code-review");
   const dir = path.resolve(base);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // mode: only applies when the directory is CREATED. On Linux /tmp is shared,
+    // so a pre-existing /tmp/cc-code-review (or a symlink to an attacker-owned
+    // directory) would otherwise receive the run logs and the guard settings file
+    // — the latter is read by claude at spawn time, i.e. it is a hook-injection
+    // point. Refuse links, require our own uid, and force 0700.
+    const st = fs.lstatSync(dir);
+    if (st.isSymbolicLink()) throw new Error("refusing a symlinked log directory");
+    if (!st.isDirectory()) throw new Error("not a directory");
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+      throw new Error("owned by uid " + st.uid + ", not " + process.getuid());
+    }
+    if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+  } catch (e) {
+    // Sync runs (waitForResult=true) used to let a raw ENOTDIR/EACCES/ENOSPC
+    // escape the tool handler as an opaque internal error. Name the directory
+    // and mark the error so both run paths can turn it into an actionable tool
+    // result before any paid work starts (audit P2-12).
+    const err = new Error(`log directory ${dir} could not be created (${e?.code || e?.message || e})`);
+    err.code = "CCR_LOG_DIR_UNWRITABLE";
+    err.logDir = dir;
+    throw err;
+  }
   return dir;
 }
 
-function writeLogFile(stdout, stderr) {
+function writeLogFile(stdout, stderr, protectedFiles = []) {
   try {
     const dir = logsDir();
     const file = path.join(dir, `run-${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.log`);
@@ -141,7 +174,19 @@ function writeLogFile(stdout, stderr) {
     fs.writeFileSync(file, `# claude stdout\n${stdout}\n\n# claude stderr\n${stderrPart}\n`, { mode: 0o600 });
     // retention: keep the newest LOG_KEEP logs
     try {
-      const all = fs.readdirSync(dir).filter((f) => f.startsWith("run-") || (f.startsWith("subagents-") && f.endsWith(".jsonl")));
+      // A subagent journal is the durable copy of reports the caller can still
+      // read (partial_reports_file); the 20-file retention must skip it even
+      // when its mtime falls outside the newest 20. Two protections are needed:
+      //  - activeSubagentFiles: a run still in flight;
+      //  - protectedFiles: this run's own journal. claude.js drops the active
+      //    mark when the run settles, and this function runs right after, so
+      //    without it the just-finished run's result would name a file this
+      //    retention deletes one statement earlier (audit P1-2).
+      const keep = new Set([...activeSubagentFiles, ...protectedFiles].filter(Boolean).map((p) => path.resolve(p)));
+      const all = fs.readdirSync(dir).filter((f) =>
+        f.startsWith("run-") ||
+        (f.startsWith("subagents-") && f.endsWith(".jsonl") && !keep.has(path.resolve(dir, f)))
+      );
       const olds = all.map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
       for (const { f } of olds.slice(LOG_KEEP)) fs.rmSync(path.join(dir, f), { force: true });
     } catch { /* best effort */ }
@@ -239,55 +284,11 @@ function validateLanguage(lang) {
   return { ok: true, lang: s };
 }
 
-/**
- * baseRef is interpolated into the reviewer prompt AND echoed back into the
- * suggested `git merge-base <ref> HEAD` commands. A leading "-" would turn the
- * ref into a git option (`git merge-base --output=... HEAD` writes a file), so
- * the shape is enforced here instead of trusting sanitizeBaseRef downstream.
- *
- * Whitespace is refused for the same reason through a different door: the native
- * pipeline appends baseRef to the `/code-review <level> <target>` command string
- * (prompt.js), and claude parses that command's own flags ANYWHERE in the string
- * — so a `"main --fix"` baseRef would turn a fix=false run into a fix run (and
- * `"main --comment"` would post to the PR) while still looking like a ref.
- * One ref token, git-safe charset, nothing else.
- */
-function validateBaseRef(ref) {
-  if (!ref) return { ok: true, ref: undefined };
-  const s = String(ref).trim();
-  if (!s) return { ok: true, ref: undefined };
-  if (s.length > 200) return { ok: false, error: "baseRef must be a short ref name (<= 200 chars)" };
-  // Before the charset check, so the original leading-"-" diagnosis (the git
-  // --output=<file> write) keeps its dedicated, actionable message.
-  if (s.startsWith("-")) {
-    return {
-      ok: false,
-      error:
-        `baseRef must not start with "-" (got ${JSON.stringify(ref)}): it would be parsed as a git option ` +
-        `(e.g. git merge-base --output=<file> HEAD writes a file) instead of as a ref. Pass the plain name, e.g. "main".`,
-    };
-  }
-  if (/\s/.test(s)) {
-    return {
-      ok: false,
-      error:
-        `baseRef must be a single ref name with no whitespace (got ${JSON.stringify(ref)}). ` +
-        `It is appended to claude's "/code-review <level> <target>" command, where claude parses flags anywhere in the string: ` +
-        `"main --fix" would enable fix mode and "main --comment" would post to the PR instead of naming a base ref. ` +
-        `Pass just the branch/tag, e.g. "main".`,
-    };
-  }
-  if (!/^[A-Za-z0-9._/@^~-]+$/.test(s)) {
-    return {
-      ok: false,
-      error:
-        `baseRef must be a plain git ref — letters, digits, ".", "_", "/", "@", "^", "~", "-" (got ${JSON.stringify(ref)}). ` +
-        `It is interpolated into claude's /code-review command and into the reviewer's suggested git commands, so any other ` +
-        `character (shell metacharacters, quotes, "{}", ":") is refused. Use the ref as git spells it, e.g. "main", "origin/release-1.2", "v1.2.3", "HEAD~1".`,
-    };
-  }
-  return { ok: true, ref: s };
-}
+// baseRef is validated by prompt.js's validateBaseRef — the SAME function the
+// prompt builder uses to decide it can spell the ref. Keeping one rule is what
+// stops a value the preflight accepts from being silently dropped from the
+// reviewer prompt (audit P0-5): the two validators used to disagree on "^",
+// "~" and "@", so a fleet review of "HEAD~1" reviewed the default-branch diff.
 
 /**
  * sessionId goes straight into argv as `--resume <sessionId>` (claude.js). A
@@ -404,6 +405,39 @@ function subagentReportsText(reports, cap = 4000) {
     return `${head}\n\n${shown}`;
   });
   return `## Reviewer subagent reports (${reports.length} dispatched)\n\n${blocks.join("\n\n")}`;
+}
+
+/**
+ * Split one run's `permission_denials` into the two things a denial can mean.
+ *
+ * A denial the guard produced is the guard doing its job, not a degraded
+ * review: the reviewer combined steps (or asked git to write a file) and can
+ * retry differently. Everything else is a real allowlist gap that may have
+ * degraded the run and must be reported. Shared by claude_code_review and
+ * claude_review_followup: the followup used to pass an EMPTY denied set to the
+ * chaining reporter, so every command the guard correctly blocked was reported
+ * as "RAN WITHOUT BEING BLOCKED ... treat this repository as hostile", while a
+ * real denial in a followup was never reported at all (audit P0-7).
+ */
+function classifyDenials(json, repoPath) {
+  const denials = Array.isArray(json?.permission_denials) ? json.permission_denials : [];
+  const deniedCommands = denials.map((d) => d?.tool_input?.command).filter((c) => typeof c === "string");
+  // The predicate is the same one the hook applies, so "reported as blocked"
+  // and "actually blocked" cannot disagree.
+  const guardWouldBlock = (cmd) => !analyseCommand(cmd, { repoRoot: repoPath }).ok;
+  const guardBlocked = deniedCommands.filter(guardWouldBlock);
+  const realDenials = denials.filter((d) => {
+    const cmd = d?.tool_input?.command;
+    return typeof cmd !== "string" || !guardWouldBlock(cmd);
+  });
+  const denialNote = realDenials.length
+    ? `⚠ ${realDenials.length} tool call(s) were denied by the permission allowlist (this MCP runs claude with --permission-mode manual) — the review may be incomplete: ` +
+      [...new Set(realDenials.map((d) => d?.tool_name || d?.tool || JSON.stringify(d)))].slice(0, 10).join(", ")
+    : "";
+  // Same options as the hook: `cd <repoRoot>` is allowed, so it must not be
+  // reported as a guard block here either.
+  const guardNote = shellGuardNote(deniedCommands, deniedCommands, { repoRoot: repoPath }) || "";
+  return { deniedCommands, guardBlocked, realDenials, denialNote, guardNote };
 }
 
 function logNoteOf(logFile) {
@@ -593,8 +627,13 @@ const server = new McpServer(
   {
     instructions:
       "Run Claude Code's code-review skill on a repository and get structured findings back. " +
-      "Typical flow: claude_code_review(repoPath, scope) -> fix code in ZCode -> claude_code_review again, " +
-      "or claude_review_followup(sessionId) to ask the reviewer something.",
+      // The default is async (a real review takes 2-15 min, longer than most clients
+      // hold a tool call), so the flow the model follows MUST include the poll step —
+      // the previous text described a synchronous call and models never polled.
+      "Typical flow: claude_code_review(repoPath, scope) returns a jobId immediately -> " +
+      "poll claude_review_status(jobId) until it returns the report -> fix the code -> run claude_code_review again to verify, " +
+      "or claude_review_followup(sessionId, message) to ask the reviewer something. " +
+      "Pass waitForResult=true only when the client can hold the call for the whole review.",
   }
 );
 
@@ -614,7 +653,11 @@ const server = new McpServer(
  */
 function maskCredentialValue(v) {
   const s = String(v ?? "");
-  return s.length < 12 ? `… (len ${s.length})` : `${s.slice(0, 6)}… (len ${s.length})`;
+  // A 6-char prefix of a 12-char secret is exactly half of it — the old
+  // boundary leaked half of every short-to-medium credential. Show at most 4
+  // characters (the same maximum scripts/init.mjs uses), and hide anything
+  // under 16 completely: length alone still disambiguates two similar values.
+  return s.length < 16 ? `… (len ${s.length})` : `${s.slice(0, 4)}… (len ${s.length})`;
 }
 
 /**
@@ -887,8 +930,25 @@ server.tool(
       // ANTHROPIC_API_KEY in the host env is exactly what a direct login looks like.
       // And when the gateway itself IS configured via the host env (the env-only
       // injection path), ANTHROPIC_BASE_URL is not residue — it is the config.
-      const baseIsGateway = t && process.env.ANTHROPIC_BASE_URL && t.url.href === new URL(process.env.ANTHROPIC_BASE_URL).href;
+      // gatewayTarget() is settings-aware and already ignored an unparseable
+      // URL, but process.env is the RAW host value: comparing it with new URL()
+      // unguarded made a malformed host ANTHROPIC_BASE_URL throw a TypeError out
+      // of the whole env diagnostic when settings.json held a valid gateway
+      // (audit P1-7). Treat it as "not the gateway" and say so.
+      let hostBaseUrl = null;
+      let hostBaseUnparseable = false;
+      if (process.env.ANTHROPIC_BASE_URL) {
+        try { hostBaseUrl = new URL(process.env.ANTHROPIC_BASE_URL).href; }
+        catch { hostBaseUnparseable = true; }
+      }
+      const baseIsGateway = !!(t && hostBaseUrl && t.url.href === hostBaseUrl);
       const realResidue = baseIsGateway ? residue.filter((k) => k !== "ANTHROPIC_BASE_URL") : residue;
+      if (hostBaseUnparseable) {
+        lines.push(
+          `⚠ ANTHROPIC_BASE_URL in this server's environment is not a parseable URL, so it was ignored for the gateway check ` +
+          `(the value from ~/.claude/settings.json, if any, still applies). Fix or unset it in the host environment.`
+        );
+      }
       if (baseIsGateway) {
         lines.push(`note: the gateway is configured via the host environment (ANTHROPIC_BASE_URL=${gatewayDisplay(t)}), not ~/.claude/settings.json — this works as-is.`);
       }
@@ -985,7 +1045,7 @@ function describePipelineAvailability() {
 
 server.tool(
   "claude_code_review",
-  "Run Claude Code's code-review skill (a diff-sized fleet of parallel reviewer subagents, 0-100 confidence scoring, keeps findings >=80). " +
+  "Run Claude Code's code-review skill (a diff-sized fleet of parallel reviewer subagents, 0-100 confidence scoring, keeps findings >=75). " +
   "Every finished reviewer subagent's report is captured the moment it lands — appended to a durable JSONL file and visible via claude_review_status while the run continues — and an agent killed mid-flight (e.g. a 429) is recovered from its output_file transcript, so a rate limit never wastes the work already paid for. " +
   "on a repository and return the markdown report. Costs Claude API credits; a run typically takes 2-15 minutes. " +
   "Afterwards, fix the code and re-run to verify, or use claude_review_followup with the returned session_id.",
@@ -1032,6 +1092,18 @@ server.tool(
 
     const prCheck = validatePr(args.pr);
     if (!prCheck.ok) return err(prCheck.error);
+    // scope=pr without a pr used to reach the reviewer as the literal
+    // "pull request undefined" (fleet prompt) or as a native command with no
+    // target (which silently reviews claude's inferred default). Both paths
+    // review something other than what the caller asked for, and the report
+    // looks normal — so fail closed before anything paid starts (audit P0-6).
+    if (scope === "pr" && !prCheck.pr) {
+      return err(
+        `scope=pr requires a pr — pass the PR number ("123"), "owner/repo#123", or a GitHub PR URL. ` +
+        `Without it the fleet prompt would name "pull request undefined" and the native /code-review command would silently ` +
+        `fall back to claude's inferred default target, so the review would cover a different diff than the one you asked for.`
+      );
+    }
     const langCheck = validateLanguage(args.outputLanguage);
     if (!langCheck.ok) return err(langCheck.error);
     const baseRefCheck = validateBaseRef(baseRef);
@@ -1157,7 +1229,12 @@ server.tool(
       }
     }
     if (pipeline === "native" && shadow) {
-      return err(
+      // preflightFail, not err: prepareRunHardening already marked this run's
+      // guard settings in-flight, and only runClaude (or this helper) releases
+      // it. A plain err() leaked the settings file AND its in-flight mark until
+      // process exit, while the file still advertised "PreToolUse protection"
+      // for a run that never happened (audit P1-10).
+      return preflightFail(
         `pipeline=native cannot be honoured: a skill named \`code-review\` exists at ${userSkillDir()} and shadows claude's built-in /code-review command, so the run would execute that skill instead. ` +
         `Remove it (claude_review_env with uninstallSkill=true, when this MCP installed it) or choose pipeline=fleet.`,
       );
@@ -1297,6 +1374,17 @@ server.tool(
         params: { progressToken: token, progress: mins, total: timeoutMinutes, message: `claude review in progress (${mins}min elapsed)` },
       }).catch(() => {});
     }, 60_000);
+    // logsDir() is a synchronous fs call: a bad CLAUDE_REVIEW_LOG_DIR used to
+    // throw straight out of the tool handler on the waitForResult path instead
+    // of producing a readable error (audit P2-12). Fail before the paid run.
+    let subagentsDir;
+    try { subagentsDir = logsDir(); }
+    catch (e) {
+      return preflightFail(
+        `Could not prepare this review's log directory: ${e?.message || e}. ` +
+        `Set CLAUDE_REVIEW_LOG_DIR to a writable directory (or fix its permissions) and retry — the review was not started.`
+      );
+    }
 
     const run = await runClaude({
       cli,
@@ -1319,7 +1407,7 @@ server.tool(
         streamJson: streamJsonSupported,
       },
       guardSettings,
-      subagentsDir: logsDir(),
+      subagentsDir,
       timeoutMs: timeoutMinutes * 60_000,
       signal,
       // One subagent finished -> one record, right now: appended to the job so a
@@ -1333,7 +1421,7 @@ server.tool(
     });
     if (progressTimer) clearInterval(progressTimer);
 
-    const logFile = writeLogFile(run.stdout, run.stderr);
+    const logFile = writeLogFile(run.stdout, run.stderr, [run.subagentsFile]);
     const j = run.json;
     const logNote = logNoteOf(logFile);
 
@@ -1372,26 +1460,10 @@ server.tool(
     // Under `--permission-mode manual` a missing allowlist entry shows up here
     // instead of aborting the run — surface it, or a silently degraded review
     // (e.g. the reviewer subagents never ran) would look like a clean result.
-    const denials = Array.isArray(j.permission_denials) ? j.permission_denials : [];
-    const deniedCommands = denials.map((d) => d?.tool_input?.command).filter((c) => typeof c === "string");
-    // A denial the guard produced is the guard doing its job, not a degraded
-    // review: the reviewer combined steps (or asked git to write a file) and can
-    // retry differently. Keeping the two apart is what stops the warning from
-    // crying wolf. The predicate is the same one the hook applies, so "reported
-    // as blocked" and "actually blocked" cannot disagree.
-    // Same options as the hook: `cd <repoRoot>` is allowed, so it must not be
-    // reported as a guard block here either.
-    const guardWouldBlock = (cmd) => !analyseCommand(cmd, { repoRoot: repoPath }).ok;
-    const guardBlocked = deniedCommands.filter(guardWouldBlock);
-    const realDenials = denials.filter((d) => {
-      const cmd = d?.tool_input?.command;
-      return typeof cmd !== "string" || !guardWouldBlock(cmd);
-    });
-    const denialNote = realDenials.length
-      ? `⚠ ${realDenials.length} tool call(s) were denied by the permission allowlist (this MCP runs claude with --permission-mode manual) — the review may be incomplete: ` +
-        [...new Set(realDenials.map((d) => d?.tool_name || d?.tool || JSON.stringify(d)))].slice(0, 10).join(", ")
-      : "";
-    const guardNote = shellGuardNote(deniedCommands, deniedCommands, { repoRoot: repoPath }) || "";
+    // The classifier is shared with claude_review_followup so both paths split
+    // "the guard blocked it" from "the allowlist is missing something" the same
+    // way (audit P0-7).
+    const { deniedCommands, guardBlocked, realDenials, denialNote, guardNote } = classifyDenials(j, repoPath);
 
     // Fix mode: verify the fixes actually reached disk. A reviewer can describe
     // perfect edits and still write nothing (its Edit/Write calls denied, or it
@@ -1790,6 +1862,17 @@ server.tool(
     // dropped, although the JSONL was already on disk).
     const followReports = [];
     let followSubagentsFile = null;
+    // Same sync-fs guard as the review path: a bad CLAUDE_REVIEW_LOG_DIR must
+    // become an actionable tool error before the paid followup starts, not an
+    // opaque internal exception (audit P2-12).
+    let subagentsDir;
+    try { subagentsDir = logsDir(); }
+    catch (e) {
+      return preflightFail(
+        `Could not prepare this followup's log directory: ${e?.message || e}. ` +
+        `Set CLAUDE_REVIEW_LOG_DIR to a writable directory (or fix its permissions) and retry — the followup was not started.`
+      );
+    }
     const run = await runClaude({
       cli,
       repoPath,
@@ -1809,7 +1892,7 @@ server.tool(
         streamJson: streamJsonSupported,
       },
       guardSettings,
-      subagentsDir: logsDir(),
+      subagentsDir,
       onSubagentReport: (rec, file) => {
         followReports.push(rec);
         if (typeof file === "string") followSubagentsFile = file;
@@ -1819,7 +1902,7 @@ server.tool(
     });
     if (progressTimer) clearInterval(progressTimer);
 
-    const logFile = writeLogFile(run.stdout, run.stderr);
+    const logFile = writeLogFile(run.stdout, run.stderr, [followSubagentsFile]);
     const logNote = logNoteOf(logFile);
     // Audit F2: the same "never lose paid-for work" contract as the review tool
     // — any interruption or failure still carries the finished subagent reports.
@@ -1845,6 +1928,12 @@ server.tool(
     const ok = j.subtype === "success" && j.is_error !== true && !looksLikeApiError && !emptyReply;
     const status2 = ok ? "success"
       : (j.subtype && j.subtype !== "success" ? j.subtype : (emptyReply ? "empty_report" : "claude reported an error"));
+    // Same denial split as a full review (audit P0-7). The chaining reporter
+    // needs the set of commands that were actually DENIED: passing an empty set
+    // turned every command the guard correctly blocked into "RAN WITHOUT BEING
+    // BLOCKED ... treat this repository as hostile", while a real allowlist gap
+    // in a followup was never reported at all.
+    const { deniedCommands, guardBlocked, realDenials, denialNote, guardNote } = classifyDenials(j, repoPath);
     if (!ok) {
       // The same empty-result treatment as a review (same status value, same
       // actionable hints); logNote/carried keep the paid-for subagent reports
@@ -1861,10 +1950,15 @@ server.tool(
           subagents: subagentsView(followReports),
           subagentsSpawned: followReports.length || undefined,
           subagentsFile: followSubagentsFile || undefined,
+          permissionDenials: realDenials.length,
+          shellGuardBlocked: guardBlocked.length,
         },
       };
     }
-    const chainNote = shellChainingNote(run.bashCommands, [], { repoRoot: repoPath });
+    // Backstop reporting: same classifier and same denied set as the review
+    // path, so the same input produces the same note (audit P0-7).
+    const chainNote = shellChainingNote(run.bashCommands, deniedCommands, { repoRoot: repoPath }) || "";
+    const warningNote = [denialNote, guardNote, chainNote].filter(Boolean).join("\n\n");
     // Same model-provenance check as a full review: a followup that silently
     // answers on a substituted model is not the session the caller thinks it is.
     const followFacts = resultFacts(j);
@@ -1882,11 +1976,13 @@ server.tool(
         costUsd: j.total_cost_usd, numTurns: j.num_turns, durationMs: j.duration_ms, logFile,
         warning: provenance.note || undefined,
         effectiveModel: provenance.main.length ? provenance.main.join(", ") : undefined,
-      }) + (chainNote ? `\n\n${chainNote}` : "") + (provenance.note ? `\n\n${provenance.note}` : "") }],
+      }) + (warningNote ? `\n\n${warningNote}` : "") + (provenance.note ? `\n\n${provenance.note}` : "") }],
       structuredContent: {
         status: status2, sessionId: j.session_id ?? sessionId,
         costUsd: j.total_cost_usd, numTurns: j.num_turns, durationMs: j.duration_ms, reply: j.result,
         hardening,
+        permissionDenials: realDenials.length,
+        shellGuardBlocked: guardBlocked.length,
         modelProvenance: {
           requested: provenance.requested,
           main: provenance.main,

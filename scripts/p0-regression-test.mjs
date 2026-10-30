@@ -16,9 +16,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { analyseCommand, bashAllowRules } from "../src/shell-guard.js";
+import { analyseCommand, bashAllowRules, policyFingerprint } from "../src/shell-guard.js";
 import { postPROnlyTools } from "../src/prompt.js";
-import { repoRunsGitPrograms } from "../src/claude.js";
+import { repoRunsGitPrograms, writeGuardSettings } from "../src/claude.js";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const HOOK = path.join(ROOT, "scripts", "pre-tool-hook.js");
@@ -34,14 +34,16 @@ const check = (label, got, want) => {
   console.log("FAIL  " + label + "\n        got " + JSON.stringify(got) + ", want " + JSON.stringify(want));
 };
 
-/** Run the live hook. Returns "ALLOW" (no decision) or "DENY". */
-function hook(toolName, toolInput) {
+/** Run the live hook. Returns "ALLOW" (no decision) or "DENY".
+ *  `repoRoot` overrides the root the hook is told to enforce; the payload cwd
+ *  stays REPO so a test can isolate "the declared root is unusable". */
+function hook(toolName, toolInput, repoRoot = REPO) {
   const payload = JSON.stringify({ tool_name: toolName, tool_input: toolInput, cwd: REPO });
   let out = "";
   try {
     out = execFileSync(process.execPath, [HOOK], {
       input: payload,
-      env: { ...process.env, CLAUDE_REVIEW_REPO_ROOT: REPO },
+      env: { ...process.env, CLAUDE_REVIEW_REPO_ROOT: repoRoot },
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 20000,
@@ -77,6 +79,19 @@ for (const cmd of [
 }
 
 /* ------------------------------------------------------------------ */
+/* P0-1b: credential exfiltration via echo. A bare $VAR is substitution */
+/* and unquoted globs/tilde expand before echo runs, but quoted literal */
+/* text must stay usable — the fix must not refuse echo 'price: $5'.    */
+/* ------------------------------------------------------------------ */
+console.log("-- P0-1b echo: expansion refused, quoted literals allowed");
+for (const cmd of ["echo $ANTHROPIC_API_KEY", "echo $HOME", "echo *", "echo ~/*", "echo ../*"]) {
+  check("bash DENY: " + JSON.stringify(cmd), bash(cmd), "DENY");
+}
+for (const cmd of ["echo hello", "echo 'price: $5'", "echo '$HOME'", "echo '*'", "echo \"=====\"", "git show HEAD && echo \"=====\" && git log --oneline -1"]) {
+  check("bash ALLOW: " + JSON.stringify(cmd), bash(cmd), "ALLOW");
+}
+
+/* ------------------------------------------------------------------ */
 /* P0-2: short options may glue their value (-o/tmp/x, -f/etc/passwd).  */
 /* A value-taking short option must reach both the path check and the  */
 /* flag deny table; treating "-xVALUE" as self-contained hid both.     */
@@ -96,6 +111,33 @@ for (const cmd of [
 for (const cmd of ["find . -name x -exec sh -c id \\;", "git diff --output=/tmp/pwn", "git log | sort -o /tmp/pwn"]) {
   check("bash DENY (spaced form): " + JSON.stringify(cmd), bash(cmd), "DENY");
 }
+
+/* ------------------------------------------------------------------ */
+/* P0-1 / P0-2 (round 2): the read boundary covers `echo` and sinks.   */
+/* `echo $SECRET` prints a credential the model never read; `echo ~/*` */
+/* and `echo ../*` expand to outside paths. `tr` takes a FILE         */
+/* operand like every other pipe sink; it was the one sink exempted    */
+/* from the path check, so its outside read was allowed.               */
+/* ------------------------------------------------------------------ */
+console.log("-- P0-1/P0-2 echo + tr read boundary");
+for (const cmd of [
+  "echo $ANTHROPIC_API_KEY",
+  "echo ~/*",
+  "echo ../*",
+  "echo hi | tr a b /etc/passwd",
+]) {
+  check("bash DENY: " + JSON.stringify(cmd), bash(cmd), "DENY");
+}
+check("bash ALLOW: echo hi | tr a b", bash("echo hi | tr a b"), "ALLOW");
+
+/* ------------------------------------------------------------------ */
+/* P0-3 (round 2): a repo root that does not resolve must fail CLOSED.  */
+/* The Read branch caught a throw out of containment and fell through  */
+/* to "allow", so an unusable root disabled the boundary.              */
+/* ------------------------------------------------------------------ */
+console.log("-- P0-3 Read fails closed when the repo root is gone");
+const GONE = path.join(os.tmpdir(), "p0-regression-gone-" + process.pid);
+check("Read DENY: repo root does not exist", hook("Read", { file_path: path.join(GONE, "secret.txt") }, GONE), "DENY");
 
 /* ------------------------------------------------------------------ */
 /* P1-6: an absolute path under a symlinked prefix is inside the repo.  */
@@ -159,6 +201,9 @@ check("analyseCommand DENY: glued -o", analyseCommand("git log | sort -o/tmp/x",
 check("analyseCommand DENY: glued -f", analyseCommand("rg -f/etc/passwd", opts).ok, false);
 check("analyseCommand ALLOW: absolute in-repo", analyseCommand('find "' + REPO + '" -name x', opts).ok, true);
 check("analyseCommand DENY: outside path", analyseCommand("find /etc -name x", opts).ok, false);
+check("analyseCommand DENY: bare $VAR printed by echo", analyseCommand("echo $ANTHROPIC_API_KEY", opts).ok, false);
+check("analyseCommand DENY: tr reading an outside file", analyseCommand("echo hi | tr a b /etc/passwd", opts).ok, false);
+check("analyseCommand ALLOW: tr with no file operand", analyseCommand("echo hi | tr a b", opts).ok, true);
 
 /* ------------------------------------------------------------------ */
 /* P0-4 / P0-5: a repository-supplied git driver must be refused.      */
@@ -208,6 +253,31 @@ try {
   check("refuses dotted [diff.evil] driver", repoRunsGitPrograms(e).refusals.length > 0, true);
   fs.rmSync(e, { recursive: true, force: true });
 
+  // P0-8: core.sshCommand makes the NEXT git transport run a repo-chosen
+  // program; the prompt itself suggests `git remote show origin`, which is
+  // allowlisted and triggers it. It must be refused, not noted.
+  const ssh = gitRepo("p0-sshcmd");
+  const sshScript = path.join(ssh, "ssh.sh");
+  fs.writeFileSync(sshScript, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(sshScript, 0o755);
+  fs.appendFileSync(path.join(ssh, ".git", "config"), "\n[core]\n\tsshCommand = " + sshScript + "\n");
+  spawnSync("git", ["-C", ssh, "remote", "add", "origin", "ssh://git@example.invalid/repo.git"], { stdio: "ignore" });
+  check("refuses core.sshCommand", repoRunsGitPrograms(ssh).refusals.length > 0, true);
+  fs.rmSync(ssh, { recursive: true, force: true });
+
+  // P0-9: core.attributesFile names an attribute file the .gitattributes walk
+  // never sees; a driver reference hidden there is invisible to the scan, so
+  // the config alone must be enough to refuse (or the file must be scanned).
+  const attr = gitRepo("p0-attrfile");
+  const attrFile = path.join(attr, "evil-attrs");
+  const attrCmd = path.join(attr, "tc.sh");
+  fs.writeFileSync(attrCmd, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(attrCmd, 0o755);
+  fs.writeFileSync(attrFile, "*.txt diff=evil\n");
+  fs.appendFileSync(path.join(attr, ".git", "config"), '\n[core]\n\tattributesFile = ' + attrFile + '\n[diff "evil"]\n\ttextconv = ' + attrCmd + "\n");
+  check("refuses a driver activated via core.attributesFile", repoRunsGitPrograms(attr).refusals.length > 0, true);
+  fs.rmSync(attr, { recursive: true, force: true });
+
   // P0-4b: a walk that hits its bound must fail closed, not scan "most" of the tree.
   const f = gitRepo("p0-toodeep");
   let deep = f;
@@ -217,6 +287,20 @@ try {
   fs.appendFileSync(path.join(f, ".git", "config"), '\n[diff "evil"]\n\ttextconv = ' + CMD + "\n");
   check("refuses when the attribute walk is truncated", repoRunsGitPrograms(f).refusals.length > 0, true);
   fs.rmSync(f, { recursive: true, force: true });
+
+  // P0-10: the FILE-COUNT bound must fail closed too. Git only honours a file
+  // named exactly `.gitattributes`, so the fixture puts one in each of 4100
+  // directories (4001 same-named files in one directory are impossible).
+  const many = fs.mkdtempSync(path.join(os.tmpdir(), "p0-manyattrs-"));
+  for (let i = 0; i < 4100; i++) {
+    const d = path.join(many, "d" + i);
+    fs.mkdirSync(d);
+    fs.writeFileSync(path.join(d, ".gitattributes"), "*.txt diff=evil\n");
+  }
+  const manyScan = repoRunsGitPrograms(many);
+  check("refuses an attribute walk past the 4000-file bound",
+    manyScan.refusals.some((x) => x.includes("more than 4000")), true);
+  fs.rmSync(many, { recursive: true, force: true });
 
   // P0-3: a committed symlink must not make the synchronous scanner block.
   if (process.platform !== "win32") {
@@ -234,6 +318,50 @@ try {
   }
 } finally {
   try { fs.rmSync(PWN, { force: true }); } catch { /* ignore */ }
+}
+
+/* ------------------------------------------------------------------ */
+/* Stale-process detection: the hook must expose the same policy hash  */
+/* the server computes. Without this the self-test compares nothing and */
+/* an upgrade that did not restart the host runs two different policies.*/
+/* ------------------------------------------------------------------ */
+console.log("-- stale-process detection: hook exposes this process's policy fingerprint");
+{
+  const info = spawnSync(process.execPath, [HOOK], {
+    env: { ...process.env, CC_REVIEW_GUARD_INFO: "1" },
+    encoding: "utf8",
+    timeout: 20000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let reported = null;
+  try { reported = JSON.parse(String(info.stdout || "").trim()).fingerprint; } catch { /* unreadable */ }
+  const local = policyFingerprint();
+  check("hook reports the server's policy fingerprint", reported, local);
+  check("fingerprint looks like a hash", /^[0-9a-f]{16}$/.test(String(local)), true);
+}
+
+/* ------------------------------------------------------------------ */
+/* P1-6: the guard-settings directory is created in a shared temp dir  */
+/* on Linux; a pre-created symlink there would receive the settings    */
+/* file claude reads at spawn time (a hook-injection point).           */
+/* ------------------------------------------------------------------ */
+console.log("-- P1-6 a symlinked guard directory is refused");
+if (process.platform !== "win32") {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "p0-guarddir-"));
+  const attacker = fs.mkdtempSync(path.join(os.tmpdir(), "p0-attacker-"));
+  fs.symlinkSync(attacker, path.join(tmpBase, "cc-code-review"));
+  const prevTmp = process.env.TMPDIR;
+  process.env.TMPDIR = tmpBase;
+  try {
+    const written = writeGuardSettings();
+    check("writeGuardSettings refuses a symlinked dir", written, null);
+    const leaked = fs.readdirSync(attacker).filter((f) => f.startsWith("guard-settings-"));
+    check("nothing was written through the symlink", leaked.length, 0);
+  } finally {
+    if (prevTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = prevTmp;
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+    fs.rmSync(attacker, { recursive: true, force: true });
+  }
 }
 
 /* ------------------------------------------------------------------ */

@@ -161,7 +161,7 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 > ⚠️ **`--settings` 替换的是整个 `hooks` 键**：注入的临时文件里只有本 MCP 的 hook，用户 `~/.claude/settings.json` 里自己配置的 hooks 在**本次子进程内不会生效**（其它键如 `env`、`model`、`permissions` 不受影响）。这是 CLI 的行为，不是遗漏——如果你依赖自己的 hook 在 review 期间运行，目前需要另想办法。
 
-**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs`（235 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）与 `scripts/p0-regression-test.mjs`（68 条：2026-10 多专家审计的全部 P0 形态——ANSI-C 引用/反斜杠转义/紧贴短选项、`.GIT` 大小写变体、fix 模式持久化路径、仓库自带 git driver 的 RCE 形态、符号链接冻结）锁定——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
+**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs`（238 条：安全链必过、非法链必拦、`cd` 越界必拦、sink 写文件必拦、真实 review 的 17 条命令回放、以及每种危险形态的 hook 进程实测）与 `scripts/p0-regression-test.mjs`（95 条：2026-10 多专家审计的全部 P0 形态——ANSI-C 引用/反斜杠转义/紧贴短选项、`.GIT` 大小写变体、fix 模式持久化路径、仓库自带 git driver 的 RCE 形态、符号链接冻结）锁定——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
 
 重定向（含 `2>/dev/null`）仍然整体拒绝：它是绕过 allowlist 的读写原语，改成"允许读重定向"需要先证明每个目标路径都无害，代价大于收益。需要看输出就直接让命令写到 stdout。
 
@@ -209,7 +209,7 @@ v1.4.0 起元数据另加 `bashCalls`（本次发起的 Bash 调用数）与 `sh
 v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagent reports` 小节 + structuredContent 的 `subagents[]`）——此前只有父代理的综合报告，子代理内容只存在于日志文件里，这正是"同样提示词在 Claude Code 里能看到多个专家干活、通过 MCP 只有一份综述"的原因。同时新增**模型溯源**：claude 2.1+ 会把子代理事件（含它实际使用的模型）转发到父流，MCP 据此比对"请求的模型 vs 实际运行的模型"，一旦发现被改写（CC Switch 等网关、或 `~/.claude/settings.json` env 里的 `CLAUDE_CODE_SUBAGENT_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL_NAME`——claude 会在 stderr 打 `[claude-code:unrecognized_model]`），就在结果里明确报 `⚠ MODEL SUBSTITUTION`：这份输出与直接在 Claude Code 里跑同一提示词**不可比**。运行前也会针对 settings.json env 里的同名改写与"进程环境的 `ANTHROPIC_BASE_URL` 被 settings 覆盖"提前预警。
 
 - 运行日志（含被审代码引用）写入 `%TEMP%/cc-code-review/`，目录 0700、文件 0600，只保留最近 20 份；增量子代理报告 `subagents-*.jsonl` 用同一目录、同样 0600，并纳入同一套保留与清扫。
-- CLI 自带一份内置安全命令白名单（`ls`、`cat`、`echo` 等只读工具），即使不在 `--allowedTools` 里也会放行。已实测 `node -e`、`python -c`、`rm`、`git push`、`git commit`、`curl`、Write 工具调用**全部被拒**，所以这不是提权口子，但"只放行白名单里的命令"要按"白名单 + 这批内置只读命令"来理解。
+- CLI 自带一份内置安全命令白名单（`ls`、`cat`、`echo` 等只读工具），即使不在 `--allowedTools` 里也会放行。**正因如此，`echo` 的收紧必须落在 hook 上**：hook 只允许字面文本，`$VAR` 展开、通配符、`~` 与仓外路径一律拒绝（否则被注入的 reviewer 可用 `echo $ANTHROPIC_API_KEY` 把宿主凭据写进报告）。已实测 `node -e`、`python -c`、`rm`、`git push`、`git commit`、`curl`、Write 工具调用**全部被拒**，所以这不是提权口子，但"只放行白名单里的命令"要按"白名单 + 这批内置只读命令"来理解。
 - 模型可以把被 hook 拦下的复合命令拆成多次允许的调用分别执行——hook 拦的是"一条命令里串多步"，不是"一个回合里做多件事"。真正的能力边界仍然是 manual 模式的 allowlist，hook 保证每一步都可被单独审计。
 - 已知残留风险：仓库内其他文件的 fix 改动、prompt 注入诱导的"看起来合理"的编辑——fix 模式改动留在工作区不 commit，请像审 PR 一样 `git diff` 检查后再采纳。
 - 已知残留风险（Windows）：日志目录/文件的 0700/0600 是尽力而为——NTFS 不存 POSIX 权限位，同一台机器上的其他本地用户理论上可读 `%TEMP%\cc-code-review\run-*.log`（内含被审代码引用）。需要更严的隔离请设 `CLAUDE_REVIEW_LOG_DIR` 指向受限目录，或接受该风险（多数单用户桌面场景等同无风险）。
@@ -248,7 +248,7 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # 跑全部免费套件并统一汇总（shell-guard 235 + 审计修复 272 + P0 回归 68 + validation 16 + smoke + cross-cases 136），任一失败即非零退出
+npm test                                         # 跑全部免费套件并统一汇总（shell-guard 238 + 审计修复 272 + P0 回归 95 + validation 16 + smoke + cross-cases 139），任一失败即非零退出
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
 node scripts/cross-cases.mjs                    # 21 个 MECE 用例（136 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）

@@ -85,13 +85,85 @@ export function finderFleetRule(reviewLevel) {
   return table[reviewLevel] ?? table.max;
 }
 
+/**
+ * THE baseRef rule, used by both the preflight (index.js imports this) and the
+ * prompt builder below. It used to exist twice, with different character sets:
+ * the preflight accepted "^", "~" and "@" while this builder only accepted
+ * [A-Za-z0-9._/-] and silently dropped everything else — so a fleet review of
+ * baseRef="HEAD~1" reviewed the default-branch diff instead, while the native
+ * pipeline (which uses the validated value) reviewed HEAD~1. Two validators
+ * meant two semantics for the same parameter (audit P0-5).
+ *
+ * baseRef is interpolated into the reviewer prompt AND echoed back into the
+ * suggested `git diff <ref>...HEAD` commands, so it is a single git-safe token:
+ *  - a leading "-" would turn the ref into a git option (`git merge-base
+ *    --output=<file> HEAD` writes a file);
+ *  - whitespace would split the value when the native pipeline appends it to
+ *    claude's "/code-review <level> <target>" command string, where claude
+ *    parses its own flags ANYWHERE — "main --fix" would enable fix mode;
+ *  - ".." / "..." are revision-range operators, not part of a ref, and the
+ *    prompt appends its own "..HEAD"/"...HEAD" around the value.
+ * Shell metacharacters, quotes, "{}" and ":" are refused by the charset.
+ *
+ * @returns {{ok: true, ref: string|undefined} | {ok: false, error: string}}
+ */
+export function validateBaseRef(ref) {
+  if (!ref) return { ok: true, ref: undefined };
+  const s = String(ref).trim();
+  if (!s) return { ok: true, ref: undefined };
+  if (s.length > 200) return { ok: false, error: "baseRef must be a short ref name (<= 200 chars)" };
+  // Before the charset check, so the original leading-"-" diagnosis (the git
+  // --output=<file> write) keeps its dedicated, actionable message.
+  if (s.startsWith("-")) {
+    return {
+      ok: false,
+      error:
+        `baseRef must not start with "-" (got ${JSON.stringify(ref)}): it would be parsed as a git option ` +
+        `(e.g. git merge-base --output=<file> HEAD writes a file) instead of as a ref. Pass the plain name, e.g. "main".`,
+    };
+  }
+  if (/\s/.test(s)) {
+    return {
+      ok: false,
+      error:
+        `baseRef must be a single ref name with no whitespace (got ${JSON.stringify(ref)}). ` +
+        `It is appended to claude's "/code-review <level> <target>" command, where claude parses flags anywhere in the string: ` +
+        `"main --fix" would enable fix mode and "main --comment" would post to the PR instead of naming a base ref. ` +
+        `Pass just the branch/tag, e.g. "main".`,
+    };
+  }
+  if (!/^[A-Za-z0-9._/@^~-]+$/.test(s)) {
+    return {
+      ok: false,
+      error:
+        `baseRef must be a plain git ref — letters, digits, ".", "_", "/", "@", "^", "~", "-" (got ${JSON.stringify(ref)}). ` +
+        `It is interpolated into claude's /code-review command and into the reviewer's suggested git commands, so any other ` +
+        `character (shell metacharacters, quotes, "{}", ":") is refused. Use the ref as git spells it, e.g. "main", "origin/release-1.2", "v1.2.3", "HEAD~1".`,
+    };
+  }
+  if (s.includes("..")) {
+    return {
+      ok: false,
+      error:
+        `baseRef must be a single ref, not a revision range (got ${JSON.stringify(ref)}): ".." and "..." are range operators, ` +
+        `and the prompt already writes them around the value (git diff <ref>...HEAD). Pass the base side only, e.g. "main".`,
+    };
+  }
+  return { ok: true, ref: s };
+}
+
 function sanitizeBaseRef(baseRef) {
   if (!baseRef) return { ref: undefined, note: "" };
-  // baseRef is interpolated into suggested git commands — keep it a plain ref.
-  if (/^[A-Za-z0-9._/-]{1,100}$/.test(baseRef) && !baseRef.includes("..")) {
-    return { ref: baseRef, note: "" };
-  }
-  return { ref: undefined, note: `\n- (baseRef "${baseRef}" ignored: only plain branch/tag names are accepted)` };
+  const check = validateBaseRef(baseRef);
+  if (check.ok) return { ref: check.ref, note: "" };
+  // Fail-closed backstop. index.js runs the SAME validator before building the
+  // prompt and returns the actionable error there, so through the tool an
+  // invalid ref never reaches this line. If a future caller skips that
+  // preflight, do NOT silently substitute the default branch: the note travels
+  // with the prompt and says the requested base was not used (the detailed
+  // rule stays in the preflight error, not in the prompt — the prompt must not
+  // carry option-shaped strings into a command-looking context).
+  return { ref: undefined, note: `\n- (baseRef ${JSON.stringify(String(baseRef))} ignored: only a single plain git ref is accepted)` };
 }
 
 function scopeDescription(scope, pr, baseRefIn) {
@@ -99,7 +171,15 @@ function scopeDescription(scope, pr, baseRefIn) {
   const suffix = baseRefNote || "";
   switch (scope) {
     case "pr":
-      return { text: `the GitHub pull request ${pr}. Use \`gh pr view\` / \`gh pr diff\` to fetch it (the repository remote resolves the repo).`, suffix };
+      // The tool preflight refuses scope=pr without a pr, so this branch is a
+      // defensive backstop for direct callers. Never interpolate "undefined": the
+      // model would run `gh pr view undefined` and burn a turn.
+      return {
+        text: pr
+          ? `the GitHub pull request ${pr}. Use \`gh pr view\` / \`gh pr diff\` to fetch it (the repository remote resolves the repo).`
+          : `the pull request the caller asked for (no PR was specified — do not guess one; report that scope=pr requires a PR number, owner/repo#123, or a PR URL).`,
+        suffix,
+      };
     case "branch":
       return {
         text: baseRef
@@ -161,7 +241,7 @@ export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, p
   }
   lines.push(`- Tool constraints (enforced by the permission allowlist, not optional): read files with Read/Glob/Grep and ${fix ? "edit them with Edit/Write" : "do not edit anything"}. Shell redirection (\`cat > f\`, \`sed -i\`, \`tee\`, heredoc writes) and interpreters (\`node -e\`, \`python -c\`) are NOT permitted and every such call is denied — use the dedicated tools. Only the git/gh read commands listed above may be run through Bash.`);
   if (cwd) {
-    lines.push(`- Your working directory is already the repository root (${cwd}). Run git/gh commands directly — no \`cd\` prefixes, no \`git -C\`, no redirection (\`> >> <\`) and no \`$()\`/backtick/\`\${}\` substitution: those are hard-denied before they run (a hook judges them). Chains of ALLOWED read-only commands (\`git status && git diff\`, \`git show x | head -50\`) do run — every part of a chain must itself be a permitted command, or the whole call is refused. A denied call costs you a turn for nothing.`);
+    lines.push(`- Your working directory is already the repository root (${cwd}). Run git/gh commands directly — no \`cd\` prefixes, no \`git -C\`, no redirection (\`> >> <\`) and no \`$()\`/backtick/\`\${}\`/bare \`$VAR\` substitution: those are hard-denied before they run (a hook judges them). Chains of ALLOWED read-only commands (\`git status && git diff\`, \`git show x | head -50\`) do run — every part of a chain must itself be a permitted command, or the whole call is refused. A denied call costs you a turn for nothing.`);
   }
   if (effort) {
     lines.push(`- Review effort level: ${effort}${effort === "max" || effort === "xhigh" ? " — be exhaustive: re-read surrounding code for every finding, verify each claim against the actual diff, and actively hunt for the harder-to-spot issues (concurrency, error paths, resource leaks), not just the obvious ones." : ""}.`);
@@ -200,7 +280,12 @@ export function buildReviewPrompt({ scope, pr, baseRef, focus, outputLanguage, p
     lines.push("");
     lines.push(bundledSkillBody());
   }
-  return lines.filter((l) => l !== "").join("\n");
+  // Keep the empty strings pushed above as paragraph separators: filtering
+  // l !== "" collapsed the delivery contract / tool constraints / fix-mode
+  // preamble into one solid paragraph, while the embedded SKILL.md (one
+  // multi-line string) kept its own spacing — two structures in one prompt.
+  // Only missing values are dropped here; "" is intentional layout.
+  return lines.filter((l) => l != null).join("\n");
 }
 
 /**
@@ -217,7 +302,9 @@ export function bundledSkillBody() {
     const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n/.exec(raw);
     return (m ? raw.slice(m[0].length) : raw).trim();
   } catch {
-    return "(bundled pipeline unavailable — review the diff, score findings 0-100, keep >= 80)";
+    // Same threshold as the pipeline's 0/25/50/75/100 scale (a ">= 80" filter
+    // dropped the 75 bucket, i.e. every finding except a certain one).
+    return "(bundled pipeline unavailable — review the diff, score findings 0-100, keep >= 75)";
   }
 }
 
@@ -281,7 +368,10 @@ export function buildFallbackPrompt({ scope, pr, baseRef, focus, outputLanguage,
   lines.push(`2. Read the CLAUDE.md / AGENTS.md files (repo root + directories of changed files) that govern the changed code.`);
   lines.push(`3. Review through five lenses: (a) convention compliance vs those files — quote the exact instruction violated; (b) shallow bug scan of the diff itself — large bugs only, no nitpicks; (c) git history (\`git log -p --follow\`, \`git blame\`) — does the change break deliberately-introduced earlier behavior; (d) for GitHub repos, previous merged PRs touching these files (\`gh pr list --state all --search "<file>"\`) — do old review comments apply again; (e) in-code comments near changed lines (TODO/HACK/WARNING/guidance) — does the change comply.`);
   lines.push(`4. Score every candidate finding 0-100 confidence: 0=false positive or pre-existing; 25=might be real; 50=real but nitpick/rare; 75=real, important, hit in practice or explicitly required by CLAUDE.md; 100=certain, frequent, evidence confirms.`);
-  lines.push(`5. Keep only findings >= 80. Drop: pre-existing issues, pedantic nitpicks, anything a linter/typechecker/CI would catch, generic "needs tests/docs" (unless CLAUDE.md requires it), issues on lines the change did not touch.`);
+  // The anchors above are 0/25/50/75/100, where 75 is "real, important, will
+  // be hit in practice" — a ">= 80" filter discarded exactly that bucket, so
+  // only 100s survived. 75 is the only threshold consistent with the scale.
+  lines.push(`5. Keep only findings >= 75. Drop: pre-existing issues, pedantic nitpicks, anything a linter/typechecker/CI would catch, generic "needs tests/docs" (unless CLAUDE.md requires it), issues on lines the change did not touch.`);
   if (fix) {
     lines.push(`6. FIX MODE: after the report, apply minimal fixes to the repository files with the Edit/Write tools (never shell redirection such as \`cat > f\` / \`sed -i\` / \`node -e\` — those are denied by the permission allowlist) for every confirmed finding that does not require a business decision. Do NOT git commit. Never write inside .git/ or into .env / secret / key files. Append a "## Fixes Applied" section (file, what changed, which finding).`);
   }
@@ -297,7 +387,9 @@ export function buildFallbackPrompt({ scope, pr, baseRef, focus, outputLanguage,
   lines.push(`## Review Summary — verdict (approve / request-changes / comment) + 2-4 sentences`);
   lines.push(`## Findings — numbered, critical -> nit: severity, title, \`file/path:line-range\`, what & why, concrete suggested fix.`);
   lines.push(`## Notes — questions / sub-threshold observations (optional)`);
-  return lines.filter((l) => l !== "").join("\n");
+  // Same rule as buildReviewPrompt: "" is a paragraph separator, not a value
+  // to discard (audit P2-10).
+  return lines.filter((l) => l != null).join("\n");
 }
 
 export function buildFollowupPrompt(message, outputLanguage) {

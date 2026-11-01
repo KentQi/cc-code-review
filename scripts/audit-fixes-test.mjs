@@ -474,7 +474,10 @@ fs.rmSync(wtRoot, { recursive: true, force: true });
 {
   const now = Date.now();
   check("codeDrift is quiet when the process is newer than the sources", codeDrift(now + 86_400_000).stale, false);
-  check("codeDrift flags sources newer than the process", codeDrift(now - 86_400_000).stale, true);
+  // An epoch clock puts the simulated process start before any plausible source
+  // mtime, so this assertion does not depend on how old the checkout is. The
+  // previous "one day ago" clock failed for any working copy older than a day.
+  check("codeDrift flags sources newer than the process", codeDrift(0).stale, true);
   check("codeDrift reports when the newest source changed", typeof codeDrift(now).newestSourceAt, "string");
 }
 

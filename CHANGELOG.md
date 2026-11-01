@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.18.9 — 2026-11-01
+
+No functional change. This release closes the gap between `main` and the release line after 1.18.8 and fixes one time-dependent test.
+
+- **Test: the codeDrift stale assertion no longer depends on the checkout's age.** `scripts/audit-fixes-test.mjs` asserted `codeDrift(now - 86_400_000).stale === true`, which only holds while the checkout's source files are newer than "one day ago": a working copy older than a day failed the suite (317/318) even though `codeDrift()` was right. The test now injects an epoch clock (`codeDrift(0)`), so the simulated process start precedes any plausible source mtime. No production code changed.
+- **Docs corrections that landed on `main` after 1.18.8:** the 1.18.8 changelog wording, the round-8 report counts, and its dev+ino identity note (`docs/04-test/20-fix-round8-v1.18.8.md`).
+- **Docs index fixed:** `docs/README.md` was missing the round-8 report entry (20) and still declared `version: v1.18.7`; both are corrected, and this release's report (21) is listed.
+- **Suite counts refreshed** in README.md / README.en.md / CONTRIBUTING.md to the actual numbers: shell-guard 327, audit-fixes 318, p0-regression 256, validation 31, pack 52, cross-cases 156/156 (27 cases defined, 26 run for free by default; C9 is paid).
+- **Suites:** shell-guard 327, audit-fixes 318, p0-regression 256, validation 31, pack 52, cross-cases 156/156, smoke PASS — `npm test` green (7 suites).
+- **Release line:** `v1.18.8` stays at its release commit (`7cbbfca`); `v1.18.9` marks this docs/test-only release. No behaviour change.
+
 ## 1.18.8 — 2026-10-30
 
 Fixes a regression introduced by 1.18.7: the self-review pipeline protection was scoped by PATH SHAPE, so fix mode could not edit `src/*.js` in any repository.

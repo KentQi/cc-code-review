@@ -162,7 +162,7 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 > ⚠️ **`--settings` 替换的是整个 `hooks` 键**：注入的临时文件里只有本 MCP 的 hook，用户 `~/.claude/settings.json` 里自己配置的 hooks 在**本次子进程内不会生效**（其它键如 `env`、`model`、`permissions` 不受影响）。这是 CLI 的行为，不是遗漏——如果你依赖自己的 hook 在 review 期间运行，目前需要另想办法。
 
-**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs`（320 条）、`scripts/p0-regression-test.mjs`（238 条：2026-10 各轮审计的全部 P0 形态——ANSI-C 引用/反斜杠转义/紧贴短选项、`.GIT` 大小写变体、fix 模式持久化路径、仓库自带 git driver 的 RCE 形态、符号链接冻结、`config.worktree`、`node_modules` attributes、hook 的 fail-closed payload 形状）与 `scripts/audit-fixes-test.mjs`（318 条）锁定——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
+**策略只有一份**：`src/shell-guard.js` 导出 `BASH_POLICY`，`prompt.js` 用它渲染 `Bash(...)` 权限规则，hook 用同一份表逐段判定——所以"hook 放行"与"引擎放行"不可能漂移。契约由 `scripts/shell-guard-test.mjs`（327 条）、`scripts/p0-regression-test.mjs`（256 条：2026-10 各轮审计的全部 P0 形态——ANSI-C 引用/反斜杠转义/紧贴短选项、`.GIT` 大小写变体、fix 模式持久化路径、仓库自带 git driver 的 RCE 形态、符号链接冻结、`config.worktree`、`node_modules` attributes、hook 的 fail-closed payload 形状）与 `scripts/audit-fixes-test.mjs`（318 条）锁定——**改策略前先跑 `npm test`**。关掉它：`CLAUDE_REVIEW_SHELL_GUARD=0`（此时整体会 fail-closed 拒跑，见下文"纵深失效即拒跑"）。
 
 重定向（含 `2>/dev/null`）仍然整体拒绝：它是绕过 allowlist 的读写原语，改成"允许读重定向"需要先证明每个目标路径都无害，代价大于收益。需要看输出就直接让命令写到 stdout。
 
@@ -277,10 +277,10 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # 跑全部免费套件并统一汇总（shell-guard 238 + 审计修复 272 + P0 回归 95 + validation 16 + smoke + cross-cases 149），任一失败即非零退出
+npm test                                         # 跑全部免费套件并统一汇总（shell-guard 327 + 审计修复 318 + P0 回归 256 + validation 31 + pack 52 + smoke + cross-cases 156/156），任一失败即非零退出
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
-node scripts/cross-cases.mjs                    # 21 个 MECE 用例（136 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
+node scripts/cross-cases.mjs                    # 27 个 MECE 用例（默认免费跑 26 个、156 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
 node scripts/paid-smoke.mjs [--cap=2]           # 真实 CLI 端到端 smoke：带三个已知 bug 的临时仓库，effort/reviewLevel=low，默认不设费用上限（计费，实测约 $0.5）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # 真实 followup（计费）

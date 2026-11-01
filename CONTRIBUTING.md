@@ -6,10 +6,10 @@
 
 ```bash
 npm install
-npm test                # 全部免费套件统一汇总（约 2 分钟）：shell-guard 238 + 审计修复 272
-                        # + P0 回归 95 + validation 16 + stdio 冒烟 + cross-cases 149；任一失败即非零退出
-node scripts/p0-regression-test.mjs  # 只跑 2026-10 审计的 P0 形态（95 条，真实 hook 进程，约 6s）
-node scripts/validation-test.mjs     # 只跑输入校验路径（16 条，免费，不发 API 请求）
+npm test                # 全部免费套件统一汇总（约 2.5 分钟）：shell-guard 327 + 审计修复 318
+                        # + P0 回归 256 + validation 31 + pack 52 + stdio 冒烟 + cross-cases 156/156；任一失败即非零退出
+node scripts/p0-regression-test.mjs  # 只跑 2026-10 审计的 P0 形态（256 条，真实 hook 进程，约 8s）
+node scripts/validation-test.mjs     # 只跑输入校验路径（31 条，免费，不发 API 请求）
 ```
 
 - `npm test` 里的 smoke 测试会真实 spawn MCP server 并调用 `claude_review_env`，所以需要本机能解析到 claude；CI 用 `CLAUDE_CODE_PATH=scripts/stub-claude.mjs` 指向桩，因此 CI 只验证 stdio 握手/工具面/env 形状，真实 CLI 行为由本机 `npm test` 覆盖。其余套件免费且离线。

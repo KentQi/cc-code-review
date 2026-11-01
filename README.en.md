@@ -164,7 +164,7 @@ It also closes the **write/execute forms that a prefix rule cannot express**: `f
 
 > ⚠️ **`--settings` replaces the entire `hooks` key**: the injected temp file contains only this MCP's hook — your own hooks from `~/.claude/settings.json` will **not** run inside this child process (other keys such as `env`, `model`, `permissions` are unaffected). This is CLI behavior, not an omission — if you rely on your own hooks during reviews, you currently need a different approach.
 
-**There is exactly one policy**: `src/shell-guard.js` exports `BASH_POLICY`, `prompt.js` renders the `Bash(...)` rules from it, and the hook judges segments against the same table — so "the hook allowed it" and "the engine allowed it" cannot drift. The contract is locked by `scripts/shell-guard-test.mjs` (320 checks) and `scripts/p0-regression-test.mjs` (238 checks: every P0 form from the 2026-10 audits — ANSI-C quoting / backslash escapes / glued short options, `.GIT` case variants, fix-mode persistence paths, repo-supplied git drivers, symlink freeze, config.worktree, node_modules attributes, the hook's fail-closed payload shapes) — **run `npm test` before changing the policy**. Turn it off with `CLAUDE_REVIEW_SHELL_GUARD=0` (the whole thing then fails closed and refuses to run — see "Fail closed when a defense layer is missing").
+**There is exactly one policy**: `src/shell-guard.js` exports `BASH_POLICY`, `prompt.js` renders the `Bash(...)` rules from it, and the hook judges segments against the same table — so "the hook allowed it" and "the engine allowed it" cannot drift. The contract is locked by `scripts/shell-guard-test.mjs` (327 checks) and `scripts/p0-regression-test.mjs` (256 checks: every P0 form from the 2026-10 audits — ANSI-C quoting / backslash escapes / glued short options, `.GIT` case variants, fix-mode persistence paths, repo-supplied git drivers, symlink freeze, config.worktree, node_modules attributes, the hook's fail-closed payload shapes) — **run `npm test` before changing the policy**. Turn it off with `CLAUDE_REVIEW_SHELL_GUARD=0` (the whole thing then fails closed and refuses to run — see "Fail closed when a defense layer is missing").
 **v1.18.5 boundaries (7 P0 / 14 P1 from the third audit)**
 
 - **Git long-option abbreviations no longer bypass the deny tables**: `git`/`sort`/`wc`/`rg` accept unambiguous prefixes, so the tables match by prefix now (`--cont` = `--contents`, `--files0` = `--files0-from`) and the missing file-reading options are denied.
@@ -281,10 +281,10 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # every free suite, one summary (shell-guard 238 + audit-fix 272 + P0 regression 95 + validation 16 + smoke + cross-cases 149); non-zero if any fails
+npm test                                         # every free suite, one summary (shell-guard 327 + audit-fix 318 + P0 regression 256 + validation 31 + pack 52 + smoke + cross-cases 156/156); non-zero if any fails
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
-node scripts/cross-cases.mjs                    # 21 MECE cases (136 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
+node scripts/cross-cases.mjs                    # 27 MECE cases (26 run for free by default, 156 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
 node scripts/paid-smoke.mjs [--cap=2]           # REAL CLI end-to-end smoke: throwaway repo with three planted bugs, effort/reviewLevel=low, no spend cap by default (billed, ~$0.5 observed)
 node scripts/e2e-test.mjs <repoPath> [json]     # real review (billed)
 node scripts/followup-e2e.mjs <repoPath> <sessionId> # real followup (billed)

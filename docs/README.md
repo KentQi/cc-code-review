@@ -1,6 +1,6 @@
 ---
 title: cc-code-review 文档索引
-version: v1.18.7
+version: v1.18.9
 created: 2026-10-30
 status: final
 ---
@@ -26,6 +26,8 @@ status: final
 | 11–17 | [11-fix-round1](04-test/11-fix-round1-v1.18.1.md) … [17-fix-round7](04-test/17-fix-round7-v1.18.7.md) | 七轮修复报告（逐条修复 + before/after 证据） |
 | 18 | [18-triage-p2-p3-v1.18.4.md](04-test/18-triage-p2-p3-v1.18.4.md) | P2/P3 存量 triage（98 修 / 5 接受 / 1 不成立） |
 | 19 | [19-audit-final-v1.18.7.md](04-test/19-audit-final-v1.18.7.md) | 最终审计报告（七轮汇总 + 残余） |
+| 20 | [20-fix-round8-v1.18.8.md](04-test/20-fix-round8-v1.18.8.md) | 第八轮修复：自审保护改按文件系统身份（修 1.18.7 的 R-2 范围回归） |
+| 21 | [21-fix-round9-v1.18.9.md](04-test/21-fix-round9-v1.18.9.md) | 第九轮：codeDrift 时间断言与文档一致性（无功能变更） |
 
 ## 旧路径映射（`audit/` → `docs/04-test/`）
 

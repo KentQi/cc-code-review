@@ -1,10 +1,11 @@
 # cc-code-review
 
 [![CI](https://github.com/KentQi/cc-code-review/actions/workflows/ci.yml/badge.svg)](https://github.com/KentQi/cc-code-review/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/KentQi/cc-code-review?label=release)](https://github.com/KentQi/cc-code-review/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)
 
-English | [简体中文](README.md)
+English | [简体中文](README.md) · [CHANGELOG](CHANGELOG.md) · [Docs index](docs/README.md) · [Releases](https://github.com/KentQi/cc-code-review/releases)
 
 An MCP server that wraps **Claude Code's code-review capability** so ZCode (or any MCP client) can call it directly:
 ZCode → MCP → `claude -p` (headless) → claude's built-in `/code-review` (low..high, including `--fix`) or the inline fleet pipeline (max: 10 finders + one verifier per surviving candidate + sweep) → the report comes back to ZCode as-is → ZCode fixes the code based on the findings → call again to re-verify.
@@ -48,7 +49,7 @@ Notes:
 
 ## Register with ZCode (skip if already done)
 
-**Recommended: one command, auto-configured (since v1.7.0)**. Clone this repository (or install the npm package — `scripts/init.mjs` ships in the tarball since v1.18.5), then inside it run:
+**Recommended: one command, auto-configured (since v1.7.0)**. Clone this repository, then inside it run:
 
 ```bash
 npm install
@@ -301,7 +302,7 @@ node scripts/cancel-test.mjs <repoPath>         # is the process tree killed rig
 
 **Verified regressions** (Windows / npm global install / CC Switch local gateway, no account login): a full review under manual mode (Chinese report, self-planted bugs scored CRITICAL/MAJOR per the ≥80 rule of that run (now ≥75), low-confidence items correctly demoted to Notes), `scope=branch` + `baseRef` (`git log main..HEAD` / `git diff main...HEAD`, `permission_denials=0`, guard blocked 0), fix mode writes files and does **not** commit, `.git/` untouched, followup resumes the same session via the returned `session_id`. Earlier rounds also verified: a repo carrying a malicious `.claude/settings.json` no longer executes repo-controlled hooks, and the process tree is zeroed within 2 seconds of cancellation.
 
-- Run logs: `%TEMP%\cc-code-review\run-*.log` (newest 20 kept)
+- Run logs: `cc-code-review/run-*.log` under the system temp dir (Windows: `%TEMP%\cc-code-review`; newest 20 kept)
 - Upgrading from v1.5.0 or earlier (old name claude-review-mcp): the old log directory `%TEMP%\claude-review-mcp` is never touched or deleted by the new version; delete it manually if it contains sensitive references.
 - Uninstall: delete the `cc-code-review` entry from the ZCode config; delete `~/.claude/skills/code-review` to remove the skill.
 

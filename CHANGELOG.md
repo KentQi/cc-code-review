@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.18.10 — 2026-11-03
+
+Docs-only: no code change. Fixes two README errors and brings the GitHub page in line with the release line.
+
+- **README duplication.** The Chinese README's English abstract read "or runs a fleet pipeline or runs a fleet pipeline with the same three-phase structure" (typo introduced in 1.18.4); the duplicated clause is gone.
+- **The npm-package claim is gone.** Both READMEs told users they could "install the npm package" — `cc-code-review` was never published to the npm registry (`npm view cc-code-review` → 404), so the supported install is cloning this repository. The tarball note (`scripts/init.mjs` ships since 1.18.5) went with it.
+- **Release badge + header links.** Both READMEs gain a Release badge (now meaningful: every tag has a GitHub Release) and header links to CHANGELOG.md, the docs index and the Releases page.
+- **Log directory wording is cross-platform.** `%TEMP%\cc-code-review\run-*.log` described Windows only; both READMEs now say "system temp dir / cc-code-review/run-*.log (Windows: %TEMP%)".
+- No functional change and no test change; `npm test` stays green (7 suites).
+
 ## 1.18.9 — 2026-11-01
 
 No functional change. This release closes the gap between `main` and the release line after 1.18.8 and fixes one time-dependent test.

@@ -1,12 +1,13 @@
 # cc-code-review
 
 [![CI](https://github.com/KentQi/cc-code-review/actions/workflows/ci.yml/badge.svg)](https://github.com/KentQi/cc-code-review/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/KentQi/cc-code-review?label=release)](https://github.com/KentQi/cc-code-review/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)
 
-[English](README.en.md) | 简体中文
+[English](README.en.md) | 简体中文 · [CHANGELOG](CHANGELOG.md) · [文档索引](docs/README.md) · [Releases](https://github.com/KentQi/cc-code-review/releases)
 
-**EN**: An MCP server that calls Claude Code's own `/code-review` (low..high, including `--fix`) or runs a fleet pipeline or runs a fleet pipeline with the same three-phase structure claude's playbook uses (8/10 parallel finder subagents, one verifier per surviving candidate, one sweep finder; findings ≥ 75 of 0–100). Reviews — PR / branch / working dir / last commit, effort `low→max` — from ZCode or any MCP client, full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI. Nothing is installed into Claude Code.
+**EN**: An MCP server that calls Claude Code's own `/code-review` (low..high, including `--fix`) or runs a fleet pipeline with the same three-phase structure claude's playbook uses (8/10 parallel finder subagents, one verifier per surviving candidate, one sweep finder; findings ≥ 75 of 0–100). Reviews — PR / branch / working dir / last commit, effort `low→max` — from ZCode or any MCP client, full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI. Nothing is installed into Claude Code.
 
 把 **Claude Code 的 code review 能力**封装成 MCP server，让 ZCode（或任何 MCP 客户端）直接调用：
 ZCode → MCP → `claude -p`（headless）→ claude 内置 /code-review（low..high，含 --fix）或内联舰队流水线（max：10 finder + 每候选 verifier + sweep）→ 审查报告原样返回给 ZCode → ZCode 根据报告改代码 → 再次调用复核。
@@ -48,7 +49,7 @@ ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --
 
 ## 注册到 ZCode（已完成则跳过）
 
-**推荐：一条命令自动配置（v1.7.0 起）**。克隆本仓库（或安装 npm 包——`scripts/init.mjs` 自 v1.18.5 起随包发布）后，在里面跑：
+**推荐：一条命令自动配置（v1.7.0 起）**。克隆本仓库后，在里面跑：
 
 ```bash
 npm install
@@ -297,7 +298,7 @@ node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立
 
 **已实测通过的回归项**（Windows / npm 全局安装 / CC Switch 本地网关，无账号登录）：manual 模式下完整 review（中文报告、按当时的 ≥80 规则把自标 BUG 评成 CRITICAL/MAJOR（现行为 ≥75）、低分项正确降级到 Notes）、`scope=branch` + `baseRef`（`git log main..HEAD` / `git diff main...HEAD`，`permission_denials=0`、guard 拦下 0 条）、fix 模式落盘且**未 commit**、`.git/` 未动、followup 用返回的 `session_id` 续上同一会话。更早一轮还验证过：带恶意 `.claude/settings.json` 的仓库不再执行仓库控制的 hook、取消后 2 秒内进程树清零。
 
-- 运行日志：`%TEMP%\cc-code-review\run-*.log`（保留 20 份；guard 临时文件与 git 沙箱 HOME 同目录，进程退出时清理，陈旧残留由下一次运行自动清扫）。
+- 运行日志：系统临时目录下的 `cc-code-review/run-*.log`（Windows 即 `%TEMP%\cc-code-review`；保留 20 份；guard 临时文件与 git 沙箱 HOME 同目录，进程退出时清理，陈旧残留由下一次运行自动清扫）。
 - 从 v1.5.0 及更早版本升级（旧名 claude-review-mcp）：旧日志目录 `%TEMP%\claude-review-mcp` 不会被新版本触碰或删除，如含敏感引用请手动删除。
 - 卸载：删除 ZCode 配置里的 `cc-code-review` 条目；移除 skill 删 `~/.claude/skills/code-review`。
 

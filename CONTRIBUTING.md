@@ -7,7 +7,7 @@
 ```bash
 npm install
 npm test                # 全部免费套件统一汇总（约 2.5 分钟）：shell-guard 327 + 审计修复 318
-                        # + P0 回归 256 + validation 31 + pack 52 + stdio 冒烟 + cross-cases 156/156；任一失败即非零退出
+                        # + P0 回归 256 + validation 31 + plugin 45 + pack 52 + stdio 冒烟 + cross-cases 156/156；任一失败即非零退出
 node scripts/p0-regression-test.mjs  # 只跑 2026-10 审计的 P0 形态（256 条，真实 hook 进程，约 8s）
 node scripts/validation-test.mjs     # 只跑输入校验路径（31 条，免费，不发 API 请求）
 ```

@@ -5,7 +5,7 @@
  *
  * Why this exists: the runtime needs exactly two things outside src/ —
  *   scripts/pre-tool-hook.js   (src/claude.js resolves it as ../scripts/...)
- *   assets/skills/code-review/SKILL.md  (src/skill.js reads it)
+ *   skills/code-review/SKILL.md  (src/skill.js reads it)
  * — and nothing in the test suite noticed if a future `files` edit / .npmignore
  * dropped them. The failure mode is silent and total: guardState() reports
  * "hook script missing" and every review refuses to run on the USER's machine,
@@ -56,7 +56,9 @@ const EXPECTED_FILES = [
   "src",
   "scripts/pre-tool-hook.js",
   "scripts/init.mjs",
-  "assets",
+  "skills",
+  "plugin.json",
+  "mcp.json",
   "README.md",
   "README.en.md",
   "CHANGELOG.md",
@@ -74,7 +76,9 @@ const REQUIRED_IN_TARBALL = [
   "src/version.js",
   "scripts/pre-tool-hook.js",
   "scripts/init.mjs",
-  "assets/skills/code-review/SKILL.md",
+  "skills/code-review/SKILL.md",
+  "plugin.json",
+  "mcp.json",
   "README.md",
   "LICENSE",
 ];
@@ -87,6 +91,7 @@ const FORBIDDEN_IN_TARBALL = [
   "scripts/validation-test.mjs",
   "scripts/smoke-test.mjs",
   "scripts/pack-test.mjs",
+  "scripts/plugin-test.mjs",
   "scripts/stub-claude.mjs",
   "scripts/paid-smoke.mjs",
   "scripts/e2e-test.mjs",
@@ -165,10 +170,11 @@ check("every tarball path is a regular packaged file", dryFiles.every((f) => !f.
 // files field even if the forbidden list above is not updated.
 truthy(`tarball is lean (${dryFiles.length} files)`, dryFiles.length <= 20, `${dryFiles.length} files`);
 const unpackedBytes = dry[0]?.unpackedSize ?? 0;
-// The docs (README/CHANGELOG) are ~170KB of the total and grew with the
-// 1.18.5–1.18.7 security sections; scripts/ used to add another ~190KB. A
-// re-widened files field crosses this ceiling immediately.
-truthy(`tarball unpacked size is runtime-sized (${Math.round(unpackedBytes / 1024)}KB)`, unpackedBytes < 720 * 1024);
+// The docs (README/CHANGELOG) are ~190KB of the total and grew with the
+// 1.18.5–1.18.7 security sections and the 1.19.0 Agent Plugins/skill docs;
+// scripts/ would add another ~190KB, so a re-widened files field still crosses
+// this ceiling immediately. The 760KB budget is runtime + docs, not repo.
+truthy(`tarball unpacked size is runtime-sized (${Math.round(unpackedBytes / 1024)}KB)`, unpackedBytes < 760 * 1024);
 
 /* ---- 3. pack for real, extract, and run the extracted copy ---- */
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cc-pack-"));
@@ -196,7 +202,9 @@ try {
     const appDir = path.join(extractDir, "package");
     truthy("the extracted package has the entry file", fs.existsSync(path.join(appDir, "src", "index.js")));
     truthy("the extracted package has the hook", fs.existsSync(path.join(appDir, "scripts", "pre-tool-hook.js")));
-    truthy("the extracted package has the bundled skill", fs.existsSync(path.join(appDir, "assets", "skills", "code-review", "SKILL.md")));
+    truthy("the extracted package has the bundled skill", fs.existsSync(path.join(appDir, "skills", "code-review", "SKILL.md")));
+    truthy("the extracted package has the Agent Plugins manifest", fs.existsSync(path.join(appDir, "plugin.json")));
+    truthy("the extracted package has the Agent Plugins MCP config", fs.existsSync(path.join(appDir, "mcp.json")));
 
     // 3a. The guard hook must load its policy from the packaged src/ — the exact
     // relative path (../src/shell-guard.js) that a different layout would break.

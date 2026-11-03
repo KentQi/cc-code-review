@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.19.0 — 2026-11-03
+
+Portable distribution: the repository is now an Agent Plugins v1.0.0 package, and the bundled code-review skill is harness-neutral. The review pipeline, the shell guard and the report contract are unchanged in behaviour — the embedded pipeline text is the same procedure, rephrased to speak in capabilities instead of Claude Code tool names.
+
+- **Agent Plugins v1.0.0 package.** The repo root is a plugin root: `plugin.json` (closed manifest), `mcp.json` (closed stdio config with `${PLUGIN_ROOT}` placeholders) and `skills/code-review/SKILL.md` in the fixed discovery location. The skill moved from `assets/skills/code-review/` to `skills/code-review/`; the server, pack-test, p0 regression and the fix-mode self-review globs follow the new path. A conformant client can load the skill and the MCP server from one directory; component failures stay non-fatal per the spec.
+- **Harness-neutral skill.** `skills/code-review/SKILL.md` is now a portable Agent Skills skill: frontmatter gains `license`/`compatibility`/`metadata`; the body speaks in capabilities (fan-out via "your harness's subagent/task tool", sequential fallback, a Harness notes section mapping tool names) and keeps the cc-code-review shell contract as the default read-only briefing, copied verbatim when the MCP run prompt supplies one. The report contract block, the 5 briefs, the three phases, the 0-100 scoring and the >=75 filter are unchanged — `prompt.js` still extracts the report block from this file, so there is exactly one copy.
+- **New `plugin-test` suite** (offline, free): validates `plugin.json` (closed schema, canonical `$schema`, name/version/license constraints), `mcp.json` (closed top-level, same spec version, stdio variant rules, reserved env names, `cwd` forms) and every discovered `SKILL.md` (Agent Skills frontmatter, name↔directory, description bounds, body limits, report-contract presence). Added to `npm test` (now 8 suites).
+- **README (both languages):** cross-harness registration (ZCode one command; Claude Code / Cursor / any stdio client JSON), a new "use it as an Agent Plugin / Agent Skill" section, corrected skill paths, and the inline-prompt size (~12KB).
+- No functional change to the review pipeline; `npm test` green (8 suites).
+
 ## 1.18.10 — 2026-11-03
 
 Docs-only: no code change. Fixes two README errors and brings the GitHub page in line with the release line.

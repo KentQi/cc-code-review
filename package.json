@@ -1,6 +1,6 @@
 {
   "name": "cc-code-review",
-  "version": "1.18.10",
+  "version": "1.19.0",
   "description": "MCP server (cc-code-review) that calls Claude Code's native /code-review (or a fleet pipeline mirroring its playbook: parallel finder subagents, one verifier per surviving candidate, sweep; 0-100 confidence scoring, >=75 filter) and returns the findings to ZCode or any other MCP client.",
   "type": "module",
   "main": "src/index.js",
@@ -33,7 +33,9 @@
     "src",
     "scripts/pre-tool-hook.js",
     "scripts/init.mjs",
-    "assets",
+    "skills",
+    "plugin.json",
+    "mcp.json",
     "README.md",
     "README.en.md",
     "CHANGELOG.md",

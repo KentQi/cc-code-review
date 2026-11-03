@@ -27,14 +27,18 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // (audit P1-4).
 // pack-test is REQUIRED too (audit Q15): it packs the real tarball and runs the
 // extracted copy. Without it, narrowing package.json#files could drop
-// scripts/pre-tool-hook.js or assets/skills/... and every checkout test would
+// scripts/pre-tool-hook.js or skills/... and every checkout test would
 // stay green while users could not run a single review.
+// plugin-test is REQUIRED: plugin.json / mcp.json / skills/ are the only surface
+// a non-Claude-Code harness loads, and a manifest violation makes a conformant
+// client reject the WHOLE plugin — invisible to every other suite.
 const SUITES = [
   { name: "shell-guard", script: "scripts/shell-guard-test.mjs" },
   { name: "audit-fixes", script: "scripts/audit-fixes-test.mjs" },
   { name: "p0-regression", script: "scripts/p0-regression-test.mjs" },
   { name: "smoke", script: "scripts/smoke-test.mjs" },
   { name: "validation", script: "scripts/validation-test.mjs" },
+  { name: "plugin", script: "scripts/plugin-test.mjs" },
   { name: "pack", script: "scripts/pack-test.mjs" },
   { name: "cross-cases", script: "scripts/cross-cases.mjs" },
 ];

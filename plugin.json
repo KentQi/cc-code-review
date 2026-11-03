@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "cc-code-review",
+  "version": "1.19.0",
+  "description": "Claude Code's code review as a portable MCP server plus an Agent Skill: native /code-review or a three-phase finder/verifier/sweep fleet, 0-100 confidence scoring (findings >= 75), read-only review and opt-in fix mode.",
+  "author": {
+    "name": "KentQi",
+    "url": "https://github.com/KentQi"
+  },
+  "homepage": "https://github.com/KentQi/cc-code-review",
+  "repository": "https://github.com/KentQi/cc-code-review",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "mcp",
+    "claude-code",
+    "agent-skills",
+    "agent-plugins",
+    "fix-mode"
+  ]
+}

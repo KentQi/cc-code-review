@@ -448,7 +448,7 @@ console.log("-- round-4: upstream writes, guard-file writes, secret reads, noteb
   // reviewed tree IS this package). In a foreign repo those names are ordinary
   // source: the running guard never loads from the reviewed repo, so blocking
   // them bought no security and broke fix mode (audit round 8).
-  const pipelineRels = ["src/index.js", "src/claude.js", "src/prompt.js", "src/skill.js", "src/version.js", "scripts/init.mjs", "scripts/lib/mcp-client.mjs", "assets/skills/code-review/SKILL.md"];
+  const pipelineRels = ["src/index.js", "src/claude.js", "src/prompt.js", "src/skill.js", "src/version.js", "scripts/init.mjs", "scripts/lib/mcp-client.mjs", "skills/code-review/SKILL.md"];
   for (const rel of pipelineRels) {
     check("write ALLOW pipeline name in a foreign repo: " + rel, write(rel), "ALLOW");
   }
@@ -844,7 +844,7 @@ console.log("-- P2-1: hook and permission globs cover the same protected classes
   }
   // Pipeline classes: identity-scoped. Foreign repo -> both layers allow (fix
   // mode must be able to edit ordinary source); self-review -> both deny.
-  const pipelinePaths = ["scripts/pre-tool-hook.js", "src/index.js", "src/claude.js", "scripts/init.mjs", "scripts/lib/mcp-client.mjs", "assets/skills/code-review/SKILL.md"];
+  const pipelinePaths = ["scripts/pre-tool-hook.js", "src/index.js", "src/claude.js", "scripts/init.mjs", "scripts/lib/mcp-client.mjs", "skills/code-review/SKILL.md"];
   for (const rel of pipelinePaths) {
     check("foreign repo: hook allows and permission globs do not cover " + rel,
       [hook("Write", { file_path: path.join(REPO, rel) }), covers(staticGlobs, rel)].join("|"), "ALLOW|false");

@@ -84,7 +84,7 @@ export function isSelfReview(repoRoot) {
  *  This set is the single source for the sink list: ALLOWED_HINT is rendered
  *  from it and the set is exported so tests can assert the hook's surface.
  *  Adding/removing a sink here is the only edit needed in this module — but
- *  the human-facing copies (assets/skills/code-review/SKILL.md, README) are
+ *  the human-facing copies (skills/code-review/SKILL.md, README) are
  *  separate documents and must be updated by whoever owns them. */
 export const PIPE_SINKS = new Set(["head", "tail", "cat", "wc", "uniq", "cut", "tr", "grep", "sort"]);
 
@@ -596,7 +596,7 @@ export const SELF_REVIEW_PIPELINE = [
   /^scripts\/pre-tool-hook\.js$/i,
   /^scripts\/init\.mjs$/i,
   /^scripts\/lib\//i,
-  /^assets\/skills\//i,
+  /^skills\//i,
 ];
 
 /**

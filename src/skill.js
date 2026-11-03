@@ -63,7 +63,7 @@ export function userSkillDir() {
 }
 
 export function bundledSkillFile() {
-  return fileURLToPath(new URL("../assets/skills/code-review/SKILL.md", import.meta.url));
+  return fileURLToPath(new URL("../skills/code-review/SKILL.md", import.meta.url));
 }
 
 /**

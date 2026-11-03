@@ -7,7 +7,7 @@
 
 [English](README.en.md) | 简体中文 · [CHANGELOG](CHANGELOG.md) · [文档索引](docs/README.md) · [Releases](https://github.com/KentQi/cc-code-review/releases)
 
-**EN**: An MCP server that calls Claude Code's own `/code-review` (low..high, including `--fix`) or runs a fleet pipeline with the same three-phase structure claude's playbook uses (8/10 parallel finder subagents, one verifier per surviving candidate, one sweep finder; findings ≥ 75 of 0–100). Reviews — PR / branch / working dir / last commit, effort `low→max` — from ZCode or any MCP client, full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI. Nothing is installed into Claude Code.
+**EN**: An MCP server that calls Claude Code's own `/code-review` (low..high, including `--fix`) or runs a fleet pipeline with the same three-phase structure claude's playbook uses (8/10 parallel finder subagents, one verifier per surviving candidate, one sweep finder; findings ≥ 75 of 0–100). Reviews — PR / branch / working dir / last commit, effort `low→max` — from ZCode or any MCP client, full report back. Works with a CC-Switch-style local gateway, direct OAuth login, or an API key, on Windows and macOS, with the standalone CLI or the desktop-app-embedded CLI. Nothing is installed into Claude Code. Ships as an Agent Plugins v1.0.0 package (`plugin.json` + `skills/` + `mcp.json`), so conforming harnesses can load the skill and the MCP server from one directory.
 
 把 **Claude Code 的 code review 能力**封装成 MCP server，让 ZCode（或任何 MCP 客户端）直接调用：
 ZCode → MCP → `claude -p`（headless）→ claude 内置 /code-review（low..high，含 --fix）或内联舰队流水线（max：10 finder + 每候选 verifier + sweep）→ 审查报告原样返回给 ZCode → ZCode 根据报告改代码 → 再次调用复核。
@@ -28,9 +28,9 @@ ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --
   - **ANTHROPIC_API_KEY 环境变量**：从宿主环境继承，天然可用。
 - PR 范围审查需要 `gh` 已登录；本地 diff 审查（working-dir / branch / last-commit）只需 git。
 
-## 跨平台与安装方式支持
+## `claude` 可执行文件解析（跨平台）
 
-`claude` 可执行文件按以下优先级解析（`claude_review_env` 可查看命中来源）：
+本 MCP 不安装 Claude Code，只调用本机已有的 `claude`。它按以下优先级解析（`claude_review_env` 可查看命中来源）：
 
 | 优先级 | 来源 | Windows 路径 | macOS 路径 |
 |---|---|---|---|
@@ -47,7 +47,9 @@ ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --
 - macOS native 二进制首次 headless 运行若被 Gatekeeper 拦截（SIGKILL），错误信息会提示先在终端跑一次 `claude --version`。
 - 超时/取消会杀整棵进程树（Windows `taskkill /T /F`，Unix 进程组 SIGKILL）；MCP server 自身退出时也会清理存活子进程。
 
-## 注册到 ZCode（已完成则跳过）
+## 注册到 MCP 客户端（ZCode / Claude Code / Cursor / 其他）
+
+### ZCode（一条命令）
 
 **推荐：一条命令自动配置（v1.7.0 起）**。克隆本仓库后，在里面跑：
 
@@ -60,22 +62,46 @@ npm run init
 
 > ⚠️ **升级代码后必须重启 MCP 宿主。** stdio MCP 是常驻进程，模块在启动那一刻就载入了内存；而 shell guard 的 hook 脚本是**每次 Bash 调用时从磁盘新起的**。所以只更新文件不重启，会得到"旧服务器 + 新 hook"的错配：两者对策略的判断不一致，guard 自检会（正确地）拒绝运行，报 `the shell guard is installed but did not behave as expected`。这不是 bug，是 fail-closed。`claude_review_env` 会直接告诉你答案：首行 `cc-code-review server: vX.Y.Z`，若磁盘源码比本进程新，会追加 `⚠ STALE PROCESS` 并给出重启提示（structuredContent 里是 `server.stale`）。
 
-手动配置（等效，适合不想跑脚本的人）——注意 `command` 必须是本机 node 的**绝对路径**，`args` 必须是本仓库 `src/index.js` 的**绝对路径**：
+### Claude Code / Cursor / 其他 MCP 客户端（手动）
+
+`npm run init` 只写 ZCode 的配置；其他客户端用下面这段标准 stdio 配置即可——注意 `command` 必须是本机 node 的**绝对路径**，`args` 必须是本仓库 `src/index.js` 的**绝对路径**（宿主的工作目录不可控，相对路径会解析到别处）：
 
 ```json
 {
-  "mcp": {
-    "servers": {
-      "cc-code-review": {
-        "command": "<本机 node 绝对路径>",
-        "args": ["<本仓库>/src/index.js"]
-      }
+  "mcpServers": {
+    "cc-code-review": {
+      "command": "<本机 node 绝对路径>",
+      "args": ["<本仓库>/src/index.js"]
     }
   }
 }
 ```
 
+- **Claude Code**：放进项目 `.mcp.json`（或用户级 MCP 配置），或直接 `claude mcp add cc-code-review <本机 node 绝对路径> <本仓库>/src/index.js`。
+- **Cursor**：放进 `~/.cursor/mcp.json` 或项目的 `.cursor/mcp.json`。
+- **ZCode**：不想跑 `npm run init` 时，等价的手写位置是 `~/.zcode/cli/config.json` 的 `mcp.servers.cc-code-review`（字段同上）。
+- **其他客户端**：任何支持 stdio MCP server 的宿主都接受这个形状；如果它同时支持 [Agent Plugins](https://agent-plugins.org/specification)，也可以直接把本仓库当插件加载（见下一节）。
+
 > 工具名（`claude_code_review` / `claude_review_status` / `claude_review_followup` / `claude_review_env`）与环境变量前缀（`CLAUDE_REVIEW_*`）**保持稳定**，不随 server 名改变——已注册过的调用方与脚本无需跟着改，改的只是 server 键名（工具前缀从 `mcp__claude-review__*` 变成 `mcp__cc-code-review__*`）。
+
+## 作为 Agent Plugin / Agent Skill 使用（任意 harness）
+
+本仓库同时是一个 **[Agent Plugins](https://agent-plugins.org/specification) v1.0.0** 包——仓库根目录就是 plugin root，固定位置放三个可移植文件：
+
+```text
+cc-code-review/
+├── plugin.json                    # 插件清单（closed schema：名称/版本/描述/许可证）
+├── mcp.json                       # stdio MCP server 配置（固定位置，不内联在 plugin.json）
+├── skills/code-review/SKILL.md    # 可移植 Agent Skill（Agent Skills 格式）
+└── src/ scripts/ ...              # MCP server 实现
+```
+
+- **支持 Agent Plugins 的客户端**：把本仓库目录作为 plugin 加载即可——`skills/` 下的 code-review skill 与 `mcp.json` 里的 stdio server 会被自动发现。前提是先在插件目录跑过 `npm install`（server 依赖在 node_modules；缺依赖时只有 MCP server 组件失败、skill 仍可加载——协议要求组件失败非致命）。
+- **只支持 Agent Skills 的 harness**：把 `skills/code-review/` 整个目录复制进该 harness 的 skills 目录（例如 Claude Code 的 `~/.claude/skills/code-review/`，或项目级 skills 目录）。skill 正文与 harness 无关：有 subagent/并行工具就并行派发 finder，没有就顺序执行全部角度，不会因为缺少 fan-out 而跳过角度；报告格式、评分与过滤规则不变。
+- **用 MCP server 时不需要装 skill**：fleet 流水线会把同一份 SKILL.md 正文内联进 prompt（见上文「评审流水线」），默认路径不往 `~/.claude` 写任何文件。
+- **格式校验**：skill 遵循 [Agent Skills 规范](https://agentskills.io/specification)（frontmatter `name`/`description`、正文 < 500 行），插件清单遵循 Agent Plugins 1.0.0 的 closed schema；`npm test` 的 `plugin-test` 套件离线校验 `plugin.json` / `mcp.json` / `SKILL.md` 三个文件。
+
+> 为什么单独测这三个文件：manifest 违规会让合规客户端**拒绝整个插件**，而 SKILL.md 违规只会静默丢弃 skill——两种失败都发生在 Claude Code 路径之外，其他套件看不见。
 
 ## 工具
 
@@ -126,7 +152,7 @@ Claude Code 2.1.x **自带** `code-review` 技能（`/code-review [level] [targe
 | max | **内联舰队流水线** | 内置 max 会派子代理，而子代理爱写 `cd X && ls && git config …` 这类复合/越界命令，被 manual 模式成片拒绝（实测 100 次 denial、5 分钟不收敛）；舰队提示词则明确约束在只读面内 |
 | `last-commit` 且 HEAD 无父提交 | 内联舰队流水线 | 内置命令的 target 是**基线 ref**（`HEAD~1`），root commit 或空仓库没有父提交 |
 
-- **内联舰队 = 不装文件**：`assets/skills/code-review/SKILL.md` 的正文直接拼进 prompt（`## Pipeline (bundled with this MCP)`），模型照它执行；代价是每次 fleet review 多约 8KB 输入。
+- **内联舰队 = 不装文件**：`skills/code-review/SKILL.md` 的正文直接拼进 prompt（`## Pipeline (bundled with this MCP)`），模型照它执行；代价是每次 fleet review 多约 12KB 输入。
 - **`pipeline` 参数**可显式指定：`auto`（默认）/ `native` / `fleet` / `skill`。`skill` 是唯一会写 `~/.claude` 的兼容模式，默认关闭。
 - **同名 skill 会遮挡内置命令**（实测：装了 `~/.claude/skills/code-review` 后，`/code-review` 变成 `Skill` 调用）。因此存在同名 skill 时 `auto` 自动改走 fleet 并在结果里说明；显式 `pipeline=native` 会直接拒绝，而不是悄悄跑成别的东西。之前装过的那份可用 `claude_review_env { uninstallSkill: true }` 移除。
 - 结果元数据带 `pipeline`（描述）与 `pipelineMode`（解析结果），`subagent_stats` 显示舰队规模。
@@ -189,11 +215,11 @@ Claude Code 的 Bash 权限规则是**把整条命令当字符串做前缀匹配
 
 - **`find` 的长选项两种拼写都拒**：GNU find 历史单横线长选项（`-files0-from`）与双横线形式（`--files0-from`、`--files0`）全部拒绝，含无歧义缩写。
 - **`find -D` / `-O`**：只吞 debugopts（字母/逗号）或 level（数字）值，其它后续 token 都是搜索路径并参与校验（`find -D /etc`、`find -O /etc` 此前可枚举宿主目录）。
-- **自审保护整条 guard/spawn 管线**：`src/*.js`、`scripts/pre-tool-hook.js`、`scripts/init.mjs`、`scripts/lib/**`、`assets/skills/**` 在 fix 模式下不可写——改 `src/index.js` 或 `src/claude.js` 与改 hook 一样能让后续所有 run 卸防。
+- **自审保护整条 guard/spawn 管线**：`src/*.js`、`scripts/pre-tool-hook.js`、`scripts/init.mjs`、`scripts/lib/**`、`skills/**` 在 fix 模式下不可写——改 `src/index.js` 或 `src/claude.js` 与改 hook 一样能让后续所有 run 卸防。
 - **hook 对无法判定的 payload fail-closed**：非法 JSON、空 stdin、非对象、缺 `tool_name` 一律拒绝（此前 exit 0）；解析成功但属于 hook 不负责的工具仍放行（那些由服务端 allowlist 管）。
 - **Node ≥ 20**：声明的最低运行时、CI 矩阵（20/22/24）与 README 徽章一致，并由 pack-test 断言锁住。
 - **`postToPR` 需要完整 PR 选择器**：`pr: "123"` 会被 `gh` 按被审仓库自己的 remote 解析，而被审仓库是不可信内容——评论目标因此由仓库控制。`owner/repo#N` 或 PR URL 把目标钉死在调用方指名的仓库；只读评审用裸号仍然允许（`scope=pr` 的既有行为）。
-- **自审保护按身份而非路径形状**（v1.18.8）：`src/*.js`、`scripts/init.mjs`、`scripts/lib/**`、`assets/skills/**` 只在**被审仓库就是本包**时禁写（hook 与服务端始终从包安装目录加载，普通仓库里改这些文件对运行中的 guard 没有影响）。普通仓库的 fix mode 可以正常编辑 `src/*.js`；自审时这些文件仍需手工改。
+- **自审保护按身份而非路径形状**（v1.18.8）：`src/*.js`、`scripts/init.mjs`、`scripts/lib/**`、`skills/**` 只在**被审仓库就是本包**时禁写（hook 与服务端始终从包安装目录加载，普通仓库里改这些文件对运行中的 guard 没有影响）。普通仓库的 fix mode 可以正常编辑 `src/*.js`；自审时这些文件仍需手工改。
 
 hook 还有第二条确定性规则：**git 的 `--output=` / `--output-directory=` 会让"只读"命令写文件**（`git diff/show/log --output=<file>`、`git format-patch --output-directory=` 实测都会落盘；`--output-to=` 不是真实旗标）。deny glob 对这条无能为力——Bash 规则是整条命令前缀匹配，`Bash(git diff --output=*)` 拦不住 `git diff HEAD --output=x`，而中间带 `*` 的规则语义无法从 CLI 外验证——所以这一条由 hook 直接判掉。注意 `grep --output`、`find -print` 等非 git 的 `--output` 不受影响。
 
@@ -268,9 +294,9 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 - **429 抢救**：被限流/额度耗尽打死的子代理，其工作会从启动确认里的 `output_file` 转录尾部恢复（标记 `partial (output_file)`），已花的 token 不白扔。
 - `claude_review_env` 与版本/flag 探测免费（结果有缓存）。
 
-## 在 ZCode 里怎么用
+## 用法示例（任意 MCP 客户端）
 
-重启 ZCode 后直接说，例如：
+重启宿主（ZCode / Claude Code / Cursor 等）后直接说，例如：
 
 > 用 cc-code-review MCP 对 C:\path\to\repo 的未提交改动跑一轮 code review（effort 用 max），然后根据 findings 修复，修完再复核一遍。
 
@@ -278,9 +304,10 @@ v1.10.0 起返回**每个评审子代理各自的报告**（`## Reviewer subagen
 
 ```bash
 npm install
-npm test                                         # 跑全部免费套件并统一汇总（shell-guard 327 + 审计修复 318 + P0 回归 256 + validation 31 + pack 52 + smoke + cross-cases 156/156），任一失败即非零退出
+npm test                                         # 跑全部免费套件并统一汇总（shell-guard 327 + 审计修复 318 + P0 回归 256 + validation 31 + plugin 45 + pack 52 + smoke + cross-cases 156/156），任一失败即非零退出
 npm run init                                     # 环境自检 + 按本机写入 ZCode 注册（免费）
 node scripts/validation-test.mjs                # 全部输入校验路径（免费，不发 API 请求）
+node scripts/plugin-test.mjs                    # Agent Plugins 一致性：plugin.json / mcp.json / skills/（免费、离线）
 node scripts/cross-cases.mjs                    # 27 个 MECE 用例（默认免费跑 26 个、156 项检查；含 ultracode/workflow + 舰队缩放、取消后保留已完成报告、误判 ack 被 notification 纠正等端到端；含桩 claude 的免费异步生命周期 + 子代理报告/模型溯源端到端；C9 付费需 CC_LOOP_PAID=1）
 node scripts/paid-smoke.mjs [--cap=2]           # 真实 CLI 端到端 smoke：带三个已知 bug 的临时仓库，effort/reviewLevel=low，默认不设费用上限（计费，实测约 $0.5）
 node scripts/e2e-test.mjs <repoPath> [json]     # 真实 review（计费）
@@ -291,6 +318,8 @@ node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立
 `validation-test.mjs` 覆盖：相对 `repoPath` 拒绝、恶意 `pr`（含前导 `-`）拒绝、`outputLanguage` 超 20 字/句末标点/多行拒绝、`focus` 含换行或制表符拒绝、`followup` 消息超 100000 字拒绝、`claude_review_status` 无 jobId 的 cancel 拒绝、空仓库拒绝、非 git 目录拒绝、`maxBudgetUsd=0` 被 schema 接受、`baseRef` 以 `-` 开头拒绝、`focus` 含控制字符/超长拒绝、guard 未生效时两个工具都 fail-closed 拒跑、以及 `CLAUDE_REVIEW_ALLOW_UNGUARDED=1` 的显式解锁。全部在付费调用之前返回——唯一例外是"clean repo 通过 preflight"这条（它会真的发起一次有预算上限的付费 run），默认跳过，设 `CC_REVIEW_ALLOW_PAID_PROBE=1` 才执行。
 
 `shell-guard-test.mjs` 覆盖：链式/重定向/替换命令必须拦、`find -delete/-exec/-fprintf` 与 `rg --pre` 必须拦而普通 `find`/`rg` 读取必须放行、`git log --format="%h; %s"` 这类引号内分隔符必须放行、引号不配对 fail-closed、hook 进程的 stdin→deny 契约、Edit/Write/Read 的仓库边界与 `.git/`/密钥路径拦截、仓库内 junction/软链接逃逸（realpath 边界），以及一次真实 review 的 17 条命令回放（确认被拦的命令不会被误报成"逃逸"）。
+
+`plugin-test.mjs` 覆盖可移植的 Agent Plugins 表面：`plugin.json`（closed schema、canonical `$schema`、name/version/license 约束）、`mcp.json`（closed 顶层、与 plugin.json 同版本、stdio variant 规则、保留 env 名、`cwd` 形式）以及 `skills/*/SKILL.md`（Agent Skills frontmatter、name 与目录名一致、description 长度、正文行数、报告合同存在）。离线运行，不拉取远程 schema。
 
 `audit-fixes-test.mjs` 覆盖三轮独立审计的每条修复：deny 列表覆盖面与"同一规则同时出现在 allow/deny 里变成死规则"的冲突、**allow 规则被 deny 规则前缀遮蔽**（`Bash(git remote -v)` vs `Bash(git remote:*)`，真实 review 发现的）、`postToPR` 授权不是死代码、版本比较（含预发布号）、git hardening 的 `-c` 参数、`repoRunsGitPrograms` 的精确性（fsmonitor 布尔不误伤、LFS 全局驱动不误伤、`[include]` 链与 `.gitattributes`↔config 交叉核对都查得出）、hook 的 `git --output=` 规则、提示词里 caller 数据只能是数据，以及一次真实 review 的命令回放（allowlist 与 deny 两侧都要放行）。
 
@@ -305,6 +334,6 @@ node scripts/cancel-test.mjs <repoPath>         # 取消后进程树是否被立
 ## 授权与致谢
 
 - 本项目以 [MIT](LICENSE) 协议开源。
-- 内置的 code-review skill（`assets/skills/code-review/SKILL.md`）改编自 Anthropic 官方的 code-review 插件管线（由 5 个 brief 驱动的 8/10 个并行 finder + 置信度过滤），在此基础上适配了 headless 调用与只读边界。
+- 内置的 code-review skill（`skills/code-review/SKILL.md`）改编自 Anthropic 官方的 code-review 插件管线（由 5 个 brief 驱动的 8/10 个并行 finder + 置信度过滤），在此基础上适配了 headless 调用、只读边界，并改写为与 harness 无关的 Agent Skill。
 - 感谢 Claude Code 团队与 CC Switch / claude-code-router 等网关项目，让"无账号登录也能跑 review"成为可能。
 - 安全模型经过多轮独立交叉审计（Windows / macOS / 认证网关 / 安装形态 / 回归五个视角），详见上文与 [SECURITY.md](SECURITY.md)。发现漏洞请走私有通告，不要开公开 Issue。

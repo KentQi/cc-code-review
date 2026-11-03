@@ -27,9 +27,9 @@ ZCode ──MCP(stdio)──▶ cc-code-review ──spawn──▶ claude -p --
   - **`ANTHROPIC_API_KEY` environment variable**: inherited from the host environment, works as-is.
 - PR-scope reviews need `gh` logged in; local diff reviews (working-dir / branch / last-commit) only need git.
 
-## Cross-platform & installation forms
+## `claude` executable resolution (cross-platform)
 
-The `claude` executable is resolved with the following priority (`claude_review_env` shows which source hit):
+This MCP does not install Claude Code — it drives the one already on your machine. The executable is resolved with the following priority (`claude_review_env` shows which source hit):
 
 | Priority | Source | Windows path | macOS path |
 |---|---|---|---|
@@ -47,7 +47,9 @@ Notes:
 - macOS: if a freshly installed native binary is Gatekeeper-killed (SIGKILL) on its first headless run, the error message tells you to run `claude --version` once in a terminal first.
 - Timeout/cancellation kills the whole process tree (Windows `taskkill /T /F`, Unix process-group SIGKILL); surviving children are also cleaned up when the MCP server itself exits.
 
-## Register with ZCode (skip if already done)
+## Register with an MCP client (ZCode / Claude Code / Cursor / anything else)
+
+### ZCode (one command)
 
 **Recommended: one command, auto-configured (since v1.7.0)**. Clone this repository, then inside it run:
 
@@ -60,24 +62,46 @@ npm run init
 
 > ⚠️ **Updating the code requires restarting the MCP host.** A stdio MCP server keeps the modules it loaded at startup, while the shell guard's hook is spawned fresh from disk on every Bash call. Updating the files without a restart therefore leaves an old server next to a new hook: the two disagree about the policy, and the guard self-test (correctly) refuses to run with `the shell guard is installed but did not behave as expected`. That is fail-closed, not a bug. `claude_review_env` answers it directly: its first line is `cc-code-review server: vX.Y.Z`, and if the source on disk is newer than this process it appends `⚠ STALE PROCESS` with a restart hint (`server.stale` in structuredContent).
 
-Manual config (equivalent, for those who prefer not to run a script) — note `command` must be YOUR machine's node absolute path and `args` the absolute path of this checkout's `src/index.js`:
+### Claude Code / Cursor / any other MCP client (manual)
+
+`npm run init` writes only ZCode's config; every other client takes the standard stdio shape below — `command` must be the **absolute path** of your node, and `args` the **absolute path** of this checkout's `src/index.js` (a host's working directory is not predictable, so a relative path resolves somewhere else):
 
 ```json
 {
-  "mcp": {
-    "servers": {
-      "cc-code-review": {
-        "command": "<absolute path to your node>",
-        "args": ["<this checkout>/src/index.js"]
-      }
+  "mcpServers": {
+    "cc-code-review": {
+      "command": "<absolute path to your node>",
+      "args": ["<this checkout>/src/index.js"]
     }
   }
 }
 ```
 
-On macOS, replace `command` with your local node absolute path (e.g. `/usr/local/bin/node` or `/opt/homebrew/bin/node`). Restart ZCode (or reconnect the MCP) after editing. Tool names: `mcp__cc-code-review__claude_code_review` and friends.
+- **Claude Code**: put it in the project `.mcp.json` (or your user-level MCP config), or run `claude mcp add cc-code-review <absolute path to your node> <this checkout>/src/index.js`.
+- **Cursor**: put it in `~/.cursor/mcp.json` or the project's `.cursor/mcp.json`.
+- **ZCode**: without `npm run init`, the equivalent hand-written location is `~/.zcode/cli/config.json` → `mcp.servers.cc-code-review` (same two fields).
+- **Anything else**: any host that supports stdio MCP servers accepts this shape; if it also supports [Agent Plugins](https://agent-plugins.org/specification), you can load this repository as a plugin instead (next section).
 
 > Tool names (`claude_code_review` / `claude_review_status` / `claude_review_followup` / `claude_review_env`) and the env-var prefix (`CLAUDE_REVIEW_*`) are **stable** — they do not follow the server name, so existing callers and scripts need no changes; only the server key changed (the tool prefix went from `mcp__claude-review__*` to `mcp__cc-code-review__*`).
+
+## Use it as an Agent Plugin / Agent Skill (any harness)
+
+This repository is also an **[Agent Plugins](https://agent-plugins.org/specification) v1.0.0** package — the repo root is the plugin root, with the three portable files in their fixed locations:
+
+```text
+cc-code-review/
+├── plugin.json                    # manifest (closed schema: name/version/description/license)
+├── mcp.json                       # stdio MCP server config (fixed location, never inline in plugin.json)
+├── skills/code-review/SKILL.md    # portable Agent Skill (Agent Skills format)
+└── src/ scripts/ ...              # the MCP server implementation
+```
+
+- **Clients that support Agent Plugins**: load this directory as a plugin — the code-review skill under `skills/` and the stdio server in `mcp.json` are discovered automatically. Run `npm install` in the plugin directory first (the server's dependencies live in node_modules); without them only the MCP-server component fails and the skill still loads — the spec requires component failures to be non-fatal.
+- **Harnesses that only support Agent Skills**: copy the whole `skills/code-review/` directory into that harness's skills directory (for Claude Code: `~/.claude/skills/code-review/`; project-level skill directories work too). The body is harness-neutral: parallel fan-out is used when the harness has a subagent/parallel tool, otherwise every phase runs sequentially — an angle is never skipped for lack of fan-out, and the report format, scoring and filter rules stay the same.
+- **No skill install is needed when you use the MCP server**: the fleet pipeline embeds the same SKILL.md body in the prompt (see "Review pipeline" above), so the default path writes nothing into `~/.claude`.
+- **Format validation**: the skill follows the [Agent Skills specification](https://agentskills.io/specification) (frontmatter `name`/`description`, body under 500 lines) and the manifest follows the closed Agent Plugins 1.0.0 schema; the `plugin-test` suite in `npm test` validates `plugin.json` / `mcp.json` / `SKILL.md` offline.
+
+> Why those three files get their own suite: a manifest violation makes a conformant client **reject the whole plugin**, while an invalid SKILL.md only silently drops the skill — both failures happen outside the Claude Code path, where no other suite can see them.
 
 ## Tools
 
@@ -128,7 +152,7 @@ Claude Code 2.1.x **ships** a `code-review` skill (`/code-review [level] [target
 | max | **inline fleet pipeline** | the built-in max spawns subagents whose `cd X && ls && git config …` exploration is denied wholesale by manual mode (measured: 100 denials, no convergence in 5 minutes); the fleet prompt keeps them inside the read-only surface |
 | `last-commit` on a root commit | inline fleet pipeline | the built-in's target is a BASE ref (`HEAD~1`); a root commit has no parent |
 
-- **Inline fleet = no files**: the body of `assets/skills/code-review/SKILL.md` is appended to the prompt (`## Pipeline (bundled with this MCP)`); the cost is ~8KB of extra input per fleet review.
+- **Inline fleet = no files**: the body of `skills/code-review/SKILL.md` is appended to the prompt (`## Pipeline (bundled with this MCP)`); the cost is ~12KB of extra input per fleet review.
 - **`pipeline` argument**: `auto` (default) / `native` / `fleet` / `skill`. `skill` is the only mode that writes to `~/.claude`, and it is off by default.
 - **A same-named skill shadows the built-in command** (measured: with `~/.claude/skills/code-review` present, `/code-review` becomes a `Skill` call). So `auto` switches to the fleet pipeline and says so; an explicit `pipeline=native` is refused rather than silently running something else. Remove an old copy with `claude_review_env { uninstallSkill: true }`.
 - Results carry `pipeline` (description) and `pipelineMode` (resolved value); `subagent_stats` shows the fleet size.
@@ -190,11 +214,11 @@ It also closes the **write/execute forms that a prefix rule cannot express**: `f
 
 - **`find` long options match both spellings**: GNU find's historical single-dash long options (`-files0-from`) and the double-dash form (`--files0-from`, `--files0`) are all denied, including abbreviations.
 - **`find -D` / `-O`**: only a debugopts value (letters/commas) or a level (digits) is consumed; any other following token is a start path and is checked (`find -D /etc` and `find -O /etc` used to enumerate a host directory).
-- **Self-review protects the whole guard/spawn pipeline**: `src/*.js`, `scripts/pre-tool-hook.js`, `scripts/init.mjs`, `scripts/lib/**` and `assets/skills/**` can no longer be written in fix mode — editing `src/index.js` or `src/claude.js` would disarm every later run just like editing the hook.
+- **Self-review protects the whole guard/spawn pipeline**: `src/*.js`, `scripts/pre-tool-hook.js`, `scripts/init.mjs`, `scripts/lib/**` and `skills/**` can no longer be written in fix mode — editing `src/index.js` or `src/claude.js` would disarm every later run just like editing the hook.
 - **The hook fails closed on a payload it cannot judge**: malformed JSON, an empty stdin, a non-object or a missing `tool_name` now denies (it used to exit 0); a parsed payload naming a tool the hook does not police still passes, because those are governed by the server allowlist.
 - **Node >= 20**: the declared runtime floor, the CI matrix (20/22/24) and the README badge agree; a pack-test assertion keeps them in step.
 - **`postToPR` requires a fully-qualified PR selector**: a bare number (`pr: "123"`) is resolved by `gh` against the reviewed repository's own remote, and that repository is untrusted content — so its `origin` would decide where the comment is published. `owner/repo#N` or a PR URL pins the target; reading a PR by bare number stays allowed (the documented `scope=pr` behaviour).
-- **Self-review protection is identity-scoped, not path-shaped** (v1.18.8): `src/*.js`, `scripts/init.mjs`, `scripts/lib/**` and `assets/skills/**` are write-denied only when the reviewed tree IS this package (the hook and server always load from the package install directory, so a foreign repository's copy has no effect on the running guard). Fix mode can edit `src/*.js` in ordinary projects again; a self-review still requires a manual edit for those files.
+- **Self-review protection is identity-scoped, not path-shaped** (v1.18.8): `src/*.js`, `scripts/init.mjs`, `scripts/lib/**` and `skills/**` are write-denied only when the reviewed tree IS this package (the hook and server always load from the package install directory, so a foreign repository's copy has no effect on the running guard). Fix mode can edit `src/*.js` in ordinary projects again; a self-review still requires a manual edit for those files.
 
 
 Redirection (including `2>/dev/null`) stays fully refused: it is the read/write primitive that bypasses the allowlist, and allowing it would require proving every destination harmless. Let the command write to stdout instead.
@@ -272,9 +296,9 @@ Tip: if the host environment has leftover `ANTHROPIC_API_KEY` and friends that `
 - **429 recovery**: an agent killed by a rate limit / quota exhaustion is salvaged from the `output_file` transcript named in its launch acknowledgement (marked `partial (output_file)`), so tokens already spent are not wasted.
 - `claude_review_env` and version/flag probes are free (results are cached).
 
-## Using it from ZCode
+## Usage example (any MCP client)
 
-Restart ZCode and just say, for example:
+Restart the host (ZCode / Claude Code / Cursor / …) and just say, for example:
 
 > Use the cc-code-review MCP to run a code review of the uncommitted changes in C:\path\to\repo (effort max), then fix the findings, then re-review to confirm.
 
@@ -282,7 +306,7 @@ Restart ZCode and just say, for example:
 
 ```bash
 npm install
-npm test                                         # every free suite, one summary (shell-guard 327 + audit-fix 318 + P0 regression 256 + validation 31 + pack 52 + smoke + cross-cases 156/156); non-zero if any fails
+npm test                                         # every free suite, one summary (shell-guard 327 + audit-fix 318 + P0 regression 256 + validation 31 + plugin 45 + pack 52 + smoke + cross-cases 156/156); non-zero if any fails
 npm run init                                     # environment self-check + writes the ZCode registration for THIS machine (free)
 node scripts/validation-test.mjs                # every input-validation path (free, no API calls)
 node scripts/cross-cases.mjs                    # 27 MECE cases (26 run for free by default, 156 checks; ultracode/workflow + fleet scaling, cancel-keeps-finished-reports, misread-ack-corrected-by-notification e2e; free stub-claude async lifecycle + reviewer-report/model-provenance e2e; C9 paid needs CC_LOOP_PAID=1)
@@ -295,6 +319,8 @@ node scripts/cancel-test.mjs <repoPath>         # is the process tree killed rig
 `validation-test.mjs` covers: relative `repoPath` refused, malicious `pr` (including a leading `-`) refused, `outputLanguage` over 20 chars / sentence punctuation / multi-line refused, `focus` with a newline or tab refused, an oversized followup message (>100000 chars) refused, `claude_review_status` cancel without a jobId refused, empty repo refused, non-git directory refused, `maxBudgetUsd=0` accepted by the schema, `baseRef` starting with `-` refused, `focus` with control characters / oversized refused, both tools fail-closed when the guard is off, and the explicit `CLAUDE_REVIEW_ALLOW_UNGUARDED=1` unlock. Everything returns before any paid call — the one exception is the "clean repo passes preflight" check, which really starts a budget-capped paid run and is therefore **skipped by default**; set `CC_REVIEW_ALLOW_PAID_PROBE=1` to include it.
 
 `shell-guard-test.mjs` covers: chained/redirected/substituted commands must be blocked, `find -delete/-exec/-fprintf` and `rg --pre` must be blocked while plain `find`/`rg` reads must pass, quoted separators like `git log --format="%h; %s"` must pass, unbalanced quotes fail closed, the hook process's stdin→deny contract, the repo boundary and `.git/`/secret-path interception for Edit/Write/Read, in-repo junction/symlink escapes (realpath containment), and a real review's 17-command replay (confirming blocked commands are not misreported as escapes).
+
+`plugin-test.mjs` covers the portable Agent Plugins surface: `plugin.json` (closed schema, canonical `$schema`, name/version/license constraints), `mcp.json` (closed top level, same spec version as the manifest, stdio variant rules, reserved env names, `cwd` forms) and every discovered `SKILL.md` (Agent Skills frontmatter, name matching the directory, description bounds, body limits, report-contract presence). Offline — no remote schema is fetched.
 
 `audit-fixes-test.mjs` covers every fix from the independent audit rounds: deny-list coverage and the "same rule in both lists is dead code" conflict, **allow rules prefix-shadowed by deny rules** (`Bash(git remote -v)` vs `Bash(git remote:*)` — found in a real review), `postToPR` grants not being dead code, version comparison (including pre-releases), git hardening `-c` args, `repoRunsGitPrograms` precision (fsmonitor booleans and global LFS drivers do not false-positive; `[include]` chains and `.gitattributes`↔config cross-checks do catch real drivers), the hook's `git --output=` rule, caller data staying data inside prompts, and a real review's command replay (both the allowlist and the deny side must pass).
 
@@ -309,6 +335,6 @@ node scripts/cancel-test.mjs <repoPath>         # is the process tree killed rig
 ## License & acknowledgments
 
 - This project is open source under the [MIT](LICENSE) license.
-- The bundled code-review skill (`assets/skills/code-review/SKILL.md`) is adapted from Anthropic's official code-review plugin pipeline (8/10 parallel finders driven by 5 briefs + confidence filtering), further adapted here for headless invocation and the read-only boundary.
+- The bundled code-review skill (`skills/code-review/SKILL.md`) is adapted from Anthropic's official code-review plugin pipeline (8/10 parallel finders driven by 5 briefs + confidence filtering), further adapted here for headless invocation, the read-only boundary, and harness-neutral Agent Skills portability.
 - Thanks to the Claude Code team and to the CC Switch / claude-code-router gateway projects for making "reviews without an account login" possible.
 - The security model has been through multiple rounds of independent cross-audits (Windows / macOS / auth-gateway / install-forms / regression perspectives) — see above and [SECURITY.md](SECURITY.md). Please report vulnerabilities via private advisories, not public issues.

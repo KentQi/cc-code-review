@@ -479,13 +479,13 @@ function loadReportContract() {
       return { source: "skill", lines: [REPORT_PREAMBLE, "", ...extracted.block, "", extracted.clean] };
     }
     warnReportContract(
-      "the report block in assets/skills/code-review/SKILL.md lost " +
+      "the report block in skills/code-review/SKILL.md lost " +
       (missing.length ? missing.join(", ") : "its clean-run sentence") +
       "; falling back to the built-in copy. Restore the block — SKILL.md is the contract's single source.",
     );
   } else {
     warnReportContract(
-      "could not read the report contract from assets/skills/code-review/SKILL.md; " +
+      "could not read the report contract from skills/code-review/SKILL.md; " +
       "falling back to the built-in copy. Reinstall the package or restore the asset.",
     );
   }
@@ -880,7 +880,7 @@ export const FIX_SELF_REVIEW_GLOBS = Object.freeze([
   "scripts/init.mjs", "**/scripts/init.mjs",
   "scripts/lib/**", "**/scripts/lib/**",
   "src/*.js", "**/src/*.js",
-  "assets/skills/**", "**/assets/skills/**",
+  "skills/**", "**/skills/**",
 ]);
 
 /**
